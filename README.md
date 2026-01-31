@@ -1,4 +1,4 @@
-# rsbts
+# rsbts [work in progress]
 
 A music library manager with MusicBrainz integration. Import albums, fetch metadata, and organize your collection.
 
