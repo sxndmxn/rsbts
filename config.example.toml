@@ -16,14 +16,8 @@ format = "$albumartist/$album/$track - $title"
 # Action: copy, move, or link
 action = "copy"
 
-# Write tags to files after import
-write_tags = true
-
 # Fetch album art from Cover Art Archive
 fetch_art = true
-
-# Embed art in audio files
-embed_art = false
 
 [musicbrainz]
 # Search result limit

@@ -25,9 +25,7 @@ pub enum Action {
 
 pub struct ImportConfig {
     pub action: Action,
-    pub write_tags: bool,
     pub fetch_art: bool,
-    pub embed_art: bool,
     pub path_format: String,
     pub library_dir: PathBuf,
 }

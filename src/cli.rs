@@ -58,9 +58,7 @@ async fn import(
 
     let import_config = ImportConfig {
         action,
-        write_tags: config.import.write_tags,
         fetch_art: config.import.fetch_art,
-        embed_art: config.import.embed_art,
         path_format: config.paths.format.clone(),
         library_dir: config.library.directory.clone(),
     };

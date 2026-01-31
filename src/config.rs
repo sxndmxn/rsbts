@@ -27,9 +27,7 @@ pub struct PathsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportConfig {
     pub action: Action,
-    pub write_tags: bool,
     pub fetch_art: bool,
-    pub embed_art: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,9 +50,7 @@ impl Default for Config {
             },
             import: ImportConfig {
                 action: Action::Copy,
-                write_tags: true,
                 fetch_art: true,
-                embed_art: false,
             },
             musicbrainz: MusicBrainzConfig { search_limit: 5 },
         }
