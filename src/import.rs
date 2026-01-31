@@ -59,6 +59,7 @@ impl<'a> Importer<'a> {
     ///
     /// # Errors
     /// Returns an error if scanning or importing fails.
+    // rusqlite::Connection is not Sync, so futures holding &Database aren't Send
     #[allow(clippy::future_not_send)]
     pub async fn import(&self, path: &Path) -> Result<()> {
         let items = scan(path);
@@ -76,6 +77,7 @@ impl<'a> Importer<'a> {
         Ok(())
     }
 
+    // rusqlite::Connection is not Sync, so futures holding &Database aren't Send
     #[allow(clippy::future_not_send)]
     async fn process_candidate(&self, candidate: AlbumCandidate) -> Result<()> {
         println!(
@@ -268,9 +270,7 @@ fn pick_best_match<'b>(candidate: &AlbumCandidate, releases: &'b [Release]) -> O
         } else {
             0.0
         };
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let score = ((artist_sim + album_sim + track_count_match) * 100.0) as u32;
-        score
+        (artist_sim + album_sim + track_count_match).mul_add(100.0, 0.0).clamp(0.0, f64::from(u32::MAX)) as u32
     })
 }
 
@@ -286,8 +286,8 @@ fn match_tracks(mut items: Vec<Item>, release: &Release) -> Vec<Item> {
     for (i, item) in items.iter().enumerate() {
         for (j, track) in tracks.iter().enumerate() {
             let title_dist = strsim::jaro_winkler(&item.title, &track.title);
-            #[allow(clippy::cast_precision_loss)]
             let length_dist = track.length.map_or(0.5, |tl| {
+                // tl is track length in ms (u64→f64 precision loss acceptable for comparison)
                 let diff = item.length.mul_add(1000.0, -(tl as f64)).abs();
                 if diff < 3000.0 {
                     1.0
@@ -297,8 +297,7 @@ fn match_tracks(mut items: Vec<Item>, release: &Release) -> Vec<Item> {
                     0.3
                 }
             });
-            #[allow(clippy::cast_possible_truncation)]
-            let cost = (title_dist + length_dist).mul_add(-5000.0, 10000.0) as i64;
+            let cost = (title_dist + length_dist).mul_add(-5000.0, 10000.0).round() as i64;
             matrix[i][j] = cost;
         }
     }

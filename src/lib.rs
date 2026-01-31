@@ -1,3 +1,7 @@
+// Precision loss when converting u64 to f64 for display/comparison is acceptable.
+// Truncation is handled manually with clamp/max/round where needed.
+#![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+
 pub mod config;
 pub mod db;
 pub mod import;

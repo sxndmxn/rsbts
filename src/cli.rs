@@ -8,6 +8,7 @@ use rsbts::import::Action;
 
 use crate::Commands;
 
+// rusqlite::Connection is not Sync, so futures holding &Database aren't Send
 #[allow(clippy::future_not_send)]
 pub async fn run(command: Commands, config_path: Option<PathBuf>) -> Result<()> {
     let config = Config::load(config_path.as_deref())?;
@@ -45,6 +46,7 @@ pub async fn run(command: Commands, config_path: Option<PathBuf>) -> Result<()> 
     Ok(())
 }
 
+// rusqlite::Connection is not Sync, so futures holding &Database aren't Send
 #[allow(clippy::future_not_send)]
 async fn import(
     db: &Database,
@@ -154,9 +156,9 @@ fn modify(db: &Database, query: &str, fields: &[String]) -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn format_duration(seconds: f64) -> String {
-    let total_secs = seconds as u64;
+    // Negative durations are invalid; clamp to 0
+    let total_secs = seconds.max(0.0) as u64;
     let hours = total_secs / 3600;
     let mins = (total_secs % 3600) / 60;
     let secs = total_secs % 60;
@@ -168,7 +170,6 @@ fn format_duration(seconds: f64) -> String {
     }
 }
 
-#[allow(clippy::cast_precision_loss)]
 fn format_size(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;

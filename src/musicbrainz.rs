@@ -1,8 +1,9 @@
 //! `MusicBrainz` API client
 
 use std::fmt::Write;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use tokio::sync::Mutex;
 
 use serde::Deserialize;
 
@@ -92,7 +93,7 @@ impl Client {
 
     async fn rate_limit(&self) {
         let sleep_duration = {
-            let mut last = self.last_request.lock().unwrap();
+            let mut last = self.last_request.lock().await;
             let duration = last.and_then(|last_time| {
                 let elapsed = last_time.elapsed();
                 RATE_LIMIT.checked_sub(elapsed)
@@ -110,7 +111,6 @@ impl Client {
     ///
     /// # Errors
     /// Returns an error if the API request fails.
-    #[allow(clippy::future_not_send)]
     pub async fn search_release(
         &self,
         artist: &str,
@@ -151,7 +151,6 @@ impl Client {
     ///
     /// # Errors
     /// Returns an error if the API request fails.
-    #[allow(clippy::future_not_send)]
     pub async fn lookup_release(&self, mbid: &str) -> Result<Release> {
         self.rate_limit().await;
 
@@ -181,7 +180,6 @@ impl Client {
     ///
     /// # Errors
     /// Returns an error if the API request fails.
-    #[allow(clippy::future_not_send)]
     pub async fn fetch_cover_art(&self, mbid: &str) -> Result<Option<Vec<u8>>> {
         self.rate_limit().await;
 

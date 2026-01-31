@@ -73,8 +73,7 @@ pub fn read_tags(path: &Path) -> Result<Item> {
         album
     };
 
-    #[allow(clippy::cast_possible_wrap)]
-    let year = year.map(|y| y as i32);
+    let year = year.map(|y| i32::try_from(y).unwrap_or(0));
 
     Ok(Item {
         id: None,

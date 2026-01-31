@@ -272,11 +272,10 @@ impl Database {
                 row.get(0)
             })?;
 
-        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         let total_size: u64 = self.conn.query_row(
             "SELECT COALESCE(SUM(bitrate * length / 8), 0) FROM items",
             [],
-            |row| row.get::<_, f64>(0).map(|v| v as u64),
+            |row| row.get::<_, f64>(0).map(|v| v.max(0.0) as u64),
         )?;
 
         Ok(Stats {
