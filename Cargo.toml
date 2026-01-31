@@ -1,0 +1,36 @@
+[package]
+name = "rsbts"
+version = "0.1.0"
+edition = "2021"
+description = "A music library manager with MusicBrainz auto-tagging"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+dialoguer = "0.11"
+dirs = "5"
+indicatif = "0.17"
+lofty = "0.22"
+pathfinding = "4"
+rayon = "1.10"
+reqwest = { version = "0.12", features = ["json"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+strsim = "0.11"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+toml = "0.8"
+urlencoding = "2"
+walkdir = "2"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"

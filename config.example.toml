@@ -1,0 +1,30 @@
+# rsbts configuration
+
+[library]
+# Path to your music library
+directory = "~/Music"
+
+# Path to the database file
+database = "~/.local/share/rsbts/library.db"
+
+[paths]
+# Template for organizing files
+# Available variables: $albumartist, $artist, $album, $year, $track, $title, $disc
+format = "$albumartist/$album/$track - $title"
+
+[import]
+# Action: copy, move, or link
+action = "copy"
+
+# Write tags to files after import
+write_tags = true
+
+# Fetch album art from Cover Art Archive
+fetch_art = true
+
+# Embed art in audio files
+embed_art = false
+
+[musicbrainz]
+# Search result limit
+search_limit = 5
