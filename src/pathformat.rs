@@ -101,7 +101,7 @@ fn apply_function(func: &str, arg: &str, item: &Item) -> Result<String> {
             if let Some((n, rest)) = arg.split_once(',') {
                 let n: usize = n
                     .parse()
-                    .map_err(|_| Error::PathFormat("Invalid number".into()))?;
+                    .map_err(|e| Error::PathFormat(format!("Invalid number: {e}")))?;
                 let val = format_path(rest.trim(), item)?;
                 val.chars().take(n).collect()
             } else {
@@ -112,7 +112,7 @@ fn apply_function(func: &str, arg: &str, item: &Item) -> Result<String> {
             if let Some((n, rest)) = arg.split_once(',') {
                 let n: usize = n
                     .parse()
-                    .map_err(|_| Error::PathFormat("Invalid number".into()))?;
+                    .map_err(|e| Error::PathFormat(format!("Invalid number: {e}")))?;
                 let val = format_path(rest.trim(), item)?;
                 let len = val.chars().count();
                 val.chars().skip(len.saturating_sub(n)).collect()

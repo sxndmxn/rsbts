@@ -5,6 +5,7 @@
 pub mod config;
 pub mod db;
 pub mod import;
+pub mod migrations;
 pub mod musicbrainz;
 pub mod pathformat;
 pub mod query;

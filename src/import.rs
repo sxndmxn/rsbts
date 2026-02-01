@@ -3,6 +3,40 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// Constants for track matching and scoring algorithms.
+mod matching {
+    /// Bonus score when track count matches release track count.
+    pub const TRACK_COUNT_BONUS: f64 = 0.2;
+    /// Multiplier for converting similarity scores to integer comparison values.
+    pub const SCORE_MULTIPLIER: f64 = 100.0;
+
+    /// Constants for track length comparison.
+    pub mod length {
+        /// Perfect match threshold in milliseconds.
+        pub const PERFECT_THRESHOLD_MS: f64 = 3000.0;
+        /// Good match threshold in milliseconds.
+        pub const GOOD_THRESHOLD_MS: f64 = 10000.0;
+        /// Score for perfect length match.
+        pub const PERFECT_SCORE: f64 = 1.0;
+        /// Score for good length match.
+        pub const GOOD_SCORE: f64 = 0.7;
+        /// Score for poor length match.
+        pub const POOR_SCORE: f64 = 0.3;
+        /// Score when length is unknown.
+        pub const UNKNOWN_SCORE: f64 = 0.5;
+    }
+
+    /// Constants for cost matrix calculation.
+    pub mod cost {
+        /// Multiplier for similarity to cost conversion.
+        pub const SIMILARITY_MULTIPLIER: f64 = -5000.0;
+        /// Base offset for cost calculation.
+        pub const BASE_OFFSET: f64 = 10000.0;
+        /// Seconds to milliseconds conversion factor.
+        pub const SECONDS_TO_MS: f64 = 1000.0;
+    }
+}
+
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -44,13 +78,16 @@ struct AlbumCandidate {
 }
 
 impl<'a> Importer<'a> {
-    #[must_use]
-    pub fn new(db: &'a Database, config: ImportConfig) -> Self {
-        Self {
+    /// Create a new importer.
+    ///
+    /// # Errors
+    /// Returns an error if the HTTP client cannot be created.
+    pub fn new(db: &'a Database, config: ImportConfig) -> Result<Self> {
+        Ok(Self {
             db,
             config,
-            mb: MbClient::new(),
-        }
+            mb: MbClient::new()?,
+        })
     }
 
     /// Import audio files from the given path.
@@ -85,71 +122,103 @@ impl<'a> Importer<'a> {
             candidate.items.len()
         );
 
+        let release_info = self.lookup_release(&candidate).await?;
+        let album = Self::create_album(&candidate, release_info.as_ref());
+        let album_id = self.db.insert_album(&album)?;
+
+        self.fetch_and_save_cover_art(&album, release_info.as_ref())
+            .await;
+
+        let matched_items = Self::match_items_to_release(candidate.items, release_info.as_ref());
+        self.import_items(matched_items, album_id)?;
+
+        println!("  Imported successfully");
+        Ok(())
+    }
+
+    /// Look up release information from `MusicBrainz`.
+    #[allow(clippy::future_not_send)]
+    async fn lookup_release(&self, candidate: &AlbumCandidate) -> Result<Option<Release>> {
         let releases = self
             .mb
             .search_release(&candidate.artist, &candidate.album, 5)
             .await?;
 
-        let matched_release = if releases.is_empty() {
+        if releases.is_empty() {
             println!("  No MusicBrainz matches found, importing as-is");
-            None
-        } else {
-            let best = pick_best_match(&candidate, &releases);
-            best.inspect(|release| {
-                println!(
-                    "  Matched: {} - {} ({})",
-                    release.artist_name(),
-                    release.title,
-                    release.year().map_or_else(|| "????".into(), |y| y.to_string())
-                );
-            })
+            return Ok(None);
+        }
+
+        let Some(best) = pick_best_match(candidate, &releases) else {
+            return Ok(None);
         };
 
-        let release_info = if let Some(release) = matched_release {
-            Some(self.mb.lookup_release(&release.id).await?)
-        } else {
-            None
-        };
+        println!(
+            "  Matched: {} - {} ({})",
+            best.artist_name(),
+            best.title,
+            best.year().map_or_else(|| "????".into(), |y| y.to_string())
+        );
 
-        let album = Album {
+        let release = self.mb.lookup_release(&best.id).await?;
+        Ok(Some(release))
+    }
+
+    /// Create an Album struct from candidate and optional release info.
+    fn create_album(candidate: &AlbumCandidate, release: Option<&Release>) -> Album {
+        Album {
             id: None,
-            album: release_info
-                .as_ref()
-                .map_or_else(|| candidate.album.clone(), |r| r.title.clone()),
-            albumartist: release_info
-                .as_ref()
-                .map_or_else(|| candidate.artist.clone(), Release::artist_name),
-            year: release_info.as_ref().and_then(Release::year),
+            album: release.map_or_else(|| candidate.album.clone(), |r| r.title.clone()),
+            albumartist: release.map_or_else(|| candidate.artist.clone(), Release::artist_name),
+            year: release.and_then(Release::year),
             artpath: None,
-            mb_albumid: release_info.as_ref().map(|r| r.id.clone()),
+            mb_albumid: release.map(|r| r.id.clone()),
             added: chrono::Utc::now(),
-        };
-        let album_id = self.db.insert_album(&album)?;
+        }
+    }
 
-        if self.config.fetch_art {
-            if let Some(ref release) = release_info {
-                if let Ok(Some(art)) = self.mb.fetch_cover_art(&release.id).await {
-                    let art_path = self.config.library_dir.join(format!(
-                        "{}/{}/cover.jpg",
-                        album.albumartist, album.album
-                    ));
-                    if let Some(parent) = art_path.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    std::fs::write(&art_path, art)?;
-                    println!("  Downloaded cover art");
-                }
+    /// Fetch and save cover art if configured and available.
+    #[allow(clippy::future_not_send)]
+    async fn fetch_and_save_cover_art(&self, album: &Album, release: Option<&Release>) {
+        if !self.config.fetch_art {
+            return;
+        }
+
+        let Some(release) = release else {
+            return;
+        };
+
+        let Ok(Some(art)) = self.mb.fetch_cover_art(&release.id).await else {
+            return;
+        };
+
+        let art_path = self.config.library_dir.join(format!(
+            "{}/{}/cover.jpg",
+            album.albumartist, album.album
+        ));
+
+        if let Some(parent) = art_path.parent() {
+            if std::fs::create_dir_all(parent).is_err() {
+                return;
             }
         }
 
-        let matched_items = release_info
-            .as_ref()
-            .map_or_else(
-                || candidate.items.clone(),
-                |release| match_tracks(candidate.items.clone(), release),
-            );
+        if std::fs::write(&art_path, art).is_ok() {
+            println!("  Downloaded cover art");
+        }
+    }
 
-        for mut item in matched_items {
+    /// Match items to release tracks if release info is available.
+    fn match_items_to_release(items: Vec<Item>, release: Option<&Release>) -> Vec<Item> {
+        match release {
+            Some(rel) => match_tracks(items, rel),
+            None => items,
+        }
+    }
+
+    /// Import matched items into the database.
+    fn import_items(&self, items: Vec<Item>, album_id: i64) -> Result<()> {
+        for mut item in items {
             if self.db.item_exists(&item.path)? {
                 continue;
             }
@@ -163,8 +232,6 @@ impl<'a> Importer<'a> {
 
             self.db.insert_item(&item)?;
         }
-
-        println!("  Imported successfully");
         Ok(())
     }
 
@@ -205,14 +272,71 @@ impl<'a> Importer<'a> {
     }
 }
 
-fn scan(path: &Path) -> Vec<Item> {
-    let spinner = ProgressBar::new_spinner();
-    spinner.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.green} Scanning: {msg}")
-            .unwrap(),
-    );
+/// Trait for reporting scan progress.
+pub trait ScanProgress: Sync {
+    /// Called when files have been found.
+    fn on_files_found(&self, count: usize);
+    /// Called periodically during scanning.
+    fn tick(&self);
+    /// Called when scanning is complete.
+    fn finish(&self, track_count: usize);
+}
 
+/// Console-based progress reporter using indicatif.
+pub struct ConsoleProgress {
+    bar: ProgressBar,
+}
+
+impl ConsoleProgress {
+    /// Create a new console progress reporter.
+    #[must_use]
+    pub fn new() -> Self {
+        let bar = ProgressBar::new_spinner();
+        if let Ok(style) =
+            ProgressStyle::default_spinner().template("{spinner:.green} Scanning: {msg}")
+        {
+            bar.set_style(style);
+        }
+        Self { bar }
+    }
+}
+
+impl Default for ConsoleProgress {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ScanProgress for ConsoleProgress {
+    fn on_files_found(&self, count: usize) {
+        self.bar.set_message(format!("Found {count} files"));
+    }
+
+    fn tick(&self) {
+        self.bar.tick();
+    }
+
+    fn finish(&self, track_count: usize) {
+        self.bar
+            .finish_with_message(format!("Scanned {track_count} tracks"));
+    }
+}
+
+/// No-op progress reporter for testing or silent operation.
+pub struct NoProgress;
+
+impl ScanProgress for NoProgress {
+    fn on_files_found(&self, _count: usize) {}
+    fn tick(&self) {}
+    fn finish(&self, _track_count: usize) {}
+}
+
+fn scan(path: &Path) -> Vec<Item> {
+    let progress = ConsoleProgress::new();
+    scan_with_progress(path, &progress)
+}
+
+fn scan_with_progress<P: ScanProgress>(path: &Path, progress: &P) -> Vec<Item> {
     let files: Vec<PathBuf> = WalkDir::new(path)
         .follow_links(true)
         .into_iter()
@@ -222,17 +346,17 @@ fn scan(path: &Path) -> Vec<Item> {
         .map(|e| e.path().to_path_buf())
         .collect();
 
-    spinner.set_message(format!("Found {} files", files.len()));
+    progress.on_files_found(files.len());
 
     let items: Vec<Item> = files
         .par_iter()
         .filter_map(|p| {
-            spinner.tick();
+            progress.tick();
             read_tags(p).ok()
         })
         .collect();
 
-    spinner.finish_with_message(format!("Scanned {} tracks", items.len()));
+    progress.finish(items.len());
     items
 }
 
@@ -264,11 +388,13 @@ fn pick_best_match<'b>(candidate: &AlbumCandidate, releases: &'b [Release]) -> O
         let artist_sim = strsim::jaro_winkler(&candidate.artist, &r.artist_name());
         let album_sim = strsim::jaro_winkler(&candidate.album, &r.title);
         let track_count_match = if r.tracks().len() == candidate.items.len() {
-            0.2
+            matching::TRACK_COUNT_BONUS
         } else {
             0.0
         };
-        (artist_sim + album_sim + track_count_match).mul_add(100.0, 0.0).clamp(0.0, f64::from(u32::MAX)) as u32
+        (artist_sim + album_sim + track_count_match)
+            .mul_add(matching::SCORE_MULTIPLIER, 0.0)
+            .clamp(0.0, f64::from(u32::MAX)) as u32
     })
 }
 
@@ -284,25 +410,34 @@ fn match_tracks(mut items: Vec<Item>, release: &Release) -> Vec<Item> {
     for (i, item) in items.iter().enumerate() {
         for (j, track) in tracks.iter().enumerate() {
             let title_dist = strsim::jaro_winkler(&item.title, &track.title);
-            let length_dist = track.length.map_or(0.5, |tl| {
+            let length_dist = track.length.map_or(matching::length::UNKNOWN_SCORE, |tl| {
                 // tl is track length in ms (u64→f64 precision loss acceptable for comparison)
-                let diff = item.length.mul_add(1000.0, -(tl as f64)).abs();
-                if diff < 3000.0 {
-                    1.0
-                } else if diff < 10000.0 {
-                    0.7
+                let diff = item
+                    .length
+                    .mul_add(matching::cost::SECONDS_TO_MS, -(tl as f64))
+                    .abs();
+                if diff < matching::length::PERFECT_THRESHOLD_MS {
+                    matching::length::PERFECT_SCORE
+                } else if diff < matching::length::GOOD_THRESHOLD_MS {
+                    matching::length::GOOD_SCORE
                 } else {
-                    0.3
+                    matching::length::POOR_SCORE
                 }
             });
-            let cost = (title_dist + length_dist).mul_add(-5000.0, 10000.0).round() as i64;
+            let cost = (title_dist + length_dist)
+                .mul_add(
+                    matching::cost::SIMILARITY_MULTIPLIER,
+                    matching::cost::BASE_OFFSET,
+                )
+                .round() as i64;
             matrix[i][j] = cost;
         }
     }
 
-    let assignment = pathfinding::kuhn_munkres::kuhn_munkres_min(
-        &pathfinding::matrix::Matrix::from_rows(matrix).unwrap(),
-    );
+    let Ok(matrix_obj) = pathfinding::matrix::Matrix::from_rows(matrix) else {
+        return items; // Return unmatched if matrix construction fails
+    };
+    let assignment = pathfinding::kuhn_munkres::kuhn_munkres_min(&matrix_obj);
 
     for (item_idx, track_idx) in assignment.1.iter().enumerate() {
         if item_idx < items.len() && *track_idx < tracks.len() {

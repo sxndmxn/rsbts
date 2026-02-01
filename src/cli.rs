@@ -63,7 +63,7 @@ async fn import(
         library_dir: config.library.directory.clone(),
     };
 
-    let importer = Importer::new(db, import_config);
+    let importer = Importer::new(db, import_config)?;
 
     for path in paths {
         importer

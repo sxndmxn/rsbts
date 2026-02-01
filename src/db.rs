@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 
 use crate::{Album, AudioFormat, Item, Result};
@@ -32,70 +32,15 @@ impl Database {
     /// # Errors
     /// Returns an error if migrations fail.
     pub fn migrate(&self) -> Result<()> {
-        self.conn.execute_batch(
-            r"
-            CREATE TABLE IF NOT EXISTS albums (
-                id INTEGER PRIMARY KEY,
-                album TEXT NOT NULL,
-                albumartist TEXT NOT NULL,
-                year INTEGER,
-                artpath TEXT,
-                mb_albumid TEXT,
-                added TEXT NOT NULL
-            );
+        crate::migrations::run_migrations(&self.conn)
+    }
 
-            CREATE TABLE IF NOT EXISTS items (
-                id INTEGER PRIMARY KEY,
-                album_id INTEGER REFERENCES albums(id),
-                path TEXT NOT NULL UNIQUE,
-                title TEXT NOT NULL,
-                artist TEXT NOT NULL,
-                album TEXT NOT NULL,
-                albumartist TEXT,
-                genre TEXT,
-                year INTEGER,
-                track INTEGER,
-                disc INTEGER,
-                format TEXT NOT NULL,
-                bitrate INTEGER NOT NULL,
-                length REAL NOT NULL,
-                mb_trackid TEXT,
-                mb_albumid TEXT,
-                added TEXT NOT NULL,
-                mtime TEXT NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_items_artist ON items(artist);
-            CREATE INDEX IF NOT EXISTS idx_items_album ON items(album);
-            CREATE INDEX IF NOT EXISTS idx_items_year ON items(year);
-            CREATE INDEX IF NOT EXISTS idx_items_genre ON items(genre);
-            CREATE INDEX IF NOT EXISTS idx_items_path ON items(path);
-
-            CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
-                title, artist, album, albumartist, genre,
-                content='items',
-                content_rowid='id'
-            );
-
-            CREATE TRIGGER IF NOT EXISTS items_ai AFTER INSERT ON items BEGIN
-                INSERT INTO items_fts(rowid, title, artist, album, albumartist, genre)
-                VALUES (new.id, new.title, new.artist, new.album, new.albumartist, new.genre);
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS items_ad AFTER DELETE ON items BEGIN
-                INSERT INTO items_fts(items_fts, rowid, title, artist, album, albumartist, genre)
-                VALUES ('delete', old.id, old.title, old.artist, old.album, old.albumartist, old.genre);
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS items_au AFTER UPDATE ON items BEGIN
-                INSERT INTO items_fts(items_fts, rowid, title, artist, album, albumartist, genre)
-                VALUES ('delete', old.id, old.title, old.artist, old.album, old.albumartist, old.genre);
-                INSERT INTO items_fts(rowid, title, artist, album, albumartist, genre)
-                VALUES (new.id, new.title, new.artist, new.album, new.albumartist, new.genre);
-            END;
-            ",
-        )?;
-        Ok(())
+    /// Get the current migration version.
+    ///
+    /// # Errors
+    /// Returns an error if the query fails.
+    pub fn migration_version(&self) -> Result<u32> {
+        crate::migrations::current_version(&self.conn)
     }
 
     /// Insert an album and return its ID.
@@ -185,17 +130,55 @@ impl Database {
         Ok(())
     }
 
+    /// Allowed fields for `modify_item` to prevent SQL injection.
+    const ALLOWED_ITEM_FIELDS: &[&'static str] = &[
+        "title",
+        "artist",
+        "album",
+        "albumartist",
+        "genre",
+        "year",
+        "track",
+        "disc",
+        "format",
+        "bitrate",
+        "length",
+        "mb_trackid",
+        "mb_albumid",
+    ];
+
     /// Modify an item's fields.
     ///
     /// # Errors
-    /// Returns an error if the update fails.
+    /// Returns an error if the update fails or field is invalid.
     pub fn modify_item(&self, id: i64, fields: &[String]) -> Result<()> {
         for field in fields {
             let Some((key, value)) = field.split_once('=') else {
                 continue;
             };
-            let sql = format!("UPDATE items SET {key} = ?1 WHERE id = ?2");
-            self.conn.execute(&sql, params![value, id])?;
+
+            if !Self::ALLOWED_ITEM_FIELDS.contains(&key) {
+                return Err(crate::Error::Query(format!("Invalid field: {key}")));
+            }
+
+            // Use match for safe SQL generation - each field maps to explicit SQL
+            let sql = match key {
+                "title" => "UPDATE items SET title = ?1 WHERE id = ?2",
+                "artist" => "UPDATE items SET artist = ?1 WHERE id = ?2",
+                "album" => "UPDATE items SET album = ?1 WHERE id = ?2",
+                "albumartist" => "UPDATE items SET albumartist = ?1 WHERE id = ?2",
+                "genre" => "UPDATE items SET genre = ?1 WHERE id = ?2",
+                "year" => "UPDATE items SET year = ?1 WHERE id = ?2",
+                "track" => "UPDATE items SET track = ?1 WHERE id = ?2",
+                "disc" => "UPDATE items SET disc = ?1 WHERE id = ?2",
+                "format" => "UPDATE items SET format = ?1 WHERE id = ?2",
+                "bitrate" => "UPDATE items SET bitrate = ?1 WHERE id = ?2",
+                "length" => "UPDATE items SET length = ?1 WHERE id = ?2",
+                "mb_trackid" => "UPDATE items SET mb_trackid = ?1 WHERE id = ?2",
+                "mb_albumid" => "UPDATE items SET mb_albumid = ?1 WHERE id = ?2",
+                _ => continue, // Should never reach here due to whitelist check above
+            };
+            self.conn.execute(sql, params![value, id])?;
         }
         Ok(())
     }
@@ -233,21 +216,28 @@ impl Database {
     /// # Errors
     /// Returns an error if the query fails.
     pub fn query_albums(&self, query: Option<&str>) -> Result<Vec<Album>> {
-        let sql = query.map_or_else(
-            || "SELECT * FROM albums ORDER BY albumartist, year, album".into(),
-            |q| {
-                let escaped = q.replace('\'', "''");
-                format!(
-                    "SELECT * FROM albums WHERE album LIKE '%{escaped}%' OR albumartist LIKE '%{escaped}%' ORDER BY albumartist, year, album"
-                )
-            },
-        );
-
-        let mut stmt = self.conn.prepare(&sql)?;
-        let albums = stmt
-            .query_map([], row_to_album)?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(albums)
+        match query {
+            None => {
+                let mut stmt = self
+                    .conn
+                    .prepare("SELECT * FROM albums ORDER BY albumartist, year, album")?;
+                let albums = stmt
+                    .query_map([], row_to_album)?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(albums)
+            }
+            Some(q) => {
+                let pattern = format!("%{q}%");
+                let mut stmt = self.conn.prepare(
+                    "SELECT * FROM albums WHERE album LIKE ?1 OR albumartist LIKE ?1 \
+                     ORDER BY albumartist, year, album",
+                )?;
+                let albums = stmt
+                    .query_map([&pattern], row_to_album)?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(albums)
+            }
+        }
     }
 
     /// Get library statistics.
@@ -301,53 +291,69 @@ impl Database {
     }
 }
 
-fn row_to_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
-    let format_str: String = row.get("format")?;
-    let path_str: String = row.get("path")?;
-    let added_str: String = row.get("added")?;
-    let mtime_str: String = row.get("mtime")?;
-    let artpath_str: Option<String> = row.get("albumartist")?;
+/// Trait for converting database rows to domain types.
+trait FromRow: Sized {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self>;
+}
 
-    Ok(Item {
-        id: row.get("id")?,
-        album_id: row.get("album_id")?,
-        path: path_str.into(),
-        title: row.get("title")?,
-        artist: row.get("artist")?,
-        album: row.get("album")?,
-        albumartist: artpath_str,
-        genre: row.get("genre")?,
-        year: row.get("year")?,
-        track: row.get("track")?,
-        disc: row.get("disc")?,
-        format: AudioFormat::from_extension(&format_str),
-        bitrate: row.get("bitrate")?,
-        length: row.get("length")?,
-        mb_trackid: row.get("mb_trackid")?,
-        mb_albumid: row.get("mb_albumid")?,
-        added: parse_datetime(&added_str),
-        mtime: parse_datetime(&mtime_str),
-    })
+impl FromRow for Item {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        let format_str: String = row.get("format")?;
+        let path_str: String = row.get("path")?;
+        let added_str: String = row.get("added")?;
+        let mtime_str: String = row.get("mtime")?;
+        let albumartist: Option<String> = row.get("albumartist")?;
+
+        Ok(Self {
+            id: row.get("id")?,
+            album_id: row.get("album_id")?,
+            path: path_str.into(),
+            title: row.get("title")?,
+            artist: row.get("artist")?,
+            album: row.get("album")?,
+            albumartist,
+            genre: row.get("genre")?,
+            year: row.get("year")?,
+            track: row.get("track")?,
+            disc: row.get("disc")?,
+            format: AudioFormat::from_extension(&format_str),
+            bitrate: row.get("bitrate")?,
+            length: row.get("length")?,
+            mb_trackid: row.get("mb_trackid")?,
+            mb_albumid: row.get("mb_albumid")?,
+            added: parse_datetime(&added_str),
+            mtime: parse_datetime(&mtime_str),
+        })
+    }
+}
+
+impl FromRow for Album {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        let artpath_str: Option<String> = row.get("artpath")?;
+        let added_str: String = row.get("added")?;
+
+        Ok(Self {
+            id: row.get("id")?,
+            album: row.get("album")?,
+            albumartist: row.get("albumartist")?,
+            year: row.get("year")?,
+            artpath: artpath_str.map(Into::into),
+            mb_albumid: row.get("mb_albumid")?,
+            added: parse_datetime(&added_str),
+        })
+    }
+}
+
+fn row_to_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
+    Item::from_row(row)
 }
 
 fn row_to_album(row: &rusqlite::Row<'_>) -> rusqlite::Result<Album> {
-    let artpath_str: Option<String> = row.get("artpath")?;
-    let added_str: String = row.get("added")?;
-
-    Ok(Album {
-        id: row.get("id")?,
-        album: row.get("album")?,
-        albumartist: row.get("albumartist")?,
-        year: row.get("year")?,
-        artpath: artpath_str.map(Into::into),
-        mb_albumid: row.get("mb_albumid")?,
-        added: parse_datetime(&added_str),
-    })
+    Album::from_row(row)
 }
 
 fn parse_datetime(s: &str) -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339(s).map_or_else(
-        |_| Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).unwrap(),
-        |dt| dt.with_timezone(&Utc),
-    )
+    DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or(DateTime::UNIX_EPOCH)
 }

@@ -10,40 +10,154 @@
 
 use crate::Result;
 
-/// Convert a query string to SQL.
+/// A parsed query term in the AST.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryTerm {
+    /// Full-text search term
+    FullText(String),
+    /// Field-based filter
+    Field {
+        negated: bool,
+        name: String,
+        op: FieldOp,
+    },
+    /// Sort directive
+    Sort { field: String, ascending: bool },
+}
+
+/// Field operation types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FieldOp {
+    /// Substring match (default): field LIKE '%value%'
+    Substring(String),
+    /// Exact match: field = 'value'
+    Exact(String),
+    /// Regex/glob match: field GLOB 'pattern'
+    Regex(String),
+    /// Range match: field BETWEEN start AND end
+    Range {
+        start: Option<String>,
+        end: Option<String>,
+    },
+    /// Relative date: added >= 'date'
+    RelativeDate(String),
+}
+
+/// Parse a query string into AST terms.
 ///
 /// # Errors
-/// Returns an error if the query cannot be parsed.
-pub fn to_sql(query: &str) -> Result<String> {
-    let mut conditions = Vec::new();
-    let mut order_by = Vec::new();
+/// Returns an error if parsing fails.
+pub fn parse(query: &str) -> Result<Vec<QueryTerm>> {
+    let mut terms = Vec::new();
 
     for term in query.split_whitespace() {
+        // Sort directive (ascending)
         if let Some(rest) = term.strip_suffix('+') {
-            order_by.push(format!("{rest} ASC"));
-            continue;
-        }
-        if let Some(rest) = term.strip_suffix('-') {
-            order_by.push(format!("{rest} DESC"));
+            terms.push(QueryTerm::Sort {
+                field: rest.to_string(),
+                ascending: true,
+            });
             continue;
         }
 
+        // Sort directive (descending)
+        if let Some(rest) = term.strip_suffix('-') {
+            terms.push(QueryTerm::Sort {
+                field: rest.to_string(),
+                ascending: false,
+            });
+            continue;
+        }
+
+        // Negation prefix
         let (negated, term) = term
             .strip_prefix('^')
             .map_or((false, term), |rest| (true, rest));
 
         if let Some((field, value)) = term.split_once(':') {
-            let condition = parse_field_query(field, value);
-            if negated {
-                conditions.push(format!("NOT ({condition})"));
-            } else {
-                conditions.push(condition);
-            }
+            let op = parse_field_op(field, value);
+            terms.push(QueryTerm::Field {
+                negated,
+                name: field.to_string(),
+                op,
+            });
         } else {
-            conditions.push(format!(
-                "id IN (SELECT rowid FROM items_fts WHERE items_fts MATCH '{}')",
-                term.replace('\'', "''")
-            ));
+            terms.push(QueryTerm::FullText(term.to_string()));
+        }
+    }
+
+    Ok(terms)
+}
+
+/// Parse a field operation from the value string.
+fn parse_field_op(field: &str, value: &str) -> FieldOp {
+    // Exact match
+    if let Some(exact) = value.strip_prefix('=') {
+        return FieldOp::Exact(exact.to_string());
+    }
+
+    // Regex/glob match
+    if let Some(pattern) = value.strip_prefix(':') {
+        return FieldOp::Regex(pattern.to_string());
+    }
+
+    // Range match
+    if value.contains("..") {
+        let parts: Vec<&str> = value.split("..").collect();
+        if parts.len() == 2 {
+            let start = if parts[0].is_empty() {
+                None
+            } else {
+                Some(parts[0].to_string())
+            };
+            let end = if parts[1].is_empty() {
+                None
+            } else {
+                Some(parts[1].to_string())
+            };
+            return FieldOp::Range { start, end };
+        }
+    }
+
+    // Relative date
+    if field == "added" && value.starts_with('-') {
+        if let Some(date) = parse_relative_date(value) {
+            return FieldOp::RelativeDate(date);
+        }
+    }
+
+    // Substring match (default)
+    FieldOp::Substring(value.to_string())
+}
+
+/// Convert AST terms to SQL.
+///
+/// # Errors
+/// Returns an error if SQL generation fails.
+pub fn terms_to_sql(terms: &[QueryTerm]) -> Result<String> {
+    let mut conditions = Vec::new();
+    let mut order_by = Vec::new();
+
+    for term in terms {
+        match term {
+            QueryTerm::FullText(text) => {
+                conditions.push(format!(
+                    "id IN (SELECT rowid FROM items_fts WHERE items_fts MATCH '{}')",
+                    text.replace('\'', "''")
+                ));
+            }
+            QueryTerm::Field { negated, name, op } => {
+                let condition = field_op_to_sql(name, op);
+                if *negated {
+                    conditions.push(format!("NOT ({condition})"));
+                } else {
+                    conditions.push(condition);
+                }
+            }
+            QueryTerm::Sort { field, ascending } => {
+                let direction = if *ascending { "ASC" } else { "DESC" };
+                order_by.push(format!("{field} {direction}"));
+            }
         }
     }
 
@@ -62,43 +176,38 @@ pub fn to_sql(query: &str) -> Result<String> {
     Ok(format!("SELECT * FROM items {where_clause} {order_clause}"))
 }
 
-fn parse_field_query(field: &str, value: &str) -> String {
-    // Exact match
-    if let Some(exact) = value.strip_prefix('=') {
-        return format!("{field} = '{}'", exact.replace('\'', "''"));
-    }
-
-    // Regex match
-    if let Some(pattern) = value.strip_prefix(':') {
-        let glob = regex_to_glob(pattern);
-        return format!("{field} GLOB '{glob}'");
-    }
-
-    // Range match
-    if value.contains("..") {
-        let parts: Vec<&str> = value.split("..").collect();
-        if parts.len() == 2 {
-            let start = parts[0];
-            let end = parts[1];
-            if !start.is_empty() && !end.is_empty() {
-                return format!("{field} BETWEEN '{start}' AND '{end}'");
-            } else if !start.is_empty() {
-                return format!("{field} >= '{start}'");
-            } else if !end.is_empty() {
-                return format!("{field} <= '{end}'");
-            }
+/// Convert a field operation to SQL.
+fn field_op_to_sql(field: &str, op: &FieldOp) -> String {
+    match op {
+        FieldOp::Substring(value) => {
+            format!("{field} LIKE '%{}%'", value.replace('\'', "''"))
+        }
+        FieldOp::Exact(value) => {
+            format!("{field} = '{}'", value.replace('\'', "''"))
+        }
+        FieldOp::Regex(pattern) => {
+            let glob = regex_to_glob(pattern);
+            format!("{field} GLOB '{glob}'")
+        }
+        FieldOp::Range { start, end } => match (start, end) {
+            (Some(s), Some(e)) => format!("{field} BETWEEN '{s}' AND '{e}'"),
+            (Some(s), None) => format!("{field} >= '{s}'"),
+            (None, Some(e)) => format!("{field} <= '{e}'"),
+            (None, None) => format!("{field} IS NOT NULL"),
+        },
+        FieldOp::RelativeDate(date) => {
+            format!("{field} >= '{date}'")
         }
     }
+}
 
-    // Relative date
-    if field == "added" && value.starts_with('-') {
-        if let Some(date) = parse_relative_date(value) {
-            return format!("added >= '{date}'");
-        }
-    }
-
-    // Substring match (default)
-    format!("{field} LIKE '%{}%'", value.replace('\'', "''"))
+/// Convert a query string to SQL.
+///
+/// # Errors
+/// Returns an error if the query cannot be parsed.
+pub fn to_sql(query: &str) -> Result<String> {
+    let terms = parse(query)?;
+    terms_to_sql(&terms)
 }
 
 fn regex_to_glob(pattern: &str) -> String {
@@ -152,5 +261,39 @@ mod tests {
     fn test_negation() {
         let sql = to_sql("^genre:jazz").unwrap();
         assert!(sql.contains("NOT (genre LIKE '%jazz%')"));
+    }
+
+    #[test]
+    fn test_parse_fulltext() {
+        let terms = parse("beatles").unwrap();
+        assert_eq!(terms.len(), 1);
+        assert!(matches!(&terms[0], QueryTerm::FullText(s) if s == "beatles"));
+    }
+
+    #[test]
+    fn test_parse_field() {
+        let terms = parse("artist:beatles").unwrap();
+        assert_eq!(terms.len(), 1);
+        assert!(matches!(
+            &terms[0],
+            QueryTerm::Field {
+                negated: false,
+                name,
+                op: FieldOp::Substring(v)
+            } if name == "artist" && v == "beatles"
+        ));
+    }
+
+    #[test]
+    fn test_parse_sort() {
+        let terms = parse("year+").unwrap();
+        assert_eq!(terms.len(), 1);
+        assert!(matches!(
+            &terms[0],
+            QueryTerm::Sort {
+                field,
+                ascending: true
+            } if field == "year"
+        ));
     }
 }

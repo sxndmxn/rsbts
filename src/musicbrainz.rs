@@ -77,18 +77,19 @@ pub struct Recording {
 impl Client {
     /// Create a new `MusicBrainz` API client.
     ///
-    /// # Panics
-    /// Panics if the HTTP client cannot be built (should never happen).
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            http: reqwest::Client::builder()
-                .user_agent(USER_AGENT)
-                .timeout(Duration::from_secs(30))
-                .build()
-                .expect("Failed to create HTTP client"),
+    /// # Errors
+    /// Returns an error if the HTTP client cannot be built (should never happen).
+    pub fn new() -> Result<Self> {
+        let http = reqwest::Client::builder()
+            .user_agent(USER_AGENT)
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| Error::MusicBrainz(format!("Failed to create HTTP client: {e}")))?;
+
+        Ok(Self {
+            http,
             last_request: Mutex::new(None),
-        }
+        })
     }
 
     async fn rate_limit(&self) {
@@ -209,12 +210,6 @@ impl Client {
             .map_err(|e| Error::MusicBrainz(e.to_string()))?;
 
         Ok(Some(bytes.to_vec()))
-    }
-}
-
-impl Default for Client {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
