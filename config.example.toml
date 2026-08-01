@@ -19,6 +19,25 @@ action = "copy"
 # Fetch album art from Cover Art Archive
 fetch_art = true
 
+# Follow directory symlinks while scanning (disabled for containment safety)
+follow_symlinks = false
+
+[matching]
+# --yes only applies candidates that pass all structural gates and this score
+auto_accept_threshold = 0.92
+
+# Required lead over the next-best release
+runner_up_margin = 0.05
+
 [musicbrainz]
 # Search result limit
 search_limit = 5
+
+# MusicBrainz requires an identifying user agent with a project URL or contact
+user_agent = "rsbts/0.2.0 (https://github.com/sxndmxn/rsbts)"
+
+# MusicBrainz permits one request per second for this client
+rate_limit_seconds = 1.0
+
+# Retry transient 429/5xx responses
+max_retries = 3

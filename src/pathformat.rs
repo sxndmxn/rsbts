@@ -7,6 +7,8 @@
 //! Variables: albumartist, artist, album, year, track, title, disc, genre
 //! Functions: upper, lower, if, left, right
 
+use std::path::{Component, Path, PathBuf};
+
 use crate::{Error, Item, Result};
 
 /// Format a path template with item metadata.
@@ -28,7 +30,7 @@ pub fn format_path(template: &str, item: &Item) -> Result<String> {
                 let func = collect_identifier(&mut chars);
                 if chars.peek() == Some(&'{') {
                     chars.next();
-                    let arg = collect_until_close(&mut chars);
+                    let arg = collect_until_close(&mut chars)?;
                     let value = apply_function(&func, &arg, item)?;
                     result.push_str(&sanitize(&value));
                 } else {
@@ -40,6 +42,38 @@ pub fn format_path(template: &str, item: &Item) -> Result<String> {
     }
 
     Ok(result)
+}
+
+/// Format and validate a relative destination path.
+pub fn format_relative_path(template: &str, item: &Item) -> Result<PathBuf> {
+    let formatted = format_path(template, item)?;
+    let path = Path::new(&formatted);
+    if path.is_absolute() {
+        return Err(Error::PathFormat(
+            "path template produced an absolute path".into(),
+        ));
+    }
+    let mut safe = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(value) if value != "." && value != ".." => safe.push(value),
+            Component::CurDir => {}
+            Component::Normal(_)
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => {
+                return Err(Error::PathFormat(format!(
+                    "unsafe path component in formatted path: {formatted}"
+                )));
+            }
+        }
+    }
+    if safe.as_os_str().is_empty() {
+        return Err(Error::PathFormat(
+            "path template produced an empty path".into(),
+        ));
+    }
+    Ok(safe)
 }
 
 fn collect_identifier(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
@@ -55,7 +89,7 @@ fn collect_identifier(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> S
     ident
 }
 
-fn collect_until_close(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
+fn collect_until_close(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Result<String> {
     let mut content = String::new();
     let mut depth = 1;
     for c in chars.by_ref() {
@@ -66,14 +100,14 @@ fn collect_until_close(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> 
             '}' => {
                 depth -= 1;
                 if depth == 0 {
-                    break;
+                    return Ok(content);
                 }
             }
             _ => {}
         }
         content.push(c);
     }
-    content
+    Err(Error::PathFormat("missing closing '}'".into()))
 }
 
 fn get_variable(name: &str, item: &Item) -> Result<String> {
@@ -154,14 +188,20 @@ fn to_title_case(s: &str) -> String {
 }
 
 fn sanitize(s: &str) -> String {
-    s.chars()
+    let sanitized = s
+        .chars()
         .map(|c| match c {
             '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\0' => '_',
             _ => c,
         })
         .collect::<String>()
         .trim()
-        .to_string()
+        .to_string();
+    if sanitized == "." || sanitized == ".." || sanitized.is_empty() {
+        "_".to_string()
+    } else {
+        sanitized
+    }
 }
 
 #[cfg(test)]
@@ -185,24 +225,50 @@ mod tests {
             format: crate::AudioFormat::Mp3,
             bitrate: 320,
             length: 180.0,
-            mb_trackid: None,
-            mb_albumid: None,
+            file_size: Some(1),
+            track_external_id: None,
+            release_external_id: None,
             added: Utc::now(),
             mtime: Utc::now(),
         }
     }
 
     #[test]
-    fn test_simple_template() {
+    fn test_simple_template() -> Result<()> {
         let item = test_item();
-        let result = format_path("$artist/$album/$track - $title", &item).unwrap();
+        let result = format_path("$artist/$album/$track - $title", &item)?;
         assert_eq!(result, "The Beatles/Help!/01 - Help!");
+        Ok(())
     }
 
     #[test]
-    fn test_functions() {
+    fn test_functions() -> Result<()> {
         let item = test_item();
-        let result = format_path("%upper{$artist}", &item).unwrap();
+        let result = format_path("%upper{$artist}", &item)?;
         assert_eq!(result, "THE BEATLES");
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_absolute_and_parent_paths() {
+        let item = test_item();
+        assert!(format_relative_path("/$artist/$title", &item).is_err());
+        assert!(format_relative_path("../$artist/$title", &item).is_err());
+    }
+
+    #[test]
+    fn neutralizes_dot_metadata_components() -> Result<()> {
+        let mut item = test_item();
+        item.artist = "..".into();
+        assert_eq!(
+            format_relative_path("$artist/$title", &item)?,
+            PathBuf::from("_/Help!")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_unclosed_functions() {
+        assert!(format_path("%upper{$artist", &test_item()).is_err());
     }
 }

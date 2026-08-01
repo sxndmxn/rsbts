@@ -15,7 +15,9 @@ pub fn read_tags(path: &Path) -> Result<Item> {
     let tagged_file = Probe::open(path)?.read()?;
 
     let properties = tagged_file.properties();
-    let tag = tagged_file.primary_tag().or_else(|| tagged_file.first_tag());
+    let tag = tagged_file
+        .primary_tag()
+        .or_else(|| tagged_file.first_tag());
 
     let format = path
         .extension()
@@ -23,6 +25,7 @@ pub fn read_tags(path: &Path) -> Result<Item> {
         .map_or(AudioFormat::Unknown, AudioFormat::from_extension);
 
     let mtime = std::fs::metadata(path)?.modified()?.into();
+    let file_size = std::fs::metadata(path)?.len();
 
     let (title, artist, album, albumartist, genre, year, track, disc) = tag.map_or_else(
         || {
@@ -42,7 +45,8 @@ pub fn read_tags(path: &Path) -> Result<Item> {
                 tag.title().map(|s| s.to_string()).unwrap_or_default(),
                 tag.artist().map(|s| s.to_string()).unwrap_or_default(),
                 tag.album().map(|s| s.to_string()).unwrap_or_default(),
-                tag.get_string(&lofty::tag::ItemKey::AlbumArtist).map(String::from),
+                tag.get_string(&lofty::tag::ItemKey::AlbumArtist)
+                    .map(String::from),
                 tag.genre().map(|s| s.to_string()),
                 tag.year(),
                 tag.track(),
@@ -73,7 +77,7 @@ pub fn read_tags(path: &Path) -> Result<Item> {
         album
     };
 
-    let year = year.map(|y| i32::try_from(y).unwrap_or(0));
+    let year = year.and_then(|value| i32::try_from(value).ok());
 
     Ok(Item {
         id: None,
@@ -90,8 +94,9 @@ pub fn read_tags(path: &Path) -> Result<Item> {
         format,
         bitrate: properties.audio_bitrate().unwrap_or(0),
         length: properties.duration().as_secs_f64(),
-        mb_trackid: None,
-        mb_albumid: None,
+        file_size: Some(file_size),
+        track_external_id: None,
+        release_external_id: None,
         added: Utc::now(),
         mtime,
     })
@@ -104,7 +109,17 @@ pub fn is_audio_file(path: &Path) -> bool {
         .is_some_and(|ext| {
             matches!(
                 ext.to_lowercase().as_str(),
-                "mp3" | "flac" | "ogg" | "oga" | "opus" | "m4a" | "aac" | "wav" | "aiff" | "aif"
+                "mp3"
+                    | "flac"
+                    | "ogg"
+                    | "oga"
+                    | "opus"
+                    | "m4a"
+                    | "aac"
+                    | "alac"
+                    | "wav"
+                    | "aiff"
+                    | "aif"
             )
         })
 }

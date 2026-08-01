@@ -1,213 +1,348 @@
-//! Query language parser
-//!
-//! Syntax:
-//!   keyword                   - FTS search
-//!   `artist:beatles`          - Field substring
-//!   `title:=Help!`            - Exact match
-//!   `genre::^rock`            - Regex/glob
-//!   `year:1960..1969`         - Range
-//!   `^genre:jazz`             - Negation
+//! Typed query parser and parameterized SQL compiler.
 
-use crate::Result;
+use std::str::FromStr;
 
-/// A parsed query term in the AST.
+use rusqlite::types::Value;
+
+use crate::{Error, Result};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum QueryTerm {
-    /// Full-text search term
-    FullText(String),
-    /// Field-based filter
-    Field {
-        negated: bool,
-        name: String,
-        op: FieldOp,
-    },
-    /// Sort directive
-    Sort { field: String, ascending: bool },
+pub struct Query {
+    terms: Vec<QueryTerm>,
 }
 
-/// Field operation types.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FieldOp {
-    /// Substring match (default): field LIKE '%value%'
+enum QueryTerm {
+    FullText(String),
+    Field {
+        negated: bool,
+        field: QueryField,
+        operation: FieldOperation,
+    },
+    Sort {
+        field: SortField,
+        ascending: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryField {
+    Path,
+    Title,
+    Artist,
+    Album,
+    AlbumArtist,
+    Genre,
+    Year,
+    Track,
+    Disc,
+    Format,
+    Bitrate,
+    Length,
+    Added,
+    Modified,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortField {
+    Path,
+    Title,
+    Artist,
+    Album,
+    AlbumArtist,
+    Genre,
+    Year,
+    Track,
+    Disc,
+    Format,
+    Bitrate,
+    Length,
+    Added,
+    Modified,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FieldOperation {
     Substring(String),
-    /// Exact match: field = 'value'
     Exact(String),
-    /// Regex/glob match: field GLOB 'pattern'
-    Regex(String),
-    /// Range match: field BETWEEN start AND end
+    Glob(String),
     Range {
         start: Option<String>,
         end: Option<String>,
     },
-    /// Relative date: added >= 'date'
     RelativeDate(String),
 }
 
-/// Parse a query string into AST terms.
-///
-/// # Errors
-/// Returns an error if parsing fails.
-pub fn parse(query: &str) -> Result<Vec<QueryTerm>> {
-    let mut terms = Vec::new();
-
-    for term in query.split_whitespace() {
-        // Sort directive (ascending)
-        if let Some(rest) = term.strip_suffix('+') {
-            terms.push(QueryTerm::Sort {
-                field: rest.to_string(),
-                ascending: true,
-            });
-            continue;
-        }
-
-        // Sort directive (descending)
-        if let Some(rest) = term.strip_suffix('-') {
-            terms.push(QueryTerm::Sort {
-                field: rest.to_string(),
-                ascending: false,
-            });
-            continue;
-        }
-
-        // Negation prefix
-        let (negated, term) = term
-            .strip_prefix('^')
-            .map_or((false, term), |rest| (true, rest));
-
-        if let Some((field, value)) = term.split_once(':') {
-            let op = parse_field_op(field, value);
-            terms.push(QueryTerm::Field {
-                negated,
-                name: field.to_string(),
-                op,
-            });
-        } else {
-            terms.push(QueryTerm::FullText(term.to_string()));
-        }
-    }
-
-    Ok(terms)
+#[derive(Debug, Clone)]
+pub struct CompiledQuery {
+    pub sql: String,
+    pub parameters: Vec<Value>,
 }
 
-/// Parse a field operation from the value string.
-fn parse_field_op(field: &str, value: &str) -> FieldOp {
-    // Exact match
-    if let Some(exact) = value.strip_prefix('=') {
-        return FieldOp::Exact(exact.to_string());
+impl Query {
+    #[must_use]
+    pub const fn all() -> Self {
+        Self { terms: Vec::new() }
     }
 
-    // Regex/glob match
-    if let Some(pattern) = value.strip_prefix(':') {
-        return FieldOp::Regex(pattern.to_string());
+    pub fn parse(input: &str) -> Result<Self> {
+        input.parse()
     }
 
-    // Range match
-    if value.contains("..") {
-        let parts: Vec<&str> = value.split("..").collect();
-        if parts.len() == 2 {
-            let start = if parts[0].is_empty() {
-                None
-            } else {
-                Some(parts[0].to_string())
-            };
-            let end = if parts[1].is_empty() {
-                None
-            } else {
-                Some(parts[1].to_string())
-            };
-            return FieldOp::Range { start, end };
-        }
-    }
+    pub fn compile(&self) -> CompiledQuery {
+        let mut conditions = Vec::new();
+        let mut order_by = Vec::new();
+        let mut parameters = Vec::new();
 
-    // Relative date
-    if field == "added" && value.starts_with('-') {
-        if let Some(date) = parse_relative_date(value) {
-            return FieldOp::RelativeDate(date);
-        }
-    }
-
-    // Substring match (default)
-    FieldOp::Substring(value.to_string())
-}
-
-/// Convert AST terms to SQL.
-///
-/// # Errors
-/// Returns an error if SQL generation fails.
-pub fn terms_to_sql(terms: &[QueryTerm]) -> Result<String> {
-    let mut conditions = Vec::new();
-    let mut order_by = Vec::new();
-
-    for term in terms {
-        match term {
-            QueryTerm::FullText(text) => {
-                conditions.push(format!(
-                    "id IN (SELECT rowid FROM items_fts WHERE items_fts MATCH '{}')",
-                    text.replace('\'', "''")
-                ));
-            }
-            QueryTerm::Field { negated, name, op } => {
-                let condition = field_op_to_sql(name, op);
-                if *negated {
-                    conditions.push(format!("NOT ({condition})"));
-                } else {
-                    conditions.push(condition);
+        for term in &self.terms {
+            match term {
+                QueryTerm::FullText(text) => {
+                    conditions.push(
+                        "id IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ?)".to_string(),
+                    );
+                    parameters.push(Value::Text(format!("\"{}\"", text.replace('"', "\"\""))));
+                }
+                QueryTerm::Field {
+                    negated,
+                    field,
+                    operation,
+                } => {
+                    let condition = compile_field(*field, operation, &mut parameters);
+                    conditions.push(if *negated {
+                        format!("NOT ({condition})")
+                    } else {
+                        condition
+                    });
+                }
+                QueryTerm::Sort { field, ascending } => {
+                    order_by.push(format!(
+                        "{} {}",
+                        field.column(),
+                        if *ascending { "ASC" } else { "DESC" }
+                    ));
                 }
             }
-            QueryTerm::Sort { field, ascending } => {
-                let direction = if *ascending { "ASC" } else { "DESC" };
-                order_by.push(format!("{field} {direction}"));
+        }
+
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", conditions.join(" AND "))
+        };
+        let order_clause = if order_by.is_empty() {
+            " ORDER BY artist, album, disc, track".to_string()
+        } else {
+            format!(" ORDER BY {}", order_by.join(", "))
+        };
+        CompiledQuery {
+            sql: format!("SELECT * FROM items{where_clause}{order_clause}"),
+            parameters,
+        }
+    }
+}
+
+impl FromStr for Query {
+    type Err = Error;
+
+    fn from_str(input: &str) -> Result<Self> {
+        if input.trim().is_empty() {
+            return Ok(Self::all());
+        }
+
+        let mut terms = Vec::new();
+        for raw in input.split_whitespace() {
+            if let Some(field) = raw.strip_suffix('+') {
+                terms.push(QueryTerm::Sort {
+                    field: field.parse()?,
+                    ascending: true,
+                });
+                continue;
+            }
+            if let Some(field) = raw.strip_suffix('-').filter(|field| !field.is_empty()) {
+                terms.push(QueryTerm::Sort {
+                    field: field.parse()?,
+                    ascending: false,
+                });
+                continue;
+            }
+
+            let (negated, raw) = raw
+                .strip_prefix('^')
+                .map_or((false, raw), |rest| (true, rest));
+            if let Some((field, value)) = raw.split_once(':') {
+                if value.is_empty() {
+                    return Err(Error::Query(format!("missing value for field {field}")));
+                }
+                let field = field.parse()?;
+                terms.push(QueryTerm::Field {
+                    negated,
+                    field,
+                    operation: parse_operation(field, value)?,
+                });
+            } else {
+                if negated {
+                    return Err(Error::Query(
+                        "negation is supported only for field queries".into(),
+                    ));
+                }
+                terms.push(QueryTerm::FullText(raw.to_string()));
             }
         }
+        Ok(Self { terms })
     }
-
-    let where_clause = if conditions.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", conditions.join(" AND "))
-    };
-
-    let order_clause = if order_by.is_empty() {
-        "ORDER BY artist, album, disc, track".to_string()
-    } else {
-        format!("ORDER BY {}", order_by.join(", "))
-    };
-
-    Ok(format!("SELECT * FROM items {where_clause} {order_clause}"))
 }
 
-/// Convert a field operation to SQL.
-fn field_op_to_sql(field: &str, op: &FieldOp) -> String {
-    match op {
-        FieldOp::Substring(value) => {
-            format!("{field} LIKE '%{}%'", value.replace('\'', "''"))
+impl FromStr for QueryField {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "path" => Ok(Self::Path),
+            "title" => Ok(Self::Title),
+            "artist" => Ok(Self::Artist),
+            "album" => Ok(Self::Album),
+            "albumartist" | "album_artist" => Ok(Self::AlbumArtist),
+            "genre" => Ok(Self::Genre),
+            "year" => Ok(Self::Year),
+            "track" => Ok(Self::Track),
+            "disc" => Ok(Self::Disc),
+            "format" => Ok(Self::Format),
+            "bitrate" => Ok(Self::Bitrate),
+            "length" => Ok(Self::Length),
+            "added" => Ok(Self::Added),
+            "mtime" | "modified" => Ok(Self::Modified),
+            _ => Err(Error::Query(format!("unknown query field: {value}"))),
         }
-        FieldOp::Exact(value) => {
-            format!("{field} = '{}'", value.replace('\'', "''"))
+    }
+}
+
+impl QueryField {
+    const fn column(self) -> &'static str {
+        match self {
+            Self::Path => "path",
+            Self::Title => "title",
+            Self::Artist => "artist",
+            Self::Album => "album",
+            Self::AlbumArtist => "albumartist",
+            Self::Genre => "genre",
+            Self::Year => "year",
+            Self::Track => "track",
+            Self::Disc => "disc",
+            Self::Format => "format",
+            Self::Bitrate => "bitrate",
+            Self::Length => "length",
+            Self::Added => "added",
+            Self::Modified => "mtime",
         }
-        FieldOp::Regex(pattern) => {
-            let glob = regex_to_glob(pattern);
-            format!("{field} GLOB '{glob}'")
+    }
+}
+
+impl FromStr for SortField {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        let query_field: QueryField = value.parse()?;
+        Ok(match query_field {
+            QueryField::Path => Self::Path,
+            QueryField::Title => Self::Title,
+            QueryField::Artist => Self::Artist,
+            QueryField::Album => Self::Album,
+            QueryField::AlbumArtist => Self::AlbumArtist,
+            QueryField::Genre => Self::Genre,
+            QueryField::Year => Self::Year,
+            QueryField::Track => Self::Track,
+            QueryField::Disc => Self::Disc,
+            QueryField::Format => Self::Format,
+            QueryField::Bitrate => Self::Bitrate,
+            QueryField::Length => Self::Length,
+            QueryField::Added => Self::Added,
+            QueryField::Modified => Self::Modified,
+        })
+    }
+}
+
+impl SortField {
+    const fn column(self) -> &'static str {
+        match self {
+            Self::Path => "path",
+            Self::Title => "title",
+            Self::Artist => "artist",
+            Self::Album => "album",
+            Self::AlbumArtist => "albumartist",
+            Self::Genre => "genre",
+            Self::Year => "year",
+            Self::Track => "track",
+            Self::Disc => "disc",
+            Self::Format => "format",
+            Self::Bitrate => "bitrate",
+            Self::Length => "length",
+            Self::Added => "added",
+            Self::Modified => "mtime",
         }
-        FieldOp::Range { start, end } => match (start, end) {
-            (Some(s), Some(e)) => format!("{field} BETWEEN '{s}' AND '{e}'"),
-            (Some(s), None) => format!("{field} >= '{s}'"),
-            (None, Some(e)) => format!("{field} <= '{e}'"),
-            (None, None) => format!("{field} IS NOT NULL"),
+    }
+}
+
+fn parse_operation(field: QueryField, value: &str) -> Result<FieldOperation> {
+    if let Some(exact) = value.strip_prefix('=') {
+        return Ok(FieldOperation::Exact(exact.to_string()));
+    }
+    if let Some(pattern) = value.strip_prefix(':') {
+        return Ok(FieldOperation::Glob(regex_to_glob(pattern)));
+    }
+    if let Some((start, end)) = value.split_once("..") {
+        return Ok(FieldOperation::Range {
+            start: (!start.is_empty()).then(|| start.to_string()),
+            end: (!end.is_empty()).then(|| end.to_string()),
+        });
+    }
+    if field == QueryField::Added && value.starts_with('-') {
+        return parse_relative_date(value)
+            .map(FieldOperation::RelativeDate)
+            .ok_or_else(|| Error::Query(format!("invalid relative date: {value}")));
+    }
+    Ok(FieldOperation::Substring(value.to_string()))
+}
+
+fn compile_field(
+    field: QueryField,
+    operation: &FieldOperation,
+    parameters: &mut Vec<Value>,
+) -> String {
+    let column = field.column();
+    match operation {
+        FieldOperation::Substring(value) => {
+            parameters.push(Value::Text(format!("%{value}%")));
+            format!("{column} LIKE ?")
+        }
+        FieldOperation::Exact(value) => {
+            parameters.push(Value::Text(value.clone()));
+            format!("{column} = ?")
+        }
+        FieldOperation::Glob(pattern) => {
+            parameters.push(Value::Text(pattern.clone()));
+            format!("{column} GLOB ?")
+        }
+        FieldOperation::Range { start, end } => match (start, end) {
+            (Some(start), Some(end)) => {
+                parameters.push(Value::Text(start.clone()));
+                parameters.push(Value::Text(end.clone()));
+                format!("{column} BETWEEN ? AND ?")
+            }
+            (Some(start), None) => {
+                parameters.push(Value::Text(start.clone()));
+                format!("{column} >= ?")
+            }
+            (None, Some(end)) => {
+                parameters.push(Value::Text(end.clone()));
+                format!("{column} <= ?")
+            }
+            (None, None) => format!("{column} IS NOT NULL"),
         },
-        FieldOp::RelativeDate(date) => {
-            format!("{field} >= '{date}'")
+        FieldOperation::RelativeDate(date) => {
+            parameters.push(Value::Text(date.clone()));
+            format!("{column} >= ?")
         }
     }
-}
-
-/// Convert a query string to SQL.
-///
-/// # Errors
-/// Returns an error if the query cannot be parsed.
-pub fn to_sql(query: &str) -> Result<String> {
-    let terms = parse(query)?;
-    terms_to_sql(&terms)
 }
 
 fn regex_to_glob(pattern: &str) -> String {
@@ -218,20 +353,19 @@ fn regex_to_glob(pattern: &str) -> String {
 }
 
 fn parse_relative_date(value: &str) -> Option<String> {
-    let value = value.trim_start_matches('-');
-    let num = if value.ends_with('d') {
-        value.trim_end_matches('d').parse::<i64>().ok()?
-    } else if value.ends_with('w') {
-        value.trim_end_matches('w').parse::<i64>().ok()? * 7
-    } else if value.ends_with('m') {
-        value.trim_end_matches('m').parse::<i64>().ok()? * 30
-    } else if value.ends_with('y') {
-        value.trim_end_matches('y').parse::<i64>().ok()? * 365
+    let value = value.strip_prefix('-')?;
+    let days = if let Some(number) = value.strip_suffix('d') {
+        number.parse::<i64>().ok()?
+    } else if let Some(number) = value.strip_suffix('w') {
+        number.parse::<i64>().ok()?.checked_mul(7)?
+    } else if let Some(number) = value.strip_suffix('m') {
+        number.parse::<i64>().ok()?.checked_mul(30)?
+    } else if let Some(number) = value.strip_suffix('y') {
+        number.parse::<i64>().ok()?.checked_mul(365)?
     } else {
         return None;
     };
-
-    let date = chrono::Utc::now() - chrono::Duration::days(num);
+    let date = chrono::Utc::now().checked_sub_signed(chrono::Duration::days(days))?;
     Some(date.format("%Y-%m-%d").to_string())
 }
 
@@ -240,60 +374,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_simple_query() {
-        let sql = to_sql("artist:beatles").unwrap();
-        assert!(sql.contains("artist LIKE '%beatles%'"));
+    fn compiles_values_as_parameters() -> Result<()> {
+        let compiled = Query::parse("artist:o'brien year:1960..1969 year+")?.compile();
+        assert!(compiled.sql.contains("artist LIKE ?"));
+        assert!(compiled.sql.contains("year BETWEEN ? AND ?"));
+        assert!(compiled.sql.ends_with("ORDER BY year ASC"));
+        assert_eq!(compiled.parameters.len(), 3);
+        Ok(())
     }
 
     #[test]
-    fn test_exact_match() {
-        let sql = to_sql("title:=Help!").unwrap();
-        assert!(sql.contains("title = 'Help!'"));
+    fn rejects_unknown_fields_and_sort_keys() {
+        assert!(Query::parse("invalid:value").is_err());
+        assert!(Query::parse("invalid+").is_err());
     }
 
     #[test]
-    fn test_range() {
-        let sql = to_sql("year:1960..1969").unwrap();
-        assert!(sql.contains("year BETWEEN '1960' AND '1969'"));
+    fn malformed_query_never_becomes_all() {
+        assert!(Query::parse("artist:").is_err());
+        assert!(Query::parse("^everything").is_err());
     }
 
     #[test]
-    fn test_negation() {
-        let sql = to_sql("^genre:jazz").unwrap();
-        assert!(sql.contains("NOT (genre LIKE '%jazz%')"));
-    }
-
-    #[test]
-    fn test_parse_fulltext() {
-        let terms = parse("beatles").unwrap();
-        assert_eq!(terms.len(), 1);
-        assert!(matches!(&terms[0], QueryTerm::FullText(s) if s == "beatles"));
-    }
-
-    #[test]
-    fn test_parse_field() {
-        let terms = parse("artist:beatles").unwrap();
-        assert_eq!(terms.len(), 1);
-        assert!(matches!(
-            &terms[0],
-            QueryTerm::Field {
-                negated: false,
-                name,
-                op: FieldOp::Substring(v)
-            } if name == "artist" && v == "beatles"
-        ));
-    }
-
-    #[test]
-    fn test_parse_sort() {
-        let terms = parse("year+").unwrap();
-        assert_eq!(terms.len(), 1);
-        assert!(matches!(
-            &terms[0],
-            QueryTerm::Sort {
-                field,
-                ascending: true
-            } if field == "year"
-        ));
+    fn full_text_is_bound() -> Result<()> {
+        let compiled = Query::parse("black sabbath")?.compile();
+        assert_eq!(compiled.parameters.len(), 2);
+        assert!(!compiled.sql.contains("black"));
+        Ok(())
     }
 }

@@ -1,12 +1,16 @@
 [package]
 name = "rsbts"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "A music library manager with MusicBrainz auto-tagging"
+description = "A safe music library manager with provider-neutral metadata matching"
 license = "MIT"
+repository = "https://github.com/sxndmxn/rsbts"
+keywords = ["music", "library", "musicbrainz", "cli"]
+categories = ["command-line-utilities", "multimedia::audio"]
 
 [dependencies]
-anyhow = "1"
+async-trait = "0.1"
+blake3 = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 dialoguer = "0.11"
@@ -14,16 +18,20 @@ dirs = "5"
 indicatif = "0.17"
 lofty = "0.22"
 pathfinding = "4"
-rayon = "1.10"
 reqwest = { version = "0.12", features = ["json"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["backup", "bundled"] }
 serde = { version = "1", features = ["derive"] }
 strsim = "0.11"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 toml = "0.8"
+unicode-normalization = "0.1"
 urlencoding = "2"
+uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints.rust]
 unsafe_code = "forbid"

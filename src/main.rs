@@ -1,19 +1,23 @@
-// Precision loss when converting u64 to f64 for display/comparison is acceptable.
-// Truncation is handled manually with clamp/max/round where needed.
-#![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
 
-use anyhow::Result;
+use std::path::PathBuf;
+use std::process::ExitCode;
+
 use clap::{Parser, Subcommand};
 
 mod cli;
 
 #[derive(Parser)]
-#[command(name = "rsbts")]
-#[command(about = "A music library manager with MusicBrainz auto-tagging")]
+#[command(name = "rsbts", version)]
+#[command(about = "A safe, plan-first music library manager")]
 struct Cli {
     /// Path to config file
     #[arg(short, long, global = true)]
-    config: Option<std::path::PathBuf>,
+    config: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Commands,
@@ -21,22 +25,34 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Import music into library
+    /// Preview and import albums into the library
     Import {
-        /// Paths to import
+        /// Paths to scan
         #[arg(required = true)]
-        paths: Vec<std::path::PathBuf>,
+        paths: Vec<PathBuf>,
 
-        /// Copy files (don't move)
-        #[arg(short = 'C', long)]
+        /// Copy files into the library
+        #[arg(short = 'C', long, conflicts_with_all = ["move", "link"])]
         copy: bool,
 
-        /// Move files
-        #[arg(short = 'M', long)]
+        /// Move files into the library after committing metadata
+        #[arg(short = 'M', long, conflicts_with_all = ["copy", "link"])]
         r#move: bool,
+
+        /// Create symbolic links in the library
+        #[arg(short = 'L', long, conflicts_with_all = ["copy", "move"])]
+        link: bool,
+
+        /// Preview decisions and destinations without changing files or the database
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Accept only candidates that pass every strict confidence gate
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 
-    /// List items in library
+    /// List tracks or albums
     #[command(name = "ls", alias = "list")]
     List {
         /// Query string
@@ -50,24 +66,32 @@ enum Commands {
     /// Show library statistics
     Stats,
 
-    /// Update library (re-read tags)
+    /// Re-read tags for matching library items
     Update {
         /// Query to filter items
         query: Option<String>,
     },
 
-    /// Remove items from library
+    /// Remove matching items from the library
     #[command(name = "rm", alias = "remove")]
     Remove {
         /// Query to match items
         query: String,
 
-        /// Also delete files from disk
+        /// Also delete files from disk after quarantining them
         #[arg(short, long)]
         delete: bool,
+
+        /// Preview the complete removal set without changing anything
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Confirm the complete removal set non-interactively
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 
-    /// Modify item metadata
+    /// Modify metadata stored in the library database
     Modify {
         /// Query to match items
         query: String,
@@ -79,7 +103,14 @@ enum Commands {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
-    cli::run(cli.command, cli.config).await
+async fn main() -> ExitCode {
+    let arguments = Cli::parse();
+    match cli::run(arguments.command, arguments.config).await {
+        Ok(cli::Outcome::Success) => ExitCode::SUCCESS,
+        Ok(cli::Outcome::Partial) => ExitCode::from(2),
+        Err(error) => {
+            eprintln!("rsbts: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
