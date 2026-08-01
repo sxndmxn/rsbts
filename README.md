@@ -30,10 +30,17 @@ organizes approved albums without silently overwriting files.
 ## Install
 
 ```bash
-cargo install --path . --locked
+cargo install rsbts --locked
 ```
 
-rsbts requires Rust 1.89 or newer.
+rsbts requires Rust 1.89 or newer. Library API documentation is available on
+[docs.rs](https://docs.rs/rsbts).
+
+To install the current source checkout instead:
+
+```bash
+cargo install --path . --locked
+```
 
 ## Quick start
 

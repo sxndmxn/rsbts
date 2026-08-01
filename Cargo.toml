@@ -6,6 +6,7 @@ rust-version = "1.89"
 description = "A safe music library manager with provider-neutral metadata matching"
 license = "MIT"
 repository = "https://github.com/sxndmxn/rsbts"
+documentation = "https://docs.rs/rsbts"
 keywords = ["music", "library", "musicbrainz", "cli"]
 categories = ["command-line-utilities", "multimedia::audio"]
 
