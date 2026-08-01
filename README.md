@@ -35,10 +35,47 @@ cargo install --path . --locked
 
 rsbts requires Rust 1.89 or newer.
 
-Copy `config.example.toml` to `~/.config/rsbts/config.toml` if the defaults do
-not fit. Relative paths in an explicit config are resolved from that config's
-directory. An explicit missing config or an unknown TOML key is an error;
-loading configuration itself creates nothing.
+## Quick start
+
+The built-in defaults use `~/Music` for organized files and
+`~/.local/share/rsbts/library.db` for the catalog. Configuration loading is
+side-effect free, so it is safe to inspect a new installation before importing
+anything:
+
+```bash
+rsbts --version
+rsbts stats
+rsbts audit
+```
+
+Create a configuration only when you want different paths or behavior:
+
+```bash
+mkdir -p ~/.config/rsbts
+cp config.example.toml ~/.config/rsbts/config.toml
+```
+
+For a first album, start with a preview. A dry run reads tags, searches
+MusicBrainz, displays match scores and the planned destination, but does not
+create or modify the database or library:
+
+```bash
+rsbts import --dry-run ~/Music/Incoming/album
+rsbts import ~/Music/Incoming/album
+rsbts ls
+rsbts stats
+rsbts audit
+```
+
+The interactive import lets you choose a MusicBrainz candidate, keep the
+existing file tags, or skip the album. Tied releases can all display excellent
+scores while still failing the runner-up-margin gate. This is intentional:
+`--yes` skips ambiguous matches instead of guessing and exits with status `2`
+when work was skipped.
+
+Relative paths in an explicit config are resolved from that config's directory.
+An explicit missing config or an unknown TOML key is an error; loading
+configuration itself creates nothing.
 
 Path templates describe the destination stem. rsbts appends the source audio
 extension, preserving periods that are part of a title. Variables are
@@ -137,6 +174,13 @@ cargo test --locked --all-targets
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
 cargo package --locked
 ```
+
+To exercise the installed CLI without touching a real collection, point an
+explicit config at a temporary library and database, then import disposable,
+tagged audio. Cover at least this user journey: empty `stats` and `audit`, an
+import dry run, an interactive or explicitly confirmed import, filtered `ls`,
+`modify`, `update`, removal dry run, confirmed removal, and a final clean
+`audit`.
 
 ## Supported audio
 
