@@ -1,10 +1,11 @@
+use std::fmt::Display;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use dialoguer::{Confirm, Select};
 
 use rsbts::config::Config;
-use rsbts::db::{AuditIssue, Library};
+use rsbts::db::{validate_modification_fields, AuditIssue, Library};
 use rsbts::import::{
     Action, AlbumPlan, ApprovalChoice, ApprovedAlbumPlan, ImportExecutor, ImportOptions,
     ImportPlanner,
@@ -25,11 +26,29 @@ pub enum Outcome {
 #[allow(clippy::future_not_send)]
 pub async fn run(command: Commands, config_path: Option<PathBuf>) -> Result<Outcome> {
     let config = Config::load(config_path.as_deref())?;
-    let mut library = Library::open(&config.library.database)?;
-    report_migration(&library);
-    recover(&mut library)?;
-    report_audit(&library)?;
-
+    preflight(&command)?;
+    match &command {
+        Commands::Import { dry_run, yes, .. } => {
+            require_confirmation_channel(*dry_run, *yes, "import")?;
+        }
+        Commands::Remove { dry_run, yes, .. } => {
+            require_confirmation_channel(*dry_run, *yes, "remove")?;
+        }
+        _ => {}
+    }
+    let dry_run = matches!(
+        &command,
+        Commands::Import { dry_run: true, .. } | Commands::Remove { dry_run: true, .. }
+    );
+    let mut library = if dry_run {
+        Library::open_snapshot(&config.library.database)?
+    } else {
+        Library::open(&config.library.database)?
+    };
+    if !dry_run {
+        report_migration(&library);
+        recover(&mut library)?;
+    }
     match command {
         Commands::Import {
             paths,
@@ -52,6 +71,7 @@ pub async fn run(command: Commands, config_path: Option<PathBuf>) -> Result<Outc
         }
         Commands::List { query, album } => list(&library, query.as_deref(), album),
         Commands::Stats => stats(&library),
+        Commands::Audit => audit(&library),
         Commands::Update { query } => update(&library, query.as_deref()),
         Commands::Remove {
             query,
@@ -63,6 +83,32 @@ pub async fn run(command: Commands, config_path: Option<PathBuf>) -> Result<Outc
     }
 }
 
+fn preflight(command: &Commands) -> Result<()> {
+    match command {
+        Commands::List {
+            query,
+            album: false,
+        }
+        | Commands::Update { query } => {
+            parse_query(query.as_deref())?;
+        }
+        Commands::Remove { query, .. } => {
+            require_selection(query, "removal")?;
+            Query::parse(query)?;
+        }
+        Commands::Modify { query, fields } => {
+            require_selection(query, "modify")?;
+            Query::parse(query)?;
+            validate_modification_fields(fields)?;
+        }
+        Commands::Import { .. }
+        | Commands::List { album: true, .. }
+        | Commands::Stats
+        | Commands::Audit => {}
+    }
+    Ok(())
+}
+
 fn report_migration(library: &Library) {
     let report = library.migration_report();
     if let Some(path) = &report.backup_path {
@@ -70,7 +116,7 @@ fn report_migration(library: &Library) {
             "Migrated database from schema {} to {}; verified backup: {}",
             report.from_version,
             report.to_version,
-            path.display()
+            terminal_safe(path.display())
         );
     }
 }
@@ -90,23 +136,6 @@ fn recover(library: &mut Library) -> Result<()> {
     }
 }
 
-fn report_audit(library: &Library) -> Result<()> {
-    let report = library.audit()?;
-    let missing = report
-        .issues
-        .iter()
-        .filter(|issue| matches!(issue, AuditIssue::MissingFile { .. }))
-        .count();
-    if missing > 0 {
-        eprintln!("Warning: {missing} library row(s) refer to missing files; rows were preserved");
-    }
-    let structural = report.issues.len().saturating_sub(missing);
-    if structural > 0 {
-        eprintln!("Warning: library audit found {structural} additional issue(s)");
-    }
-    Ok(())
-}
-
 #[allow(clippy::future_not_send)]
 async fn import(
     library: &mut Library,
@@ -116,7 +145,6 @@ async fn import(
     dry_run: bool,
     yes: bool,
 ) -> Result<Outcome> {
-    require_confirmation_channel(dry_run, yes, "import")?;
     let options = ImportOptions {
         action,
         fetch_art: config.import.fetch_art,
@@ -133,7 +161,11 @@ async fn import(
         .await;
     let mut partial = !plan.scan_issues.is_empty();
     for issue in &plan.scan_issues {
-        eprintln!("Scan warning: {}: {}", issue.path.display(), issue.message);
+        eprintln!(
+            "Scan warning: {}: {}",
+            terminal_safe(issue.path.display()),
+            terminal_safe(&issue.message)
+        );
     }
     if plan.albums.is_empty() {
         println!("No readable audio files found");
@@ -158,7 +190,7 @@ async fn import(
         let Some(approved) = (match approved {
             Ok(approved) => approved,
             Err(error) => {
-                eprintln!("  Cannot approve album: {error}");
+                eprintln!("  Cannot approve album: {}", terminal_safe(error));
                 partial = true;
                 continue;
             }
@@ -178,14 +210,14 @@ async fn import(
                     report.imported_tracks, report.already_managed_tracks
                 );
                 for warning in report.warnings {
-                    eprintln!("  Warning: {warning}");
+                    eprintln!("  Warning: {}", terminal_safe(warning));
                 }
                 if report.cleanup_recovered {
                     eprintln!("  Warning: post-commit cleanup required automatic recovery");
                 }
             }
             Err(error) => {
-                eprintln!("  Album failed: {error}");
+                eprintln!("  Album failed: {}", terminal_safe(error));
                 partial = true;
             }
         }
@@ -220,8 +252,8 @@ fn choose_import(plan: &AlbumPlan, dry_run: bool, yes: bool) -> Result<ApprovalC
             format!(
                 "{}. {} — {} ({}, {:.1}%)",
                 index + 1,
-                candidate.release.artist,
-                candidate.release.title,
+                terminal_safe(&candidate.release.artist),
+                terminal_safe(&candidate.release.title),
                 candidate
                     .release
                     .year
@@ -248,12 +280,12 @@ fn choose_import(plan: &AlbumPlan, dry_run: bool, yes: bool) -> Result<ApprovalC
 fn print_album_plan(plan: &AlbumPlan) {
     println!(
         "\n{} — {} ({} track(s))",
-        plan.source_artist,
-        plan.source_album,
+        terminal_safe(&plan.source_artist),
+        terminal_safe(&plan.source_album),
         plan.items.len()
     );
     if let Some(error) = &plan.lookup_error {
-        eprintln!("  Metadata lookup failed: {error}");
+        eprintln!("  Metadata lookup failed: {}", terminal_safe(error));
     }
     if plan.candidates.is_empty() {
         println!("  No provider candidates; existing tags are available as an explicit choice");
@@ -264,8 +296,8 @@ fn print_album_plan(plan: &AlbumPlan) {
         println!(
             "  [{}] {} — {} | total {:.1}% (artist {:.1}, album {:.1}, tracks {:.1}, provider {:.1}; margin {:.1}){}",
             index + 1,
-            candidate.release.artist,
-            candidate.release.title,
+            terminal_safe(&candidate.release.artist),
+            terminal_safe(&candidate.release.title),
             confidence.composite * 100.0,
             confidence.artist * 100.0,
             confidence.album * 100.0,
@@ -276,7 +308,7 @@ fn print_album_plan(plan: &AlbumPlan) {
         );
         if index == 0 {
             for failure in &confidence.gate_failures {
-                println!("      gate: {failure}");
+                println!("      gate: {}", terminal_safe(failure));
             }
         }
     }
@@ -287,8 +319,8 @@ fn print_approved(plan: &ApprovedAlbumPlan) {
     for track in &plan.tracks {
         println!(
             "    {} -> {}{}",
-            track.source.display(),
-            track.destination.display(),
+            terminal_safe(track.source.display()),
+            terminal_safe(track.destination.display()),
             if track.already_managed {
                 " (already managed)"
             } else {
@@ -297,7 +329,10 @@ fn print_approved(plan: &ApprovedAlbumPlan) {
         );
     }
     if let Some(artwork) = &plan.artwork {
-        println!("    cover art -> {}", artwork.destination.display());
+        println!(
+            "    cover art -> {}",
+            terminal_safe(artwork.destination.display())
+        );
     }
 }
 
@@ -307,16 +342,20 @@ fn list(library: &Library, query: Option<&str>, album: bool) -> Result<Outcome> 
             let year = album
                 .year
                 .map_or_else(String::new, |year| format!(" ({year})"));
-            println!("{} - {}{year}", album.albumartist, album.album);
+            println!(
+                "{} - {}{year}",
+                terminal_safe(&album.albumartist),
+                terminal_safe(&album.album)
+            );
         }
     } else {
         let query = parse_query(query)?;
         for item in library.query_items(&query)? {
             println!(
                 "{} - {} - {} [{}]",
-                item.artist,
-                item.album,
-                item.title,
+                terminal_safe(&item.artist),
+                terminal_safe(&item.album),
+                terminal_safe(&item.title),
                 format_duration(item.length)
             );
         }
@@ -337,10 +376,53 @@ fn stats(library: &Library) -> Result<Outcome> {
     Ok(Outcome::Success)
 }
 
+fn audit(library: &Library) -> Result<Outcome> {
+    let report = library.audit()?;
+    if report.issues.is_empty() {
+        println!("Audit: no issues found");
+        return Ok(Outcome::Success);
+    }
+    for issue in &report.issues {
+        match issue {
+            AuditIssue::MissingFile { item_id, path } => {
+                println!(
+                    "Missing file: item {item_id}: {}",
+                    terminal_safe(path.display())
+                );
+            }
+            AuditIssue::UnknownFileSize { item_id, path } => {
+                println!(
+                    "Unknown file size: item {item_id}: {}",
+                    terminal_safe(path.display())
+                );
+            }
+            AuditIssue::OrphanedItem { item_id, album_id } => {
+                println!("Orphaned item: item {item_id}, missing album {album_id}");
+            }
+            AuditIssue::SearchIndexInconsistent { detail } => {
+                println!("Search index is inconsistent: {}", terminal_safe(detail));
+            }
+            AuditIssue::InvalidTimestamp {
+                table,
+                row_id,
+                field,
+                value,
+            } => {
+                println!(
+                    "Invalid timestamp: {table} row {row_id}, {field}: {}",
+                    terminal_safe(value)
+                );
+            }
+        }
+    }
+    println!("Audit: {} issue(s) found", report.issues.len());
+    Ok(Outcome::Partial)
+}
+
 fn update(library: &Library, query: Option<&str>) -> Result<Outcome> {
     let query = parse_query(query)?;
     let items = library.query_items(&query)?;
-    let mut updated = 0;
+    let mut tag_updates = Vec::new();
     let mut failed = 0;
     for item in items {
         let Some(id) = item.id else {
@@ -348,17 +430,19 @@ fn update(library: &Library, query: Option<&str>) -> Result<Outcome> {
             continue;
         };
         match rsbts::tags::read_tags(&item.path) {
-            Ok(value) => {
-                library.update_item(id, &value)?;
-                updated += 1;
-            }
+            Ok(value) => tag_updates.push((id, value)),
             Err(error) => {
-                eprintln!("Could not update {}: {error}", item.path.display());
+                eprintln!(
+                    "Could not update {}: {}",
+                    terminal_safe(item.path.display()),
+                    terminal_safe(error)
+                );
                 failed += 1;
             }
         }
     }
-    println!("Updated {updated} item(s); {failed} failed");
+    let updated_count = library.update_items(&tag_updates)?;
+    println!("Updated {updated_count} item(s); {failed} failed");
     Ok(if failed == 0 {
         Outcome::Success
     } else {
@@ -373,7 +457,7 @@ fn remove(
     dry_run: bool,
     yes: bool,
 ) -> Result<Outcome> {
-    require_confirmation_channel(dry_run, yes, "remove")?;
+    require_selection(raw_query, "removal")?;
     let query = Query::parse(raw_query)?;
     let plan = RemovalPlan::build(library, &query, delete)?;
     println!(
@@ -383,7 +467,7 @@ fn remove(
         plan.missing_files.len()
     );
     for item in &plan.items {
-        println!("  {}", item.path.display());
+        println!("  {}", terminal_safe(item.path.display()));
     }
     if dry_run || plan.items.is_empty() {
         println!("No changes made");
@@ -410,7 +494,10 @@ fn remove(
         report.removed_rows, report.deleted_files
     );
     for path in &report.missing_files {
-        eprintln!("Missing file row removed: {}", path.display());
+        eprintln!(
+            "Missing file row removed: {}",
+            terminal_safe(path.display())
+        );
     }
     if report.cleanup_recovered {
         eprintln!("Warning: post-commit cleanup required automatic recovery");
@@ -423,20 +510,39 @@ fn remove(
 }
 
 fn modify(library: &Library, raw_query: &str, fields: &[String]) -> Result<Outcome> {
+    require_selection(raw_query, "modify")?;
     let query = Query::parse(raw_query)?;
     let items = library.query_items(&query)?;
-    let count = items.len();
-    for item in items {
-        if let Some(id) = item.id {
-            library.modify_item(id, fields)?;
-        }
-    }
+    let ids = items
+        .iter()
+        .map(|item| {
+            item.id
+                .ok_or_else(|| Error::Query("a matched item has no database ID".into()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let count = library.modify_items(&ids, fields)?;
     println!("Modified {count} item(s)");
     Ok(Outcome::Success)
 }
 
 fn parse_query(query: Option<&str>) -> Result<Query> {
-    query.map_or_else(|| Ok(Query::all()), Query::parse)
+    match query {
+        None => Ok(Query::all()),
+        Some(query) if query.trim().is_empty() => Err(Error::Query(
+            "an explicit query cannot be empty; omit it to select all items".into(),
+        )),
+        Some(query) => Query::parse(query),
+    }
+}
+
+fn require_selection(query: &str, operation: &str) -> Result<()> {
+    if query.trim().is_empty() {
+        Err(Error::Query(format!(
+            "{operation} query cannot be empty; provide an explicit filter"
+        )))
+    } else {
+        Ok(())
+    }
 }
 
 fn require_confirmation_channel(dry_run: bool, yes: bool, operation: &str) -> Result<()> {
@@ -473,5 +579,27 @@ fn format_size(bytes: u64) -> String {
         format!("{:.1} KiB", bytes as f64 / KIB as f64)
     } else {
         format!("{bytes} B")
+    }
+}
+
+pub fn terminal_safe(value: impl Display) -> String {
+    let mut output = String::new();
+    for character in value.to_string().chars() {
+        if character.is_control() {
+            output.extend(character.escape_default());
+        } else {
+            output.push(character);
+        }
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::terminal_safe;
+
+    #[test]
+    fn terminal_output_escapes_control_characters() {
+        assert_eq!(terminal_safe("title\n\u{1b}[2J"), "title\\n\\u{1b}[2J");
     }
 }

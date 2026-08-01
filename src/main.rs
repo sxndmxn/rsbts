@@ -55,7 +55,7 @@ enum Commands {
     /// List tracks or albums
     #[command(name = "ls", alias = "list")]
     List {
-        /// Query string
+        /// Track query, or album/album-artist substring with --album
         query: Option<String>,
 
         /// Show albums instead of tracks
@@ -65,6 +65,9 @@ enum Commands {
 
     /// Show library statistics
     Stats,
+
+    /// Check database and file consistency
+    Audit,
 
     /// Re-read tags for matching library items
     Update {
@@ -109,7 +112,7 @@ async fn main() -> ExitCode {
         Ok(cli::Outcome::Success) => ExitCode::SUCCESS,
         Ok(cli::Outcome::Partial) => ExitCode::from(2),
         Err(error) => {
-            eprintln!("rsbts: {error}");
+            eprintln!("rsbts: {}", cli::terminal_safe(error));
             ExitCode::FAILURE
         }
     }

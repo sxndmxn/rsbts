@@ -109,7 +109,7 @@ impl Query {
                 } => {
                     let condition = compile_field(*field, operation, &mut parameters);
                     conditions.push(if *negated {
-                        format!("NOT ({condition})")
+                        format!("COALESCE(NOT ({condition}), 1)")
                     } else {
                         condition
                     });
@@ -150,25 +150,34 @@ impl FromStr for Query {
         }
 
         let mut terms = Vec::new();
-        for raw in input.split_whitespace() {
-            if let Some(field) = raw.strip_suffix('+') {
-                terms.push(QueryTerm::Sort {
-                    field: field.parse()?,
-                    ascending: true,
-                });
-                continue;
+        for raw in tokenize(input)? {
+            if raw.is_empty() {
+                return Err(Error::Query("query terms cannot be empty".into()));
             }
-            if let Some(field) = raw.strip_suffix('-').filter(|field| !field.is_empty()) {
-                terms.push(QueryTerm::Sort {
-                    field: field.parse()?,
-                    ascending: false,
-                });
-                continue;
+            if !raw.contains(':') {
+                if let Some(field) = raw.strip_suffix('+') {
+                    if let Ok(field) = field.parse() {
+                        terms.push(QueryTerm::Sort {
+                            field,
+                            ascending: true,
+                        });
+                        continue;
+                    }
+                }
+                if let Some(field) = raw.strip_suffix('-').filter(|field| !field.is_empty()) {
+                    if let Ok(field) = field.parse() {
+                        terms.push(QueryTerm::Sort {
+                            field,
+                            ascending: false,
+                        });
+                        continue;
+                    }
+                }
             }
 
             let (negated, raw) = raw
                 .strip_prefix('^')
-                .map_or((false, raw), |rest| (true, rest));
+                .map_or((false, raw.as_str()), |rest| (true, rest));
             if let Some((field, value)) = raw.split_once(':') {
                 if value.is_empty() {
                     return Err(Error::Query(format!("missing value for field {field}")));
@@ -190,6 +199,53 @@ impl FromStr for Query {
         }
         Ok(Self { terms })
     }
+}
+
+fn tokenize(input: &str) -> Result<Vec<String>> {
+    let mut terms = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut started = false;
+
+    for character in input.chars() {
+        if escaped {
+            current.push(character);
+            escaped = false;
+            continue;
+        }
+        if quoted {
+            match character {
+                '\\' => escaped = true,
+                '"' => quoted = false,
+                _ => current.push(character),
+            }
+            continue;
+        }
+        match character {
+            '"' => {
+                quoted = true;
+                started = true;
+            }
+            character if character.is_whitespace() => {
+                if started {
+                    terms.push(std::mem::take(&mut current));
+                    started = false;
+                }
+            }
+            _ => {
+                current.push(character);
+                started = true;
+            }
+        }
+    }
+    if quoted || escaped {
+        return Err(Error::Query("unterminated quoted query value".into()));
+    }
+    if started {
+        terms.push(current);
+    }
+    Ok(terms)
 }
 
 impl FromStr for QueryField {
@@ -287,7 +343,7 @@ fn parse_operation(field: QueryField, value: &str) -> Result<FieldOperation> {
         return Ok(FieldOperation::Exact(exact.to_string()));
     }
     if let Some(pattern) = value.strip_prefix(':') {
-        return Ok(FieldOperation::Glob(regex_to_glob(pattern)));
+        return Ok(FieldOperation::Glob(pattern.to_string()));
     }
     if let Some((start, end)) = value.split_once("..") {
         return Ok(FieldOperation::Range {
@@ -311,8 +367,8 @@ fn compile_field(
     let column = field.column();
     match operation {
         FieldOperation::Substring(value) => {
-            parameters.push(Value::Text(format!("%{value}%")));
-            format!("{column} LIKE ?")
+            parameters.push(Value::Text(format!("%{}%", escape_like(value))));
+            format!("{column} LIKE ? ESCAPE '!'")
         }
         FieldOperation::Exact(value) => {
             parameters.push(Value::Text(value.clone()));
@@ -345,11 +401,11 @@ fn compile_field(
     }
 }
 
-fn regex_to_glob(pattern: &str) -> String {
-    pattern
-        .replace(".*", "*")
-        .replace('.', "?")
-        .replace(['^', '$'], "")
+fn escape_like(value: &str) -> String {
+    value
+        .replace('!', "!!")
+        .replace('%', "!%")
+        .replace('_', "!_")
 }
 
 fn parse_relative_date(value: &str) -> Option<String> {
@@ -365,6 +421,9 @@ fn parse_relative_date(value: &str) -> Option<String> {
     } else {
         return None;
     };
+    if days < 0 {
+        return None;
+    }
     let date = chrono::Utc::now().checked_sub_signed(chrono::Duration::days(days))?;
     Some(date.format("%Y-%m-%d").to_string())
 }
@@ -376,7 +435,7 @@ mod tests {
     #[test]
     fn compiles_values_as_parameters() -> Result<()> {
         let compiled = Query::parse("artist:o'brien year:1960..1969 year+")?.compile();
-        assert!(compiled.sql.contains("artist LIKE ?"));
+        assert!(compiled.sql.contains("artist LIKE ? ESCAPE '!'"));
         assert!(compiled.sql.contains("year BETWEEN ? AND ?"));
         assert!(compiled.sql.ends_with("ORDER BY year ASC"));
         assert_eq!(compiled.parameters.len(), 3);
@@ -384,9 +443,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_fields_and_sort_keys() {
+    fn rejects_unknown_fields_and_preserves_sort_like_search_terms() -> Result<()> {
         assert!(Query::parse("invalid:value").is_err());
-        assert!(Query::parse("invalid+").is_err());
+        assert_eq!(
+            Query::parse("C++ invalid+")?.compile().parameters,
+            [
+                Value::Text("\"C++\"".into()),
+                Value::Text("\"invalid+\"".into())
+            ]
+        );
+        Ok(())
     }
 
     #[test]
@@ -400,6 +466,60 @@ mod tests {
         let compiled = Query::parse("black sabbath")?.compile();
         assert_eq!(compiled.parameters.len(), 2);
         assert!(!compiled.sql.contains("black"));
+        Ok(())
+    }
+
+    #[test]
+    fn quoted_values_can_contain_spaces() -> Result<()> {
+        let compiled =
+            Query::parse(r#"artist:"Black Sabbath" album:="Master of Reality""#)?.compile();
+        assert_eq!(compiled.parameters.len(), 2);
+        assert_eq!(
+            compiled.parameters,
+            [
+                Value::Text("%Black Sabbath%".into()),
+                Value::Text("Master of Reality".into())
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn field_values_may_end_in_sort_characters() -> Result<()> {
+        let compiled = Query::parse("title:C++ artist:B-")?.compile();
+        assert_eq!(
+            compiled.parameters,
+            [Value::Text("%C++%".into()), Value::Text("%B-%".into())]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_quoted_values_fail_closed() {
+        assert!(Query::parse(r#"artist:"Black Sabbath"#).is_err());
+        assert!(Query::parse(r#"artist:"""#).is_err());
+    }
+
+    #[test]
+    fn substring_metacharacters_are_literal_and_globs_are_not_rewritten() -> Result<()> {
+        let compiled = Query::parse("title:100%_done title::Part.*")?.compile();
+        assert_eq!(
+            compiled.parameters,
+            [
+                Value::Text("%100!%!_done%".into()),
+                Value::Text("Part.*".into())
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn negated_optional_fields_include_null_and_future_offsets_are_rejected() -> Result<()> {
+        let compiled = Query::parse("^genre:Metal")?.compile();
+        assert!(compiled
+            .sql
+            .contains("COALESCE(NOT (genre LIKE ? ESCAPE '!'), 1)"));
+        assert!(Query::parse("added:--7d").is_err());
         Ok(())
     }
 }

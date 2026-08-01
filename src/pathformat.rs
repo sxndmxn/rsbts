@@ -16,6 +16,11 @@ use crate::{Error, Item, Result};
 /// # Errors
 /// Returns an error if the template contains unknown variables or functions.
 pub fn format_path(template: &str, item: &Item) -> Result<String> {
+    validate_template(template)?;
+    render_path(template, item)
+}
+
+fn render_path(template: &str, item: &Item) -> Result<String> {
     let mut result = String::new();
     let mut chars = template.chars().peekable();
 
@@ -24,7 +29,7 @@ pub fn format_path(template: &str, item: &Item) -> Result<String> {
             '$' => {
                 let var = collect_identifier(&mut chars);
                 let value = get_variable(&var, item)?;
-                result.push_str(&sanitize(&value));
+                result.push_str(&sanitize_substitution(&value));
             }
             '%' => {
                 let func = collect_identifier(&mut chars);
@@ -32,7 +37,7 @@ pub fn format_path(template: &str, item: &Item) -> Result<String> {
                     chars.next();
                     let arg = collect_until_close(&mut chars)?;
                     let value = apply_function(&func, &arg, item)?;
-                    result.push_str(&sanitize(&value));
+                    result.push_str(&sanitize_substitution(&value));
                 } else {
                     return Err(Error::PathFormat(format!("Expected '{{' after %{func}")));
                 }
@@ -44,9 +49,44 @@ pub fn format_path(template: &str, item: &Item) -> Result<String> {
     Ok(result)
 }
 
+/// Validate template syntax and identifiers without requiring track metadata.
+///
+/// # Errors
+/// Returns an error for unknown fields or functions, malformed function arguments, and
+/// unbalanced delimiters.
+pub fn validate_template(template: &str) -> Result<()> {
+    let mut chars = template.chars().peekable();
+    while let Some(character) = chars.next() {
+        match character {
+            '$' => {
+                let variable = collect_identifier(&mut chars);
+                validate_variable(&variable)?;
+            }
+            '%' => {
+                let function = collect_identifier(&mut chars);
+                if chars.next() != Some('{') {
+                    return Err(Error::PathFormat(format!(
+                        "expected '{{' after %{function}"
+                    )));
+                }
+                let argument = collect_until_close(&mut chars)?;
+                validate_function(&function, &argument)?;
+            }
+            '}' => return Err(Error::PathFormat("unexpected closing '}'".into())),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Format and validate a relative destination path.
 pub fn format_relative_path(template: &str, item: &Item) -> Result<PathBuf> {
     let formatted = format_path(template, item)?;
+    if formatted.chars().any(char::is_control) {
+        return Err(Error::PathFormat(
+            "path template produced a control character".into(),
+        ));
+    }
     let path = Path::new(&formatted);
     if path.is_absolute() {
         return Err(Error::PathFormat(
@@ -124,49 +164,115 @@ fn get_variable(name: &str, item: &Item) -> Result<String> {
     })
 }
 
-fn apply_function(func: &str, arg: &str, item: &Item) -> Result<String> {
-    let expanded = format_path(arg, item)?;
+fn validate_variable(name: &str) -> Result<()> {
+    if matches!(
+        name,
+        "title" | "artist" | "album" | "albumartist" | "genre" | "year" | "track" | "disc"
+    ) {
+        Ok(())
+    } else {
+        Err(Error::PathFormat(format!("unknown variable: {name}")))
+    }
+}
 
-    Ok(match func {
-        "upper" => expanded.to_uppercase(),
-        "lower" => expanded.to_lowercase(),
-        "title" => to_title_case(&expanded),
-        "left" => {
-            if let Some((n, rest)) = arg.split_once(',') {
-                let n: usize = n
-                    .parse()
-                    .map_err(|e| Error::PathFormat(format!("Invalid number: {e}")))?;
-                let val = format_path(rest.trim(), item)?;
-                val.chars().take(n).collect()
-            } else {
-                expanded
+fn validate_function(function: &str, argument: &str) -> Result<()> {
+    match function {
+        "upper" | "lower" | "title" => validate_template(argument),
+        "left" | "right" => {
+            let parts = split_arguments(argument)?;
+            if parts.len() != 2 {
+                return Err(Error::PathFormat(format!(
+                    "%{function} expects a length and a value"
+                )));
             }
-        }
-        "right" => {
-            if let Some((n, rest)) = arg.split_once(',') {
-                let n: usize = n
-                    .parse()
-                    .map_err(|e| Error::PathFormat(format!("Invalid number: {e}")))?;
-                let val = format_path(rest.trim(), item)?;
-                let len = val.chars().count();
-                val.chars().skip(len.saturating_sub(n)).collect()
-            } else {
-                expanded
-            }
+            parts[0].trim().parse::<usize>().map_err(|error| {
+                Error::PathFormat(format!("invalid %{function} length: {error}"))
+            })?;
+            validate_template(parts[1].trim())
         }
         "if" => {
-            let parts: Vec<&str> = arg.splitn(3, ',').collect();
-            if parts.len() >= 2 {
-                let condition = format_path(parts[0].trim(), item)?;
-                if !condition.is_empty() {
-                    format_path(parts[1].trim(), item)?
-                } else if parts.len() == 3 {
-                    format_path(parts[2].trim(), item)?
-                } else {
-                    String::new()
-                }
+            let parts = split_arguments(argument)?;
+            if !(2..=3).contains(&parts.len()) {
+                return Err(Error::PathFormat(
+                    "%if expects a condition, true value, and optional false value".into(),
+                ));
+            }
+            for part in parts {
+                validate_template(part.trim())?;
+            }
+            Ok(())
+        }
+        _ => Err(Error::PathFormat(format!("unknown function: {function}"))),
+    }
+}
+
+fn split_arguments(argument: &str) -> Result<Vec<&str>> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut depth = 0_u32;
+    for (index, character) in argument.char_indices() {
+        match character {
+            '{' => depth = depth.saturating_add(1),
+            '}' => {
+                depth = depth.checked_sub(1).ok_or_else(|| {
+                    Error::PathFormat("unexpected closing '}' in function arguments".into())
+                })?;
+            }
+            ',' if depth == 0 => {
+                parts.push(&argument[start..index]);
+                start = index + character.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return Err(Error::PathFormat(
+            "unclosed function in function arguments".into(),
+        ));
+    }
+    parts.push(&argument[start..]);
+    Ok(parts)
+}
+
+fn apply_function(func: &str, arg: &str, item: &Item) -> Result<String> {
+    validate_function(func, arg)?;
+    Ok(match func {
+        "upper" => render_path(arg, item)?.to_uppercase(),
+        "lower" => render_path(arg, item)?.to_lowercase(),
+        "title" => to_title_case(&render_path(arg, item)?),
+        "left" => {
+            let parts = split_arguments(arg)?;
+            let length = parts[0]
+                .trim()
+                .parse::<usize>()
+                .map_err(|error| Error::PathFormat(format!("invalid %left length: {error}")))?;
+            render_path(parts[1].trim(), item)?
+                .chars()
+                .take(length)
+                .collect()
+        }
+        "right" => {
+            let parts = split_arguments(arg)?;
+            let length = parts[0]
+                .trim()
+                .parse::<usize>()
+                .map_err(|error| Error::PathFormat(format!("invalid %right length: {error}")))?;
+            let value = render_path(parts[1].trim(), item)?;
+            let character_count = value.chars().count();
+            value
+                .chars()
+                .skip(character_count.saturating_sub(length))
+                .collect()
+        }
+        "if" => {
+            let parts = split_arguments(arg)?;
+            let condition = render_path(parts[0].trim(), item)?;
+            if !condition.is_empty() {
+                render_path(parts[1].trim(), item)?
+            } else if parts.len() == 3 {
+                render_path(parts[2].trim(), item)?
             } else {
-                expanded
+                String::new()
             }
         }
         _ => return Err(Error::PathFormat(format!("Unknown function: {func}"))),
@@ -187,17 +293,18 @@ fn to_title_case(s: &str) -> String {
         .join(" ")
 }
 
-fn sanitize(s: &str) -> String {
+fn sanitize_substitution(s: &str) -> String {
     let sanitized = s
         .chars()
         .map(|c| match c {
             '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\0' => '_',
+            c if c.is_control() => '_',
             _ => c,
         })
         .collect::<String>()
         .trim()
         .to_string();
-    if sanitized == "." || sanitized == ".." || sanitized.is_empty() {
+    if sanitized == "." || sanitized == ".." {
         "_".to_string()
     } else {
         sanitized
@@ -268,7 +375,49 @@ mod tests {
     }
 
     #[test]
+    fn neutralizes_control_characters() -> Result<()> {
+        let mut item = test_item();
+        item.title = "line one\nline two".into();
+        assert_eq!(format_path("$title", &item)?, "line one_line two");
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_literal_control_characters() {
+        assert!(format_relative_path("album\n/$title", &test_item()).is_err());
+    }
+
+    #[test]
     fn rejects_unclosed_functions() {
         assert!(format_path("%upper{$artist", &test_item()).is_err());
+    }
+
+    #[test]
+    fn optional_values_drive_if_branches() -> Result<()> {
+        let mut item = test_item();
+        item.genre = None;
+        assert_eq!(format_path("%if{$genre,$genre,Unknown}", &item)?, "Unknown");
+        item.genre = Some("Rock".into());
+        assert_eq!(format_path("%if{$genre,$genre,Unknown}", &item)?, "Rock");
+        Ok(())
+    }
+
+    #[test]
+    fn nested_function_arguments_are_split_at_the_top_level() -> Result<()> {
+        assert_eq!(
+            format_path("%if{$genre,%left{2,$genre},Unknown}", &test_item())?,
+            "Ro"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn template_validation_checks_every_branch() {
+        assert!(validate_template("$artist/%if{$genre,$title,Unknown}").is_ok());
+        assert!(validate_template("$artist/%if{$genre,$titel,Unknown}").is_err());
+        assert!(validate_template("%left{x,$title}").is_err());
+        assert!(validate_template("%if{$genre}").is_err());
+        assert!(validate_template("$artist}").is_err());
+        assert!(format_path("$artist}", &test_item()).is_err());
     }
 }

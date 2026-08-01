@@ -7,7 +7,7 @@ use rusqlite::{Connection, DatabaseName, TransactionBehavior};
 
 use crate::{Error, Result};
 
-const LATEST_VERSION: u32 = 2;
+const LATEST_VERSION: u32 = 3;
 
 pub struct Migration {
     pub version: u32,
@@ -23,6 +23,10 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 2,
         sql: include_str!("migrations/002_safety.sql"),
     },
+    Migration {
+        version: 3,
+        sql: include_str!("migrations/003_source_identity.sql"),
+    },
 ];
 
 #[derive(Debug, Clone, Default)]
@@ -37,6 +41,7 @@ pub fn run_migrations(
     database_path: Option<&Path>,
 ) -> Result<MigrationReport> {
     verify_integrity(conn, "before migration")?;
+    verify_foreign_keys(conn)?;
     let had_schema = table_exists(conn, "items")?;
     let had_tracking = table_exists(conn, "_migrations")?;
     let recorded_version = if had_tracking {
@@ -49,12 +54,21 @@ pub fn run_migrations(
     } else if had_schema {
         detect_untracked_version(conn)?
     } else {
+        if has_non_tracking_user_tables(conn)? {
+            return Err(Error::Recovery(
+                "database contains non-rsbts tables or a partial untracked schema; refusing to initialize over it"
+                    .into(),
+            ));
+        }
         0
     };
     if current > LATEST_VERSION {
         return Err(Error::Recovery(format!(
             "database schema {current} is newer than supported schema {LATEST_VERSION}"
         )));
+    }
+    if current > 0 {
+        verify_schema_version(conn, current)?;
     }
     let from_version = current;
 
@@ -93,6 +107,7 @@ pub fn run_migrations(
     }
     verify_integrity(conn, "after migration")?;
     verify_foreign_keys(conn)?;
+    verify_schema_version(conn, current)?;
 
     Ok(MigrationReport {
         from_version,
@@ -102,8 +117,25 @@ pub fn run_migrations(
 }
 
 fn detect_untracked_version(conn: &Connection) -> Result<u32> {
-    if table_exists(conn, "operation_journal")? && column_exists(conn, "items", "file_size")? {
-        Ok(2)
+    let has_journal = table_exists(conn, "operation_journal")?;
+    let has_source_identity =
+        has_journal && column_exists(conn, "operation_files", "source_identity")?;
+    let has_owned_identity =
+        has_journal && column_exists(conn, "operation_files", "owned_identity")?;
+    if has_journal {
+        if has_source_identity && has_owned_identity {
+            Ok(3)
+        } else if !has_source_identity
+            && !has_owned_identity
+            && column_exists(conn, "items", "file_size")?
+        {
+            Ok(2)
+        } else {
+            Err(Error::Recovery(
+                "database has a partial untracked journal schema; refusing to guess a migration"
+                    .into(),
+            ))
+        }
     } else if table_exists(conn, "albums")?
         && column_exists(conn, "items", "mb_trackid")?
         && column_exists(conn, "albums", "mb_albumid")?
@@ -127,12 +159,54 @@ pub fn current_version(conn: &Connection) -> Result<u32> {
     if !table_exists(conn, "_migrations")? {
         return Ok(0);
     }
-    conn.query_row(
-        "SELECT COALESCE(MAX(version), 0) FROM _migrations",
-        [],
-        |row| row.get(0),
-    )
-    .map_err(Into::into)
+    let mut statement = conn.prepare("SELECT version FROM _migrations ORDER BY version")?;
+    let versions = statement
+        .query_map([], |row| row.get::<_, u32>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for (index, version) in versions.iter().enumerate() {
+        let expected = u32::try_from(index + 1)
+            .map_err(|error| Error::Recovery(format!("invalid migration history: {error}")))?;
+        if *version != expected {
+            return Err(Error::Recovery(format!(
+                "migration history is not contiguous: expected version {expected}, found {version}"
+            )));
+        }
+    }
+    Ok(versions.last().copied().unwrap_or(0))
+}
+
+fn verify_schema_version(conn: &Connection, version: u32) -> Result<()> {
+    if version == 0 {
+        return Ok(());
+    }
+    let v1 = table_exists(conn, "albums")?
+        && table_exists(conn, "items")?
+        && table_exists(conn, "items_fts")?
+        && schema_object_exists(conn, "trigger", "items_ai")?
+        && schema_object_exists(conn, "trigger", "items_ad")?
+        && schema_object_exists(conn, "trigger", "items_au")?
+        && column_exists(conn, "albums", "mb_albumid")?
+        && column_exists(conn, "items", "mb_trackid")?;
+    let v2 = version < 2
+        || (table_exists(conn, "operation_journal")?
+            && table_exists(conn, "operation_files")?
+            && column_exists(conn, "items", "file_size")?
+            && column_exists(conn, "items", "metadata_provider")?
+            && column_exists(conn, "items", "external_track_id")?
+            && column_exists(conn, "items", "external_release_id")?
+            && column_exists(conn, "albums", "metadata_provider")?
+            && column_exists(conn, "albums", "external_release_id")?
+            && column_exists(conn, "operation_files", "content_hash")?);
+    let v3 = version < 3
+        || (column_exists(conn, "operation_files", "source_identity")?
+            && column_exists(conn, "operation_files", "owned_identity")?);
+    if v1 && v2 && v3 {
+        Ok(())
+    } else {
+        Err(Error::Recovery(format!(
+            "database schema does not match recorded migration version {version}"
+        )))
+    }
 }
 
 fn ensure_tracking_table(conn: &Connection) -> Result<()> {
@@ -152,6 +226,29 @@ fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
             SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1
         )",
         [name],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+fn schema_object_exists(conn: &Connection, object_type: &str, name: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master WHERE type = ?1 AND name = ?2
+        )",
+        [object_type, name],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+fn has_non_tracking_user_tables(conn: &Connection) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name != '_migrations'
+        )",
+        [],
         |row| row.get(0),
     )
     .map_err(Into::into)
@@ -223,7 +320,7 @@ mod tests {
         connection.execute_batch(include_str!("migrations/001_initial.sql"))?;
         let report = run_migrations(&mut connection, None)?;
         assert_eq!(report.from_version, 1);
-        assert_eq!(report.to_version, 2);
+        assert_eq!(report.to_version, LATEST_VERSION);
         Ok(())
     }
 
@@ -234,7 +331,102 @@ mod tests {
         ensure_tracking_table(&connection)?;
         let report = run_migrations(&mut connection, None)?;
         assert_eq!(report.from_version, 1);
-        assert_eq!(report.to_version, 2);
+        assert_eq!(report.to_version, LATEST_VERSION);
+        Ok(())
+    }
+
+    #[test]
+    fn recognizes_untracked_v2_schema() -> Result<()> {
+        let mut connection = Connection::open_in_memory()?;
+        connection.execute_batch(include_str!("migrations/001_initial.sql"))?;
+        connection.execute_batch(include_str!("migrations/002_safety.sql"))?;
+        let report = run_migrations(&mut connection, None)?;
+        assert_eq!(report.from_version, 2);
+        assert_eq!(report.to_version, LATEST_VERSION);
+        assert!(column_exists(
+            &connection,
+            "operation_files",
+            "source_identity"
+        )?);
+        assert!(column_exists(
+            &connection,
+            "operation_files",
+            "owned_identity"
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_a_partial_untracked_identity_migration() -> Result<()> {
+        let mut connection = Connection::open_in_memory()?;
+        connection.execute_batch(include_str!("migrations/001_initial.sql"))?;
+        connection.execute_batch(include_str!("migrations/002_safety.sql"))?;
+        connection.execute(
+            "ALTER TABLE operation_files ADD COLUMN source_identity TEXT",
+            [],
+        )?;
+
+        assert!(run_migrations(&mut connection, None).is_err());
+        assert!(!column_exists(
+            &connection,
+            "operation_files",
+            "owned_identity"
+        )?);
+        assert!(!table_exists(&connection, "_migrations")?);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_gapped_migration_history() -> Result<()> {
+        let mut connection = Connection::open_in_memory()?;
+        connection.execute_batch(include_str!("migrations/001_initial.sql"))?;
+        connection.execute_batch(include_str!("migrations/002_safety.sql"))?;
+        connection.execute_batch(include_str!("migrations/003_source_identity.sql"))?;
+        ensure_tracking_table(&connection)?;
+        connection.execute("INSERT INTO _migrations (version) VALUES (1), (3)", [])?;
+        assert!(run_migrations(&mut connection, None).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_a_recorded_version_that_the_schema_does_not_have() -> Result<()> {
+        let mut connection = Connection::open_in_memory()?;
+        connection.execute_batch(include_str!("migrations/001_initial.sql"))?;
+        ensure_tracking_table(&connection)?;
+        connection.execute("INSERT INTO _migrations (version) VALUES (1), (2), (3)", [])?;
+        assert!(run_migrations(&mut connection, None).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_to_initialize_over_an_unrelated_database() -> Result<()> {
+        let mut connection = Connection::open_in_memory()?;
+        connection.execute("CREATE TABLE unrelated (value TEXT)", [])?;
+
+        assert!(run_migrations(&mut connection, None).is_err());
+
+        assert!(table_exists(&connection, "unrelated")?);
+        assert!(!table_exists(&connection, "items")?);
+        assert!(!table_exists(&connection, "_migrations")?);
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_foreign_key_corruption_before_changing_the_schema() -> Result<()> {
+        let mut connection = Connection::open_in_memory()?;
+        connection.execute_batch(include_str!("migrations/001_initial.sql"))?;
+        connection.pragma_update(None, "foreign_keys", "OFF")?;
+        connection.execute(
+            "INSERT INTO items
+             (album_id, path, title, artist, album, format, bitrate, length, added, mtime)
+             VALUES (999, '/missing.flac', 'Track', 'Artist', 'Album', 'FLAC', 1, 1,
+                     '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            [],
+        )?;
+
+        assert!(run_migrations(&mut connection, None).is_err());
+        assert!(!table_exists(&connection, "_migrations")?);
+        assert!(!table_exists(&connection, "operation_journal")?);
         Ok(())
     }
 
@@ -257,6 +449,49 @@ mod tests {
         assert_eq!(current_version(&backup)?, 0);
         assert!(!table_exists(&backup, "_migrations")?);
         assert!(!table_exists(&backup, "operation_journal")?);
+        Ok(())
+    }
+
+    #[test]
+    fn v3_migration_backs_up_the_v2_journal() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let database_path = temporary.path().join("library.db");
+        {
+            let connection = Connection::open(&database_path)?;
+            connection.execute_batch(include_str!("migrations/001_initial.sql"))?;
+            connection.execute_batch(include_str!("migrations/002_safety.sql"))?;
+            ensure_tracking_table(&connection)?;
+            connection.execute("INSERT INTO _migrations (version) VALUES (1), (2)", [])?;
+        }
+
+        let mut connection = Connection::open(&database_path)?;
+        let report = run_migrations(&mut connection, Some(&database_path))?;
+        let backup_path = report
+            .backup_path
+            .ok_or_else(|| Error::Recovery("v2 migration did not create a backup".into()))?;
+        assert!(column_exists(
+            &connection,
+            "operation_files",
+            "source_identity"
+        )?);
+        assert!(column_exists(
+            &connection,
+            "operation_files",
+            "owned_identity"
+        )?);
+        let backup =
+            Connection::open_with_flags(backup_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        assert_eq!(current_version(&backup)?, 2);
+        assert!(!column_exists(
+            &backup,
+            "operation_files",
+            "source_identity"
+        )?);
+        assert!(!column_exists(
+            &backup,
+            "operation_files",
+            "owned_identity"
+        )?);
         Ok(())
     }
 }

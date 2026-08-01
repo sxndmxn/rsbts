@@ -121,6 +121,36 @@ impl Item {
     }
 }
 
+pub(crate) fn validate_item_metadata(item: &Item) -> Result<()> {
+    for (field, value) in [
+        ("title", item.title.as_str()),
+        ("artist", item.artist.as_str()),
+        ("album", item.album.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return Err(Error::Import(format!("item {field} cannot be empty")));
+        }
+    }
+    if !item.length.is_finite() || item.length < 0.0 {
+        return Err(Error::Import(
+            "item length must be a finite, non-negative number".into(),
+        ));
+    }
+    validate_external_id(item.track_external_id.as_ref())?;
+    validate_external_id(item.release_external_id.as_ref())?;
+    if let (Some(track), Some(release)) = (
+        item.track_external_id.as_ref(),
+        item.release_external_id.as_ref(),
+    ) {
+        if track.provider != release.provider {
+            return Err(Error::Import(
+                "track and release external IDs must use the same provider".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Album {
     pub id: Option<i64>,
@@ -130,6 +160,25 @@ pub struct Album {
     pub artpath: Option<PathBuf>,
     pub external_id: Option<ExternalId>,
     pub added: DateTime<Utc>,
+}
+
+pub(crate) fn validate_album_metadata(album: &Album) -> Result<()> {
+    if album.album.trim().is_empty() || album.albumartist.trim().is_empty() {
+        return Err(Error::Import(
+            "album name and album artist cannot be empty".into(),
+        ));
+    }
+    validate_external_id(album.external_id.as_ref())
+}
+
+fn validate_external_id(external_id: Option<&ExternalId>) -> Result<()> {
+    if external_id.is_some_and(|id| id.provider.trim().is_empty() || id.value.trim().is_empty()) {
+        Err(Error::Import(
+            "external ID provider and value cannot be empty".into(),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

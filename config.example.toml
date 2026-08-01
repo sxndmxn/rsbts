@@ -8,8 +8,10 @@ directory = "~/Music"
 database = "~/.local/share/rsbts/library.db"
 
 [paths]
-# Template for organizing files
-# Available variables: $albumartist, $artist, $album, $year, $track, $title, $disc
+# Template for organizing file stems; the source extension is appended
+# Variables: $albumartist, $artist, $album, $genre, $year, $track, $title, $disc
+# Functions: %upper{}, %lower{}, %title{}, %left{n,value}, %right{n,value},
+# and %if{condition,true-value,false-value}
 format = "$albumartist/$album/$track - $title"
 
 [import]
@@ -31,13 +33,15 @@ runner_up_margin = 0.05
 
 [musicbrainz]
 # Search result limit
+# Values above 100 are rejected.
 search_limit = 5
 
 # MusicBrainz requires an identifying user agent with a project URL or contact
 user_agent = "rsbts/0.2.0 (https://github.com/sxndmxn/rsbts)"
 
-# MusicBrainz permits one request per second for this client
+# Minimum interval between requests (values below 1.0 are rejected)
 rate_limit_seconds = 1.0
 
 # Retry transient 429/5xx responses
+# Values above 10 are rejected.
 max_retries = 3
