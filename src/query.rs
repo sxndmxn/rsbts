@@ -416,10 +416,9 @@ fn parse_relative_date(value: &str) -> Option<String> {
         number.parse::<i64>().ok()?.checked_mul(7)?
     } else if let Some(number) = value.strip_suffix('m') {
         number.parse::<i64>().ok()?.checked_mul(30)?
-    } else if let Some(number) = value.strip_suffix('y') {
-        number.parse::<i64>().ok()?.checked_mul(365)?
     } else {
-        return None;
+        let number = value.strip_suffix('y')?;
+        number.parse::<i64>().ok()?.checked_mul(365)?
     };
     if days < 0 {
         return None;
