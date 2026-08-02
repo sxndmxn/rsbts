@@ -1221,6 +1221,7 @@ dependencies = [
  "pathfinding",
  "reqwest",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "strsim",

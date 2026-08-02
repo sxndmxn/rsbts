@@ -8,6 +8,10 @@ organizes approved albums without silently overwriting files.
 
 - Imports are previewed and approved per album. A collision rejects the whole
   album; an existing, managed destination with identical content is a no-op.
+- On Unix, library directories are opened component-by-component without
+  following symlinks. Creation, staging, and no-clobber finalization stay
+  relative to pinned directory handles and abort if the library root or a
+  destination parent changes during execution.
 - Copy, move, link, cover-art, and file-deleting removal operations use a
   persistent SQLite journal. Interrupted work is reconciled when the CLI opens
   for a non-dry-run command; if ownership cannot be proven, recovery stops and

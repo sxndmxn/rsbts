@@ -2,10 +2,14 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+
+#[cfg(not(unix))]
+use std::fs::OpenOptions;
+#[cfg(unix)]
+use std::io::{Seek, SeekFrom};
 
 use chrono::Utc;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -14,9 +18,10 @@ use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
 
+#[cfg(not(unix))]
+use crate::db::sync_directory;
 use crate::db::{
-    file_identity, hash_path, remove_file_synced, sync_directory, JournalFile, Library,
-    OperationKind,
+    file_identity, hash_path, remove_file_synced, JournalFile, Library, OperationKind,
 };
 use crate::pathformat::format_relative_path;
 use crate::provider::{MetadataProvider, ProviderTrack, ReleaseCandidate, ReleaseQuery};
@@ -542,57 +547,51 @@ impl<'a> ImportExecutor<'a> {
         tracks: &[&PlannedTrack],
         files: &[JournalFile],
     ) -> Result<()> {
+        let destination_root = DestinationRoot::open(&plan.library_dir)?;
+        let mut prepared = Vec::with_capacity(files.len());
         self.library
             .set_operation_state(operation_id, "staging", None)?;
         for (ordinal, track) in tracks.iter().enumerate() {
             validate_source(track)?;
             validate_destination(&plan.library_dir, &track.destination)?;
-            validate_destination_for_execution(&track.destination)?;
-            create_parent(&track.destination)?;
-            validate_destination(&plan.library_dir, &track.destination)?;
-            match plan.action {
-                Action::Copy | Action::Move => copy_new(&track.source, &files[ordinal].staged)?,
-                Action::Link => create_symlink(&track.source, &files[ordinal].staged)?,
-            }
-            verify_hash(&files[ordinal].staged, &track.fingerprint.content_hash)?;
-            let staged_identity =
-                file_identity(&std::fs::symlink_metadata(&files[ordinal].staged)?);
+            let destination =
+                destination_root.resolve(&files[ordinal].staged, &track.destination)?;
+            destination.ensure_destination_absent()?;
+            let staged_identity = match plan.action {
+                Action::Copy | Action::Move => {
+                    destination.stage_regular(&track.source, &track.fingerprint.content_hash)?
+                }
+                Action::Link => {
+                    destination.stage_link(&track.source, &track.fingerprint.content_hash)?
+                }
+            };
             self.library
                 .set_staged_file_identity(operation_id, ordinal, &staged_identity)?;
+            prepared.push(PreparedDestination {
+                destination,
+                identity: staged_identity,
+            });
         }
 
         if let Some(artwork) = &plan.artwork {
             let ordinal = tracks.len();
             validate_destination(&plan.library_dir, &artwork.destination)?;
-            validate_destination_for_execution(&artwork.destination)?;
-            create_parent(&artwork.destination)?;
-            validate_destination(&plan.library_dir, &artwork.destination)?;
-            write_new(&files[ordinal].staged, &artwork.bytes)?;
-            verify_hash(&files[ordinal].staged, &artwork.content_hash)?;
-            let staged_identity =
-                file_identity(&std::fs::symlink_metadata(&files[ordinal].staged)?);
+            let destination =
+                destination_root.resolve(&files[ordinal].staged, &artwork.destination)?;
+            destination.ensure_destination_absent()?;
+            let staged_identity = destination.stage_bytes(&artwork.bytes, &artwork.content_hash)?;
             self.library
                 .set_staged_file_identity(operation_id, ordinal, &staged_identity)?;
+            prepared.push(PreparedDestination {
+                destination,
+                identity: staged_identity,
+            });
         }
 
         self.library
             .set_operation_state(operation_id, "finalizing", None)?;
-        for (ordinal, track) in tracks.iter().enumerate() {
-            validate_destination(&plan.library_dir, &track.destination)?;
-            validate_destination_for_execution(&track.destination)?;
-            if plan.action == Action::Link {
-                finalize_link(&files[ordinal].staged, &track.destination)?;
-            } else {
-                finalize_regular_file(&files[ordinal].staged, &track.destination)?;
-            }
-            self.library
-                .set_file_state(operation_id, ordinal, "finalized")?;
-        }
-        if let Some(artwork) = &plan.artwork {
-            let ordinal = tracks.len();
-            validate_destination(&plan.library_dir, &artwork.destination)?;
-            validate_destination_for_execution(&artwork.destination)?;
-            finalize_regular_file(&files[ordinal].staged, &artwork.destination)?;
+        for (ordinal, destination) in prepared.iter().enumerate() {
+            destination.destination.finalize(&destination.identity)?;
             self.library
                 .set_file_state(operation_id, ordinal, "finalized")?;
         }
@@ -1137,6 +1136,7 @@ fn validate_destination(root: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(unix))]
 fn validate_destination_for_execution(destination: &Path) -> Result<()> {
     if destination.exists() || destination.is_symlink() {
         Err(Error::Import(format!(
@@ -1215,6 +1215,629 @@ fn validate_source(track: &PlannedTrack) -> Result<()> {
     Ok(())
 }
 
+struct PreparedDestination<'a> {
+    destination: DestinationFile<'a>,
+    identity: String,
+}
+
+#[cfg(unix)]
+struct DestinationRoot {
+    path: PathBuf,
+    directory: rustix::fd::OwnedFd,
+    identity: String,
+}
+
+#[cfg(unix)]
+struct DestinationFile<'a> {
+    root: &'a DestinationRoot,
+    directory: rustix::fd::OwnedFd,
+    relative_parent: PathBuf,
+    parent_identity: String,
+    staged_name: std::ffi::OsString,
+    destination_name: std::ffi::OsString,
+    staged_path: PathBuf,
+    destination_path: PathBuf,
+}
+
+#[cfg(unix)]
+impl DestinationRoot {
+    fn open(path: &Path) -> Result<Self> {
+        let directory = open_root(path, true)?;
+        let identity = directory_identity(&directory)?;
+        let root = Self {
+            path: path.to_path_buf(),
+            directory,
+            identity,
+        };
+        root.ensure_current()?;
+        Ok(root)
+    }
+
+    fn resolve<'a>(&'a self, staged: &Path, destination: &Path) -> Result<DestinationFile<'a>> {
+        self.ensure_current()?;
+        let destination_relative = destination.strip_prefix(&self.path).map_err(|error| {
+            Error::Import(format!(
+                "destination escapes the library directory: {}: {error}",
+                destination.display()
+            ))
+        })?;
+        let staged_relative = staged.strip_prefix(&self.path).map_err(|error| {
+            Error::Import(format!(
+                "staging path escapes the library directory: {}: {error}",
+                staged.display()
+            ))
+        })?;
+        let destination_parent = destination_relative.parent().ok_or_else(|| {
+            Error::Import(format!(
+                "destination has no parent: {}",
+                destination.display()
+            ))
+        })?;
+        if staged_relative.parent() != Some(destination_parent) {
+            return Err(Error::Import(format!(
+                "staging path does not share the destination parent: {}",
+                staged.display()
+            )));
+        }
+        let destination_name = normal_filename(destination_relative, "destination")?;
+        let staged_name = normal_filename(staged_relative, "staging")?;
+        let directory = self.open_relative_directory(destination_parent, true)?;
+        let parent_identity = directory_identity(&directory)?;
+        Ok(DestinationFile {
+            root: self,
+            directory,
+            relative_parent: destination_parent.to_path_buf(),
+            parent_identity,
+            staged_name,
+            destination_name,
+            staged_path: staged.to_path_buf(),
+            destination_path: destination.to_path_buf(),
+        })
+    }
+
+    fn ensure_current(&self) -> Result<()> {
+        let current = open_root(&self.path, false)?;
+        if directory_identity(&current)? == self.identity {
+            Ok(())
+        } else {
+            Err(Error::Import(format!(
+                "library directory changed during execution: {}",
+                self.path.display()
+            )))
+        }
+    }
+
+    fn open_relative_directory(
+        &self,
+        relative: &Path,
+        create_missing: bool,
+    ) -> Result<rustix::fd::OwnedFd> {
+        let mut directory =
+            rustix::io::dup(&self.directory).map_err(|error| Error::Io(error.into()))?;
+        let mut display_path = self.path.clone();
+        for component in relative.components() {
+            let std::path::Component::Normal(name) = component else {
+                return Err(Error::Import(format!(
+                    "destination contains an unsafe path component: {}",
+                    relative.display()
+                )));
+            };
+            display_path.push(name);
+            let flags = rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC;
+            let opened =
+                match rustix::fs::openat(&directory, name, flags, rustix::fs::Mode::empty()) {
+                    Ok(opened) => opened,
+                    Err(rustix::io::Errno::NOENT) if create_missing => {
+                        match rustix::fs::mkdirat(&directory, name, rustix::fs::Mode::from(0o777)) {
+                            Ok(()) => {
+                                rustix::fs::fsync(&directory)
+                                    .map_err(|error| Error::Io(error.into()))?;
+                            }
+                            Err(rustix::io::Errno::EXIST) => {}
+                            Err(error) => {
+                                return Err(destination_error(
+                                    "cannot create destination directory",
+                                    &display_path,
+                                    error,
+                                ));
+                            }
+                        }
+                        rustix::fs::openat(&directory, name, flags, rustix::fs::Mode::empty())
+                            .map_err(|error| {
+                                destination_error(
+                                    "cannot open newly created destination directory",
+                                    &display_path,
+                                    error,
+                                )
+                            })?
+                    }
+                    Err(error) => {
+                        return Err(destination_error(
+                            "destination parent is not a stable, real directory",
+                            &display_path,
+                            error,
+                        ));
+                    }
+                };
+            directory = opened;
+        }
+        Ok(directory)
+    }
+}
+
+#[cfg(unix)]
+impl DestinationFile<'_> {
+    fn ensure_destination_absent(&self) -> Result<()> {
+        self.ensure_parent_current()?;
+        self.ensure_absent(&self.destination_name, &self.destination_path)
+    }
+
+    fn stage_regular(&self, source: &Path, expected_hash: &str) -> Result<String> {
+        self.ensure_parent_current()?;
+        self.ensure_absent(&self.destination_name, &self.destination_path)?;
+        let descriptor = rustix::fs::openat(
+            &self.directory,
+            &self.staged_name,
+            rustix::fs::OFlags::RDWR
+                | rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::EXCL
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::from(0o644),
+        )
+        .map_err(|error| {
+            destination_error("cannot create staging file", &self.staged_path, error)
+        })?;
+        let mut output = std::fs::File::from(descriptor);
+        let result = (|| {
+            let mut input = std::fs::File::open(source)?;
+            std::io::copy(&mut input, &mut output)?;
+            output.sync_all()?;
+            verify_open_file_hash(&mut output, expected_hash, &self.staged_path)?;
+            self.ensure_parent_current()
+        })();
+        let identity = file_identity(&output.metadata()?);
+        if let Err(error) = result {
+            return Err(self.cleanup_created(
+                &self.staged_name,
+                &self.staged_path,
+                &identity,
+                error,
+            ));
+        }
+        Ok(identity)
+    }
+
+    fn stage_bytes(&self, bytes: &[u8], expected_hash: &str) -> Result<String> {
+        self.ensure_parent_current()?;
+        self.ensure_absent(&self.destination_name, &self.destination_path)?;
+        let descriptor = rustix::fs::openat(
+            &self.directory,
+            &self.staged_name,
+            rustix::fs::OFlags::RDWR
+                | rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::EXCL
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::from(0o644),
+        )
+        .map_err(|error| {
+            destination_error("cannot create staging file", &self.staged_path, error)
+        })?;
+        let mut output = std::fs::File::from(descriptor);
+        let result = (|| {
+            output.write_all(bytes)?;
+            output.sync_all()?;
+            verify_open_file_hash(&mut output, expected_hash, &self.staged_path)?;
+            self.ensure_parent_current()
+        })();
+        let identity = file_identity(&output.metadata()?);
+        if let Err(error) = result {
+            return Err(self.cleanup_created(
+                &self.staged_name,
+                &self.staged_path,
+                &identity,
+                error,
+            ));
+        }
+        Ok(identity)
+    }
+
+    fn stage_link(&self, source: &Path, expected_hash: &str) -> Result<String> {
+        use std::os::unix::ffi::OsStrExt;
+
+        self.ensure_parent_current()?;
+        self.ensure_absent(&self.destination_name, &self.destination_path)?;
+        rustix::fs::symlinkat(source, &self.directory, &self.staged_name).map_err(|error| {
+            destination_error("cannot create staging link", &self.staged_path, error)
+        })?;
+        let identity = match self.entry_identity(&self.staged_name, &self.staged_path) {
+            Ok(Some(identity)) => identity,
+            Ok(None) => {
+                return Err(Error::Recovery(format!(
+                    "new staging link disappeared before it could be journaled: {}",
+                    self.staged_path.display()
+                )));
+            }
+            Err(error) => return Err(error),
+        };
+        let result = (|| {
+            let target = rustix::fs::readlinkat(&self.directory, &self.staged_name, Vec::new())
+                .map_err(|error| {
+                    destination_error("cannot inspect staging link", &self.staged_path, error)
+                })?;
+            if target.to_bytes() != source.as_os_str().as_bytes() {
+                return Err(Error::Import(format!(
+                    "staging link target changed during creation: {}",
+                    self.staged_path.display()
+                )));
+            }
+            verify_hash(source, expected_hash)?;
+            self.ensure_parent_current()
+        })();
+        if let Err(error) = result {
+            return Err(self.cleanup_created(
+                &self.staged_name,
+                &self.staged_path,
+                &identity,
+                error,
+            ));
+        }
+        Ok(identity)
+    }
+
+    fn finalize(&self, expected_identity: &str) -> Result<()> {
+        self.ensure_parent_current()?;
+        self.ensure_owned(&self.staged_name, &self.staged_path, expected_identity)?;
+        self.ensure_absent(&self.destination_name, &self.destination_path)?;
+        rustix::fs::linkat(
+            &self.directory,
+            &self.staged_name,
+            &self.directory,
+            &self.destination_name,
+            rustix::fs::AtFlags::empty(),
+        )
+        .map_err(|error| {
+            destination_error(
+                "cannot finalize staging file without overwriting",
+                &self.destination_path,
+                error,
+            )
+        })?;
+        let result = (|| {
+            self.ensure_owned(
+                &self.destination_name,
+                &self.destination_path,
+                expected_identity,
+            )?;
+            rustix::fs::unlinkat(
+                &self.directory,
+                &self.staged_name,
+                rustix::fs::AtFlags::empty(),
+            )
+            .map_err(|error| {
+                destination_error(
+                    "cannot remove finalized staging name",
+                    &self.staged_path,
+                    error,
+                )
+            })?;
+            rustix::fs::fsync(&self.directory).map_err(|error| Error::Io(error.into()))?;
+            self.ensure_parent_current()
+        })();
+        if let Err(error) = result {
+            return Err(self.cleanup_created(
+                &self.destination_name,
+                &self.destination_path,
+                expected_identity,
+                error,
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_parent_current(&self) -> Result<()> {
+        self.root.ensure_current()?;
+        let current = self
+            .root
+            .open_relative_directory(&self.relative_parent, false)?;
+        if directory_identity(&current)? == self.parent_identity {
+            Ok(())
+        } else {
+            Err(Error::Import(format!(
+                "destination parent changed during execution: {}",
+                self.destination_path
+                    .parent()
+                    .map_or_else(String::new, |path| path.display().to_string())
+            )))
+        }
+    }
+
+    fn ensure_absent(&self, name: &std::ffi::OsStr, path: &Path) -> Result<()> {
+        match self.entry_identity(name, path)? {
+            None => Ok(()),
+            Some(_) => Err(Error::Import(format!(
+                "destination appeared after planning: {}",
+                path.display()
+            ))),
+        }
+    }
+
+    fn ensure_owned(&self, name: &std::ffi::OsStr, path: &Path, identity: &str) -> Result<()> {
+        match self.entry_identity(name, path)? {
+            Some(actual) if actual == identity => Ok(()),
+            Some(_) => Err(Error::Recovery(format!(
+                "refusing to touch a replaced destination entry: {}",
+                path.display()
+            ))),
+            None => Err(Error::Recovery(format!(
+                "owned destination entry disappeared: {}",
+                path.display()
+            ))),
+        }
+    }
+
+    fn entry_identity(&self, name: &std::ffi::OsStr, path: &Path) -> Result<Option<String>> {
+        match rustix::fs::statat(&self.directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => Ok(Some(stat_identity(&stat))),
+            Err(rustix::io::Errno::NOENT) => Ok(None),
+            Err(error) => Err(destination_error(
+                "cannot inspect destination entry",
+                path,
+                error,
+            )),
+        }
+    }
+
+    fn cleanup_created(
+        &self,
+        name: &std::ffi::OsStr,
+        path: &Path,
+        identity: &str,
+        original: Error,
+    ) -> Error {
+        match self.entry_identity(name, path) {
+            Ok(None) => original,
+            Ok(Some(actual)) if actual != identity => Error::Recovery(format!(
+                "{original}; preserving replaced destination entry {}",
+                path.display()
+            )),
+            Ok(Some(_)) => {
+                match rustix::fs::unlinkat(&self.directory, name, rustix::fs::AtFlags::empty()) {
+                    Ok(()) => {
+                        if let Err(sync_error) = rustix::fs::fsync(&self.directory) {
+                            Error::Recovery(format!(
+                            "{original}; removed failed destination but could not sync its directory: {}",
+                            std::io::Error::from(sync_error)
+                        ))
+                        } else {
+                            original
+                        }
+                    }
+                    Err(cleanup_error) => Error::Recovery(format!(
+                        "{original}; could not remove owned failed destination {}: {}",
+                        path.display(),
+                        std::io::Error::from(cleanup_error)
+                    )),
+                }
+            }
+            Err(cleanup_error) => Error::Recovery(format!(
+                "{original}; could not verify owned failed destination {}: {cleanup_error}",
+                path.display()
+            )),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn open_directory(path: &Path) -> std::result::Result<rustix::fd::OwnedFd, rustix::io::Errno> {
+    rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+}
+
+#[cfg(unix)]
+fn open_root(path: &Path, create_missing: bool) -> Result<rustix::fd::OwnedFd> {
+    if !path.is_absolute() {
+        return Err(Error::Import(format!(
+            "library directory must be absolute: {}",
+            path.display()
+        )));
+    }
+
+    let mut directory = open_directory(Path::new("/"))
+        .map_err(|error| destination_error("cannot open filesystem root", Path::new("/"), error))?;
+    let mut display_path = PathBuf::from("/");
+    for component in path.components() {
+        let name = match component {
+            std::path::Component::RootDir => continue,
+            std::path::Component::Normal(name) => name,
+            _ => {
+                return Err(Error::Import(format!(
+                    "library directory contains an unsafe path component: {}",
+                    path.display()
+                )));
+            }
+        };
+        display_path.push(name);
+        let flags = rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC;
+        let opened = match rustix::fs::openat(&directory, name, flags, rustix::fs::Mode::empty()) {
+            Ok(opened) => opened,
+            Err(rustix::io::Errno::NOENT) if create_missing => {
+                match rustix::fs::mkdirat(&directory, name, rustix::fs::Mode::from(0o777)) {
+                    Ok(()) => {
+                        rustix::fs::fsync(&directory).map_err(|error| Error::Io(error.into()))?;
+                    }
+                    Err(rustix::io::Errno::EXIST) => {}
+                    Err(error) => {
+                        return Err(destination_error(
+                            "cannot create library directory",
+                            &display_path,
+                            error,
+                        ));
+                    }
+                }
+                rustix::fs::openat(&directory, name, flags, rustix::fs::Mode::empty()).map_err(
+                    |error| {
+                        destination_error(
+                            "new library directory is not a stable, real directory",
+                            &display_path,
+                            error,
+                        )
+                    },
+                )?
+            }
+            Err(error) => {
+                return Err(destination_error(
+                    "library directory path is not a stable, real directory",
+                    &display_path,
+                    error,
+                ));
+            }
+        };
+        directory = opened;
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn directory_identity(directory: &rustix::fd::OwnedFd) -> Result<String> {
+    let stat = rustix::fs::fstat(directory).map_err(|error| Error::Io(error.into()))?;
+    Ok(format!("{}:{}", stat.st_dev, stat.st_ino))
+}
+
+#[cfg(unix)]
+fn stat_identity(stat: &rustix::fs::Stat) -> String {
+    format!(
+        "{}:{}:{}:{}:{}",
+        stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime, stat.st_mtime_nsec
+    )
+}
+
+#[cfg(unix)]
+fn normal_filename(path: &Path, role: &str) -> Result<std::ffi::OsString> {
+    let mut components = path.components();
+    let Some(std::path::Component::Normal(name)) = components.next_back() else {
+        return Err(Error::Import(format!(
+            "{role} path has no safe filename: {}",
+            path.display()
+        )));
+    };
+    if components.any(|component| !matches!(component, std::path::Component::Normal(_))) {
+        return Err(Error::Import(format!(
+            "{role} path contains an unsafe component: {}",
+            path.display()
+        )));
+    }
+    Ok(name.to_os_string())
+}
+
+#[cfg(unix)]
+fn destination_error(action: &str, path: &Path, error: rustix::io::Errno) -> Error {
+    Error::Import(format!(
+        "{action} {}: {}",
+        path.display(),
+        std::io::Error::from(error)
+    ))
+}
+
+#[cfg(unix)]
+fn verify_open_file_hash(file: &mut std::fs::File, expected: &str, path: &Path) -> Result<()> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut hasher = blake3::Hasher::new();
+    std::io::copy(file, &mut hasher)?;
+    let actual = hasher.finalize().to_hex().to_string();
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(Error::Import(format!(
+            "staged content verification failed: {}",
+            path.display()
+        )))
+    }
+}
+
+#[cfg(not(unix))]
+struct DestinationRoot {
+    path: PathBuf,
+}
+
+#[cfg(not(unix))]
+struct DestinationFile<'a> {
+    _root: &'a DestinationRoot,
+    staged_path: PathBuf,
+    destination_path: PathBuf,
+}
+
+#[cfg(not(unix))]
+impl DestinationRoot {
+    fn open(path: &Path) -> Result<Self> {
+        Ok(Self {
+            path: path.to_path_buf(),
+        })
+    }
+
+    fn resolve<'a>(&'a self, staged: &Path, destination: &Path) -> Result<DestinationFile<'a>> {
+        validate_destination(&self.path, staged)?;
+        validate_destination(&self.path, destination)?;
+        create_parent(destination)?;
+        validate_destination(&self.path, destination)?;
+        Ok(DestinationFile {
+            _root: self,
+            staged_path: staged.to_path_buf(),
+            destination_path: destination.to_path_buf(),
+        })
+    }
+}
+
+#[cfg(not(unix))]
+impl DestinationFile<'_> {
+    fn ensure_destination_absent(&self) -> Result<()> {
+        validate_destination_for_execution(&self.destination_path)
+    }
+
+    fn stage_regular(&self, source: &Path, expected_hash: &str) -> Result<String> {
+        copy_new(source, &self.staged_path)?;
+        verify_hash(&self.staged_path, expected_hash)?;
+        Ok(file_identity(&std::fs::symlink_metadata(
+            &self.staged_path,
+        )?))
+    }
+
+    fn stage_bytes(&self, bytes: &[u8], expected_hash: &str) -> Result<String> {
+        write_new(&self.staged_path, bytes)?;
+        verify_hash(&self.staged_path, expected_hash)?;
+        Ok(file_identity(&std::fs::symlink_metadata(
+            &self.staged_path,
+        )?))
+    }
+
+    fn stage_link(&self, source: &Path, expected_hash: &str) -> Result<String> {
+        create_symlink(source, &self.staged_path)?;
+        verify_hash(&self.staged_path, expected_hash)?;
+        Ok(file_identity(&std::fs::symlink_metadata(
+            &self.staged_path,
+        )?))
+    }
+
+    fn finalize(&self, _expected_identity: &str) -> Result<()> {
+        validate_destination_for_execution(&self.destination_path)?;
+        finalize_regular_file(&self.staged_path, &self.destination_path)
+    }
+}
+
+#[cfg(not(unix))]
 fn create_parent(path: &Path) -> Result<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
@@ -1251,6 +1874,7 @@ fn create_parent(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(unix))]
 fn copy_new(source: &Path, destination: &Path) -> Result<()> {
     let mut input = std::fs::File::open(source)?;
     let mut output = OpenOptions::new()
@@ -1262,6 +1886,7 @@ fn copy_new(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(unix))]
 fn write_new(destination: &Path, bytes: &[u8]) -> Result<()> {
     let mut output = OpenOptions::new()
         .write(true)
@@ -1269,12 +1894,6 @@ fn write_new(destination: &Path, bytes: &[u8]) -> Result<()> {
         .open(destination)?;
     output.write_all(bytes)?;
     output.sync_all()?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn create_symlink(source: &Path, destination: &Path) -> Result<()> {
-    std::os::unix::fs::symlink(source, destination)?;
     Ok(())
 }
 
@@ -1302,16 +1921,8 @@ fn verify_hash(path: &Path, expected: &str) -> Result<()> {
     }
 }
 
+#[cfg(not(unix))]
 fn finalize_regular_file(staged: &Path, destination: &Path) -> Result<()> {
-    std::fs::hard_link(staged, destination)?;
-    std::fs::remove_file(staged)?;
-    if let Some(parent) = destination.parent() {
-        sync_directory(parent)?;
-    }
-    Ok(())
-}
-
-fn finalize_link(staged: &Path, destination: &Path) -> Result<()> {
     std::fs::hard_link(staged, destination)?;
     std::fs::remove_file(staged)?;
     if let Some(parent) = destination.parent() {
@@ -1580,10 +2191,85 @@ mod tests {
         let destination = temporary.path().join("destination");
         std::fs::write(&staged, b"new")?;
         std::fs::write(&destination, b"old")?;
-        assert!(finalize_regular_file(&staged, &destination).is_err());
+        let root = DestinationRoot::open(temporary.path())?;
+        let destination_file = root.resolve(&staged, &destination)?;
+        let identity = file_identity(&std::fs::symlink_metadata(&staged)?);
+        assert!(destination_file.finalize(&identity).is_err());
         let mut value = String::new();
         std::fs::File::open(destination)?.read_to_string(&mut value)?;
         assert_eq!(value, "old");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn library_creation_rejects_a_symlinked_ancestor() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let outside = temporary.path().join("outside");
+        let redirected = temporary.path().join("redirected");
+        std::fs::create_dir(&outside)?;
+        std::os::unix::fs::symlink(&outside, &redirected)?;
+
+        assert!(DestinationRoot::open(&redirected.join("library")).is_err());
+        assert!(!outside.join("library").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_rejects_a_parent_replaced_by_a_symlink() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let source = temporary.path().join("source.flac");
+        let library_dir = temporary.path().join("library");
+        let parent = library_dir.join("Artist/Album");
+        let detached = temporary.path().join("detached-album");
+        let outside = temporary.path().join("outside");
+        let staged = parent.join(".track.stage");
+        let destination = parent.join("track.flac");
+        std::fs::write(&source, b"audio")?;
+        std::fs::create_dir_all(&parent)?;
+        std::fs::create_dir(&outside)?;
+
+        let root = DestinationRoot::open(&library_dir)?;
+        let destination_file = root.resolve(&staged, &destination)?;
+        std::fs::rename(&parent, &detached)?;
+        std::os::unix::fs::symlink(&outside, &parent)?;
+
+        assert!(destination_file
+            .stage_regular(&source, &hash_path(&source)?)
+            .is_err());
+        assert!(!outside.join(".track.stage").exists());
+        assert!(!outside.join("track.flac").exists());
+        assert!(!detached.join(".track.stage").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finalization_rejects_a_parent_replaced_by_a_symlink() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let source = temporary.path().join("source.flac");
+        let library_dir = temporary.path().join("library");
+        let parent = library_dir.join("Artist/Album");
+        let detached = temporary.path().join("detached-album");
+        let outside = temporary.path().join("outside");
+        let staged = parent.join(".track.stage");
+        let destination = parent.join("track.flac");
+        std::fs::write(&source, b"audio")?;
+        std::fs::create_dir_all(&parent)?;
+        std::fs::create_dir(&outside)?;
+
+        let root = DestinationRoot::open(&library_dir)?;
+        let destination_file = root.resolve(&staged, &destination)?;
+        let identity = destination_file.stage_regular(&source, &hash_path(&source)?)?;
+        std::fs::rename(&parent, &detached)?;
+        std::os::unix::fs::symlink(&outside, &parent)?;
+
+        assert!(destination_file.finalize(&identity).is_err());
+        assert!(!outside.join(".track.stage").exists());
+        assert!(!outside.join("track.flac").exists());
+        assert!(detached.join(".track.stage").exists());
+        assert!(!detached.join("track.flac").exists());
         Ok(())
     }
 
@@ -1670,7 +2356,11 @@ mod tests {
         std::fs::write(&source, b"audio")?;
         let plan = approved_plan(&source, &library_dir, Action::Copy)?;
         let destination = plan.tracks[0].destination.clone();
-        create_parent(&destination)?;
+        std::fs::create_dir_all(
+            destination.parent().ok_or_else(|| {
+                Error::Import("test destination unexpectedly has no parent".into())
+            })?,
+        )?;
         std::fs::write(&destination, b"collision")?;
         let mut library = Library::open_in_memory()?;
         assert!(ImportExecutor::new(&mut library).execute(plan).is_err());
