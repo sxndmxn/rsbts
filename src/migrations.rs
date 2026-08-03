@@ -7,7 +7,7 @@ use rusqlite::{Connection, DatabaseName, TransactionBehavior};
 
 use crate::{Error, Result};
 
-const LATEST_VERSION: u32 = 3;
+const LATEST_VERSION: u32 = 4;
 
 pub struct Migration {
     pub version: u32,
@@ -26,6 +26,10 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 3,
         sql: include_str!("migrations/003_source_identity.sql"),
+    },
+    Migration {
+        version: 4,
+        sql: include_str!("migrations/004_core_metadata.sql"),
     },
 ];
 
@@ -122,6 +126,23 @@ fn detect_untracked_version(conn: &Connection) -> Result<u32> {
         has_journal && column_exists(conn, "operation_files", "source_identity")?;
     let has_owned_identity =
         has_journal && column_exists(conn, "operation_files", "owned_identity")?;
+    let has_singleton = column_exists(conn, "items", "singleton")?;
+    let has_entity_metadata = table_exists(conn, "entity_metadata")?;
+    let has_external_ids = table_exists(conn, "external_ids")?;
+    let v4_markers = [has_singleton, has_entity_metadata, has_external_ids];
+    if v4_markers.into_iter().any(|present| present) {
+        if v4_markers.into_iter().all(|present| present)
+            && has_journal
+            && has_source_identity
+            && has_owned_identity
+        {
+            return Ok(4);
+        }
+        return Err(Error::Recovery(
+            "database has a partial untracked core-metadata schema; refusing to guess a migration"
+                .into(),
+        ));
+    }
     if has_journal {
         if has_source_identity && has_owned_identity {
             Ok(3)
@@ -200,7 +221,11 @@ fn verify_schema_version(conn: &Connection, version: u32) -> Result<()> {
     let v3 = version < 3
         || (column_exists(conn, "operation_files", "source_identity")?
             && column_exists(conn, "operation_files", "owned_identity")?);
-    if v1 && v2 && v3 {
+    let v4 = version < 4
+        || (column_exists(conn, "items", "singleton")?
+            && table_exists(conn, "entity_metadata")?
+            && table_exists(conn, "external_ids")?);
+    if v1 && v2 && v3 && v4 {
         Ok(())
     } else {
         Err(Error::Recovery(format!(
@@ -353,6 +378,38 @@ mod tests {
             "operation_files",
             "owned_identity"
         )?);
+        Ok(())
+    }
+
+    #[test]
+    fn recognizes_untracked_v4_schema() -> Result<()> {
+        let mut connection = Connection::open_in_memory()?;
+        for migration in MIGRATIONS {
+            connection.execute_batch(migration.sql)?;
+        }
+
+        let report = run_migrations(&mut connection, None)?;
+
+        assert_eq!(report.from_version, 4);
+        assert_eq!(report.to_version, LATEST_VERSION);
+        assert_eq!(current_version(&connection)?, LATEST_VERSION);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_a_partial_untracked_core_metadata_migration() -> Result<()> {
+        let mut connection = Connection::open_in_memory()?;
+        connection.execute_batch(include_str!("migrations/001_initial.sql"))?;
+        connection.execute_batch(include_str!("migrations/002_safety.sql"))?;
+        connection.execute_batch(include_str!("migrations/003_source_identity.sql"))?;
+        connection.execute(
+            "ALTER TABLE items ADD COLUMN singleton INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+
+        assert!(run_migrations(&mut connection, None).is_err());
+        assert!(!table_exists(&connection, "entity_metadata")?);
+        assert!(!table_exists(&connection, "_migrations")?);
         Ok(())
     }
 

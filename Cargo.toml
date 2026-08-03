@@ -1,6 +1,6 @@
 [package]
 name = "rsbts"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.89"
 description = "A safe music library manager with provider-neutral metadata matching"
@@ -21,9 +21,11 @@ indicatif = "0.18"
 lofty = "0.24"
 pathfinding = "4"
 reqwest = "0.12"
-rusqlite = { version = "0.32", features = ["backup", "bundled"] }
+rusqlite = { version = "0.32", features = ["backup", "bundled", "functions"] }
+regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 strsim = "0.11"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

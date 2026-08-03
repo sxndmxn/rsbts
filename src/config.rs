@@ -16,6 +16,8 @@ pub struct Config {
     pub import: ImportConfig,
     pub matching: MatchingConfig,
     pub musicbrainz: MusicBrainzConfig,
+    pub providers: ProvidersConfig,
+    pub discogs: DiscogsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +57,21 @@ pub struct MusicBrainzConfig {
     pub max_retries: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProvidersConfig {
+    pub enabled: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DiscogsConfig {
+    pub search_limit: u32,
+    pub user_agent: String,
+    pub rate_limit_seconds: f64,
+    pub max_retries: u32,
+}
+
 impl Default for Config {
     fn default() -> Self {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
@@ -81,6 +98,18 @@ impl Default for Config {
                 search_limit: 5,
                 user_agent: format!(
                     "rsbts/{} (https://github.com/sxndmxn/rsbts)",
+                    env!("CARGO_PKG_VERSION")
+                ),
+                rate_limit_seconds: 1.0,
+                max_retries: 3,
+            },
+            providers: ProvidersConfig {
+                enabled: vec!["musicbrainz".into()],
+            },
+            discogs: DiscogsConfig {
+                search_limit: 5,
+                user_agent: format!(
+                    "rsbts/{} +https://github.com/sxndmxn/rsbts",
                     env!("CARGO_PKG_VERSION")
                 ),
                 rate_limit_seconds: 1.0,
@@ -182,6 +211,42 @@ impl From<&Config> for MusicBrainzConfig {
     }
 }
 
+impl Default for ProvidersConfig {
+    fn default() -> Self {
+        Self::from(&Config::default())
+    }
+}
+
+impl From<&Config> for ProvidersConfig {
+    fn from(config: &Config) -> Self {
+        config.providers.clone()
+    }
+}
+
+impl Default for DiscogsConfig {
+    fn default() -> Self {
+        Self::from(&Config::default())
+    }
+}
+
+impl From<&Config> for DiscogsConfig {
+    fn from(config: &Config) -> Self {
+        config.discogs.clone()
+    }
+}
+
+impl DiscogsConfig {
+    pub fn validate(&self) -> Result<()> {
+        validate_http_provider(
+            "discogs",
+            self.search_limit,
+            &self.user_agent,
+            self.rate_limit_seconds,
+            self.max_retries,
+        )
+    }
+}
+
 impl Config {
     /// Load configuration without creating directories or opening the database.
     pub fn load(path: Option<&Path>) -> Result<Self> {
@@ -233,8 +298,67 @@ impl Config {
                 "matching.runner_up_margin must be between 0 and 1".into(),
             ));
         }
-        self.musicbrainz.validate()
+        self.musicbrainz.validate()?;
+        self.discogs.validate()?;
+        if self.providers.enabled.is_empty() {
+            return Err(Error::Config(
+                "providers.enabled must contain at least one provider".into(),
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for provider in &self.providers.enabled {
+            if !matches!(provider.as_str(), "musicbrainz" | "discogs") {
+                return Err(Error::Config(format!(
+                    "unknown built-in provider: {provider}"
+                )));
+            }
+            if !seen.insert(provider) {
+                return Err(Error::Config(format!(
+                    "provider is enabled more than once: {provider}"
+                )));
+            }
+        }
+        if self
+            .providers
+            .enabled
+            .iter()
+            .any(|value| value == "discogs")
+            && std::env::var("RSBTS_DISCOGS_TOKEN").is_err()
+        {
+            return Err(Error::Config(
+                "Discogs is enabled but RSBTS_DISCOGS_TOKEN is not set".into(),
+            ));
+        }
+        Ok(())
     }
+}
+
+fn validate_http_provider(
+    name: &str,
+    search_limit: u32,
+    user_agent: &str,
+    rate_limit_seconds: f64,
+    max_retries: u32,
+) -> Result<()> {
+    if search_limit == 0 || search_limit > 100 {
+        return Err(Error::Config(format!(
+            "{name}.search_limit must be between 1 and 100"
+        )));
+    }
+    if user_agent.trim().is_empty() {
+        return Err(Error::Config(format!("{name}.user_agent cannot be empty")));
+    }
+    if !rate_limit_seconds.is_finite() || rate_limit_seconds < 1.0 {
+        return Err(Error::Config(format!(
+            "{name}.rate_limit_seconds must be finite and at least 1.0"
+        )));
+    }
+    if max_retries > 10 {
+        return Err(Error::Config(format!(
+            "{name}.max_retries cannot be greater than 10"
+        )));
+    }
+    Ok(())
 }
 
 fn current_dir() -> Result<PathBuf> {

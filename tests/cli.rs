@@ -123,6 +123,94 @@ fn invalid_commands_fail_before_opening_the_database() -> Result<(), Box<dyn std
 }
 
 #[test]
+fn beets_migration_dry_run_is_read_only_and_execution_creates_a_new_catalog(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = tempfile::tempdir()?;
+    let config_path = temporary.path().join("config.toml");
+    let default_database = temporary.path().join("unused-default.db");
+    let organized = temporary.path().join("organized");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[library]\ndirectory = '{}'\ndatabase = '{}'\n",
+            organized.display(),
+            default_database.display()
+        ),
+    )?;
+    let source = temporary.path().join("beets.db");
+    let missing_track = temporary.path().join("missing.wav");
+    let connection = Connection::open(&source)?;
+    connection.execute_batch(
+        "CREATE TABLE albums (id INTEGER PRIMARY KEY, album TEXT, albumartist TEXT);
+         CREATE TABLE items (
+            id INTEGER PRIMARY KEY, album_id INTEGER, path TEXT, title TEXT,
+            artist TEXT, album TEXT, format TEXT, length REAL, added REAL, mtime REAL
+         );",
+    )?;
+    connection.execute(
+        "INSERT INTO items
+         (id, album_id, path, title, artist, album, format, length, added, mtime)
+         VALUES (1, NULL, ?1, 'Migrated Single', 'Artist', '', 'WAV', 1.0, 1.0, 1.0)",
+        [missing_track.to_string_lossy().as_ref()],
+    )?;
+    drop(connection);
+    let source_before = std::fs::read(&source)?;
+    let output_database = temporary.path().join("migrated.db");
+    let output_config = temporary.path().join("migrated.toml");
+    let source_arg = source.to_string_lossy();
+    let database_arg = output_database.to_string_lossy();
+    let config_arg = output_config.to_string_lossy();
+
+    let output = run(
+        &config_path,
+        &[
+            "migrate",
+            "beets",
+            "--beets-library",
+            source_arg.as_ref(),
+            "--output-database",
+            database_arg.as_ref(),
+            "--output-config",
+            config_arg.as_ref(),
+            "--dry-run",
+        ],
+    )?;
+    assert_success(&output);
+    assert!(!output_database.exists());
+    assert!(!output_config.exists());
+    assert!(!default_database.exists());
+    assert_eq!(std::fs::read(&source)?, source_before);
+
+    let output = run(
+        &config_path,
+        &[
+            "migrate",
+            "beets",
+            "--beets-library",
+            source_arg.as_ref(),
+            "--output-database",
+            database_arg.as_ref(),
+            "--output-config",
+            config_arg.as_ref(),
+            "--yes",
+        ],
+    )?;
+    assert_success(&output);
+    assert!(output_config.exists());
+    assert_eq!(std::fs::read(&source)?, source_before);
+    let migrated = Connection::open(&output_database)?;
+    let (count, singleton, album_id): (u64, bool, Option<i64>) = migrated.query_row(
+        "SELECT COUNT(*), singleton, album_id FROM items",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    assert_eq!(count, 1);
+    assert!(singleton);
+    assert!(album_id.is_none());
+    Ok(())
+}
+
+#[test]
 fn disposable_cli_workflow_is_atomic_and_confirmation_safe(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let temporary = tempfile::tempdir()?;

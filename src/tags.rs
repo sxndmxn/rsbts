@@ -115,6 +115,8 @@ pub fn read_tags(path: &Path) -> Result<Item> {
         release_external_id: None,
         added: Utc::now(),
         mtime,
+        singleton: false,
+        extended: crate::ExtendedMetadata::default(),
     })
 }
 

@@ -10,12 +10,14 @@ use rsbts::import::{
     Action, AlbumPlan, ApprovalChoice, ApprovedAlbumPlan, ImportExecutor, ImportOptions,
     ImportPlanner,
 };
-use rsbts::musicbrainz::MusicBrainzProvider;
+use rsbts::move_files::{MoveExecutor, MovePlan};
+use rsbts::providers::ProviderSet;
 use rsbts::query::Query;
 use rsbts::remove::{RemovalExecutor, RemovalPlan};
+use rsbts::write::{TagWriteExecutor, TagWritePlan};
 use rsbts::{Error, Result};
 
-use crate::Commands;
+use crate::{Commands, MigrateSource};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -34,11 +36,29 @@ pub async fn run(command: Commands, config_path: Option<PathBuf>) -> Result<Outc
         Commands::Remove { dry_run, yes, .. } => {
             require_confirmation_channel(*dry_run, *yes, "remove")?;
         }
+        Commands::Write { dry_run, yes, .. } => {
+            require_confirmation_channel(*dry_run, *yes, "write")?;
+        }
+        Commands::Move { dry_run, yes, .. } => {
+            require_confirmation_channel(*dry_run, *yes, "move")?;
+        }
+        Commands::Migrate {
+            source: MigrateSource::Beets { dry_run, yes, .. },
+        } => {
+            require_confirmation_channel(*dry_run, *yes, "migration")?;
+        }
         _ => {}
     }
+    let command = match command {
+        Commands::Migrate { source } => return migrate(source, &config),
+        command => command,
+    };
     let dry_run = matches!(
         &command,
-        Commands::Import { dry_run: true, .. } | Commands::Remove { dry_run: true, .. }
+        Commands::Import { dry_run: true, .. }
+            | Commands::Remove { dry_run: true, .. }
+            | Commands::Write { dry_run: true, .. }
+            | Commands::Move { dry_run: true, .. }
     );
     let mut library = if dry_run {
         Library::open_snapshot(&config.library.database)?
@@ -55,6 +75,7 @@ pub async fn run(command: Commands, config_path: Option<PathBuf>) -> Result<Outc
             copy,
             r#move,
             link,
+            in_place,
             dry_run,
             yes,
         } => {
@@ -64,6 +85,8 @@ pub async fn run(command: Commands, config_path: Option<PathBuf>) -> Result<Outc
                 Action::Move
             } else if link {
                 Action::Link
+            } else if in_place {
+                Action::InPlace
             } else {
                 config.import.action
             };
@@ -73,6 +96,18 @@ pub async fn run(command: Commands, config_path: Option<PathBuf>) -> Result<Outc
         Commands::Stats => stats(&library),
         Commands::Audit => audit(&library),
         Commands::Update { query } => update(&library, query.as_deref()),
+        Commands::Write {
+            query,
+            all,
+            dry_run,
+            yes,
+        } => write_tags(&mut library, query.as_deref(), all, dry_run, yes),
+        Commands::Move {
+            query,
+            all,
+            dry_run,
+            yes,
+        } => move_files(&mut library, &config, query.as_deref(), all, dry_run, yes),
         Commands::Remove {
             query,
             delete,
@@ -80,6 +115,9 @@ pub async fn run(command: Commands, config_path: Option<PathBuf>) -> Result<Outc
             yes,
         } => remove(&mut library, &query, delete, dry_run, yes),
         Commands::Modify { query, fields } => modify(&library, &query, &fields),
+        Commands::Migrate { .. } => Err(Error::Config(
+            "migration command was not dispatched during preflight".into(),
+        )),
     }
 }
 
@@ -101,10 +139,26 @@ fn preflight(command: &Commands) -> Result<()> {
             Query::parse(query)?;
             validate_modification_fields(fields)?;
         }
+        Commands::Write { query, all, .. } | Commands::Move { query, all, .. } => {
+            if *all {
+                if query.is_some() {
+                    return Err(Error::Query(
+                        "operation accepts either --all or a query, not both".into(),
+                    ));
+                }
+            } else {
+                let query = query.as_deref().ok_or_else(|| {
+                    Error::Query("operation requires --all or an explicit query".into())
+                })?;
+                require_selection(query, "operation")?;
+                Query::parse(query)?;
+            }
+        }
         Commands::Import { .. }
         | Commands::List { album: true, .. }
         | Commands::Stats
-        | Commands::Audit => {}
+        | Commands::Audit
+        | Commands::Migrate { .. } => {}
     }
     Ok(())
 }
@@ -145,20 +199,33 @@ async fn import(
     dry_run: bool,
     yes: bool,
 ) -> Result<Outcome> {
+    let search_limit = config
+        .providers
+        .enabled
+        .iter()
+        .map(|provider| match provider.as_str() {
+            "discogs" => config.discogs.search_limit,
+            _ => config.musicbrainz.search_limit,
+        })
+        .max()
+        .unwrap_or(config.musicbrainz.search_limit);
     let options = ImportOptions {
         action,
         fetch_art: config.import.fetch_art,
         follow_symlinks: config.import.follow_symlinks,
         path_format: config.paths.format.clone(),
         library_dir: config.library.directory.clone(),
-        search_limit: config.musicbrainz.search_limit,
+        search_limit,
         auto_accept_threshold: config.matching.auto_accept_threshold,
         runner_up_margin: config.matching.runner_up_margin,
     };
-    let provider = MusicBrainzProvider::new(&config.musicbrainz)?;
+    let provider = ProviderSet::from_config(config)?;
     let plan = ImportPlanner::new(library, &provider, options.clone())
         .plan(paths)
         .await;
+    for warning in &plan.provider_warnings {
+        eprintln!("Provider warning: {}", terminal_safe(warning));
+    }
     let mut partial = !plan.scan_issues.is_empty();
     for issue in &plan.scan_issues {
         eprintln!(
@@ -444,6 +511,258 @@ fn update(library: &Library, query: Option<&str>) -> Result<Outcome> {
     let updated_count = library.update_items(&tag_updates)?;
     println!("Updated {updated_count} item(s); {failed} failed");
     Ok(if failed == 0 {
+        Outcome::Success
+    } else {
+        Outcome::Partial
+    })
+}
+
+fn write_tags(
+    library: &mut Library,
+    raw_query: Option<&str>,
+    all: bool,
+    dry_run: bool,
+    yes: bool,
+) -> Result<Outcome> {
+    let query = if all {
+        Query::all()
+    } else {
+        let raw_query = raw_query
+            .ok_or_else(|| Error::Query("write requires --all or an explicit query".into()))?;
+        require_selection(raw_query, "write")?;
+        Query::parse(raw_query)?
+    };
+    let plan = TagWritePlan::build(library, &query)?;
+    println!("Tag-write plan: {} file(s)", plan.files.len());
+    for file in &plan.files {
+        println!("  {}", terminal_safe(file.item.path.display()));
+    }
+    if dry_run || plan.files.is_empty() {
+        println!("No changes made");
+        return Ok(Outcome::Success);
+    }
+    if !yes {
+        let confirmed = Confirm::new()
+            .with_prompt("Write database metadata to every listed file?")
+            .default(false)
+            .interact()
+            .map_err(|error| Error::Import(format!("cannot read confirmation: {error}")))?;
+        if !confirmed {
+            println!("Cancelled; no changes made");
+            return Ok(Outcome::Partial);
+        }
+    }
+    let report = TagWriteExecutor::new(library).execute(plan);
+    println!(
+        "Wrote {} file(s); {} failed",
+        report.written,
+        report.failures.len()
+    );
+    for failure in &report.failures {
+        eprintln!(
+            "Could not write {}: {}",
+            terminal_safe(failure.path.display()),
+            terminal_safe(&failure.error)
+        );
+    }
+    Ok(if report.failures.is_empty() {
+        Outcome::Success
+    } else {
+        Outcome::Partial
+    })
+}
+
+fn move_files(
+    library: &mut Library,
+    config: &Config,
+    raw_query: Option<&str>,
+    all: bool,
+    dry_run: bool,
+    yes: bool,
+) -> Result<Outcome> {
+    let query = if all {
+        Query::all()
+    } else {
+        let raw_query = raw_query
+            .ok_or_else(|| Error::Query("move requires --all or an explicit query".into()))?;
+        require_selection(raw_query, "move")?;
+        Query::parse(raw_query)?
+    };
+    let plan = MovePlan::build(
+        library,
+        &query,
+        &config.library.directory,
+        &config.paths.format,
+    )?;
+    println!("Move plan: {} file(s)", plan.tracks.len());
+    for track in &plan.tracks {
+        println!(
+            "  {} -> {}",
+            terminal_safe(track.source.display()),
+            terminal_safe(track.destination.display())
+        );
+    }
+    if dry_run || plan.tracks.is_empty() {
+        println!("No changes made");
+        return Ok(Outcome::Success);
+    }
+    if !yes {
+        let confirmed = Confirm::new()
+            .with_prompt("Move every listed file?")
+            .default(false)
+            .interact()
+            .map_err(|error| Error::Import(format!("cannot read confirmation: {error}")))?;
+        if !confirmed {
+            println!("Cancelled; no changes made");
+            return Ok(Outcome::Partial);
+        }
+    }
+    let report = MoveExecutor::new(library, config.library.directory.clone()).execute(plan);
+    println!(
+        "Moved {} file(s); {} failed",
+        report.moved,
+        report.failures.len()
+    );
+    for failure in &report.failures {
+        eprintln!(
+            "Could not move {}: {}",
+            terminal_safe(failure.source.display()),
+            terminal_safe(&failure.error)
+        );
+    }
+    Ok(if report.failures.is_empty() {
+        Outcome::Success
+    } else {
+        Outcome::Partial
+    })
+}
+
+fn migrate(source: MigrateSource, config: &Config) -> Result<Outcome> {
+    match source {
+        MigrateSource::Beets {
+            beets_library,
+            beets_config,
+            music_directory,
+            output_database,
+            output_config,
+            dry_run,
+            yes,
+        } => migrate_beets(
+            config,
+            &beets_library,
+            beets_config.as_deref(),
+            music_directory.as_deref(),
+            output_database.as_deref(),
+            output_config.as_deref(),
+            dry_run,
+            yes,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn migrate_beets(
+    config: &Config,
+    beets_library: &std::path::Path,
+    beets_config: Option<&std::path::Path>,
+    music_directory: Option<&std::path::Path>,
+    output_database: Option<&std::path::Path>,
+    output_config: Option<&std::path::Path>,
+    dry_run: bool,
+    yes: bool,
+) -> Result<Outcome> {
+    let output_database = output_database.map_or_else(
+        || config.library.database.clone(),
+        std::path::Path::to_path_buf,
+    );
+    if output_database.exists() || output_database.is_symlink() {
+        return Err(Error::Config(format!(
+            "migration output database already exists: {}",
+            output_database.display()
+        )));
+    }
+    if output_config.is_some_and(|path| path.exists() || path.is_symlink()) {
+        return Err(Error::Config(
+            "migration output config already exists".into(),
+        ));
+    }
+    let migration = rsbts::beets::BeetsMigration::read(
+        beets_library,
+        beets_config,
+        music_directory,
+        output_database.clone(),
+    )?;
+    migration.validate_in_memory()?;
+    println!(
+        "Beets migration plan: {} album(s), {} album track(s), {} singleton(s), {} external ID(s), {} flexible field(s), {} missing file(s)",
+        migration.report.albums,
+        migration.report.album_tracks,
+        migration.report.singletons,
+        migration.report.external_ids,
+        migration.report.flexible_fields,
+        migration.report.missing_files,
+    );
+    for warning in &migration.report.warnings {
+        eprintln!("Migration warning: {}", terminal_safe(warning));
+    }
+    if dry_run {
+        println!("Dry run: no output files created");
+        return Ok(if migration.report.warnings.is_empty() {
+            Outcome::Success
+        } else {
+            Outcome::Partial
+        });
+    }
+    if !yes {
+        let confirmed = Confirm::new()
+            .with_prompt("Create the new rsbts database from this Beets library?")
+            .default(false)
+            .interact()
+            .map_err(|error| Error::Import(format!("cannot read confirmation: {error}")))?;
+        if !confirmed {
+            println!("Cancelled; no output files created");
+            return Ok(Outcome::Partial);
+        }
+    }
+    let parent = output_database
+        .parent()
+        .ok_or_else(|| Error::Config("migration output database has no parent directory".into()))?;
+    std::fs::create_dir_all(parent)?;
+    let name = output_database
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| Error::Config("migration database filename is not valid UTF-8".into()))?;
+    let temporary = parent.join(format!(
+        ".{name}.rsbts-migrate-{}.tmp",
+        uuid::Uuid::new_v4()
+    ));
+    let import_result = (|| {
+        let mut library = Library::open(&temporary)?;
+        library.import_migrated_groups(&migration.groups)?;
+        let expected = migration.report.album_tracks + migration.report.singletons;
+        if library.stats()?.tracks as usize != expected {
+            return Err(Error::Recovery(
+                "migrated track count changed before finalization".into(),
+            ));
+        }
+        drop(library);
+        std::fs::hard_link(&temporary, &output_database)?;
+        rsbts::db::sync_directory(parent)?;
+        std::fs::remove_file(&temporary)?;
+        if let Some(output_config) = output_config {
+            rsbts::beets::write_config_create_new(&migration.translated_config, output_config)?;
+        }
+        Ok(())
+    })();
+    if import_result.is_err() && temporary.exists() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    import_result?;
+    println!(
+        "Created migrated rsbts database: {}",
+        terminal_safe(output_database.display())
+    );
+    Ok(if migration.report.warnings.is_empty() {
         Outcome::Success
     } else {
         Outcome::Partial
