@@ -49,6 +49,7 @@ pub enum Action {
     Copy,
     Move,
     Link,
+    #[serde(rename = "in_place", alias = "inplace")]
     InPlace,
 }
 

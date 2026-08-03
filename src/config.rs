@@ -433,6 +433,14 @@ mod tests {
     }
 
     #[test]
+    fn accepts_documented_in_place_action_spelling() -> Result<()> {
+        let config: Config = toml::from_str("[import]\naction = 'in_place'\n")
+            .map_err(|error| Error::Config(error.to_string()))?;
+        assert_eq!(config.import.action, Action::InPlace);
+        Ok(())
+    }
+
+    #[test]
     fn explicit_missing_config_fails_closed() -> Result<()> {
         let temporary = tempfile::tempdir()?;
         let missing = temporary.path().join("missing.toml");
