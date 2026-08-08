@@ -1,5 +1,6 @@
+use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use rusqlite::Connection;
 
@@ -123,6 +124,94 @@ fn invalid_commands_fail_before_opening_the_database() -> Result<(), Box<dyn std
 }
 
 #[test]
+fn beets_migration_dry_run_is_read_only_and_execution_creates_a_new_catalog(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = tempfile::tempdir()?;
+    let config_path = temporary.path().join("config.toml");
+    let default_database = temporary.path().join("unused-default.db");
+    let organized = temporary.path().join("organized");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[library]\ndirectory = '{}'\ndatabase = '{}'\n",
+            organized.display(),
+            default_database.display()
+        ),
+    )?;
+    let source = temporary.path().join("beets.db");
+    let missing_track = temporary.path().join("missing.wav");
+    let connection = Connection::open(&source)?;
+    connection.execute_batch(
+        "CREATE TABLE albums (id INTEGER PRIMARY KEY, album TEXT, albumartist TEXT);
+         CREATE TABLE items (
+            id INTEGER PRIMARY KEY, album_id INTEGER, path TEXT, title TEXT,
+            artist TEXT, album TEXT, format TEXT, length REAL, added REAL, mtime REAL
+         );",
+    )?;
+    connection.execute(
+        "INSERT INTO items
+         (id, album_id, path, title, artist, album, format, length, added, mtime)
+         VALUES (1, NULL, ?1, 'Migrated Single', 'Artist', '', 'WAV', 1.0, 1.0, 1.0)",
+        [missing_track.to_string_lossy().as_ref()],
+    )?;
+    drop(connection);
+    let source_before = std::fs::read(&source)?;
+    let output_database = temporary.path().join("migrated.db");
+    let output_config = temporary.path().join("migrated.toml");
+    let source_arg = source.to_string_lossy();
+    let database_arg = output_database.to_string_lossy();
+    let config_arg = output_config.to_string_lossy();
+
+    let output = run(
+        &config_path,
+        &[
+            "migrate",
+            "beets",
+            "--beets-library",
+            source_arg.as_ref(),
+            "--output-database",
+            database_arg.as_ref(),
+            "--output-config",
+            config_arg.as_ref(),
+            "--dry-run",
+        ],
+    )?;
+    assert_success(&output);
+    assert!(!output_database.exists());
+    assert!(!output_config.exists());
+    assert!(!default_database.exists());
+    assert_eq!(std::fs::read(&source)?, source_before);
+
+    let output = run(
+        &config_path,
+        &[
+            "migrate",
+            "beets",
+            "--beets-library",
+            source_arg.as_ref(),
+            "--output-database",
+            database_arg.as_ref(),
+            "--output-config",
+            config_arg.as_ref(),
+            "--yes",
+        ],
+    )?;
+    assert_success(&output);
+    assert!(output_config.exists());
+    assert_eq!(std::fs::read(&source)?, source_before);
+    let migrated = Connection::open(&output_database)?;
+    let (count, singleton, album_id): (u64, bool, Option<i64>) = migrated.query_row(
+        "SELECT COUNT(*), singleton, album_id FROM items",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    assert_eq!(count, 1);
+    assert!(singleton);
+    assert!(album_id.is_none());
+    Ok(())
+}
+
+#[test]
 fn disposable_cli_workflow_is_atomic_and_confirmation_safe(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let temporary = tempfile::tempdir()?;
@@ -230,5 +319,63 @@ fn disposable_cli_workflow_is_atomic_and_confirmation_safe(
     let connection = Connection::open(&database_path)?;
     let count: u64 = connection.query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))?;
     assert_eq!(count, 0);
+    Ok(())
+}
+
+#[test]
+fn a_closed_stdout_pipe_is_successful_and_never_panics() -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = tempfile::tempdir()?;
+    let config_path = temporary.path().join("config.toml");
+    let database_path = temporary.path().join("library.db");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[library]\ndirectory = 'organized'\ndatabase = '{}'\n",
+            database_path.display()
+        ),
+    )?;
+    assert_success(&run(&config_path, &["stats"])?);
+
+    let connection = Connection::open(&database_path)?;
+    connection.execute_batch(
+        "WITH RECURSIVE records(id) AS (
+             SELECT 1 UNION ALL SELECT id + 1 FROM records WHERE id < 4096
+         )
+         INSERT INTO items
+             (path, title, artist, album, format, bitrate, length, added, mtime)
+         SELECT printf('/missing/%d.flac', id), printf('Track %d', id),
+                'Pipe Artist', 'Pipe Album', 'FLAC', 1, 1.0,
+                '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z'
+         FROM records;",
+    )?;
+    drop(connection);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rsbts"))
+        .arg("--config")
+        .arg(&config_path)
+        .arg("ls")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("child process did not expose its piped stdout"))?;
+    let mut reader = BufReader::new(stdout);
+    let mut first_line = String::new();
+    assert!(reader.read_line(&mut first_line)? > 0);
+    drop(reader);
+
+    let output = child.wait_with_output()?;
+    assert_eq!(output.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("panicked"),
+        "unexpected panic output: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Broken pipe"),
+        "unexpected pipe diagnostic: {stderr}"
+    );
     Ok(())
 }

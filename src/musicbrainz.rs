@@ -10,12 +10,16 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 
 use crate::config::MusicBrainzConfig;
-use crate::provider::{MetadataProvider, ProviderTrack, ReleaseCandidate, ReleaseQuery};
+use crate::provider::{
+    MetadataProvider, ProviderTrack, ReleaseCandidate, ReleaseQuery, TrackCandidate, TrackQuery,
+};
 use crate::{Error, Result};
 
 const API_BASE: &str = "https://musicbrainz.org/ws/2";
 const MAX_METADATA_BYTES: usize = 8 * 1024 * 1024;
 const MAX_COVER_ART_BYTES: usize = 20 * 1024 * 1024;
+const MAX_METADATA_BYTES_U64: u64 = 8 * 1024 * 1024;
+const MAX_COVER_ART_BYTES_U64: u64 = 20 * 1024 * 1024;
 const MAX_RETRY_AFTER_SECONDS: u64 = 60;
 
 pub struct MusicBrainzProvider {
@@ -28,6 +32,29 @@ pub struct MusicBrainzProvider {
 #[derive(Debug, Clone, Deserialize)]
 struct ReleaseSearchResult {
     releases: Vec<Release>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RecordingSearchResult {
+    recordings: Vec<RecordingSearchEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RecordingSearchEntry {
+    id: String,
+    title: String,
+    length: Option<u64>,
+    #[serde(rename = "artist-credit", default)]
+    artist_credit: Vec<ArtistCredit>,
+    #[serde(default)]
+    releases: Vec<RecordingRelease>,
+    #[serde(default)]
+    score: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RecordingRelease {
+    id: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -130,7 +157,11 @@ impl MusicBrainzProvider {
         }
     }
 
-    async fn lookup_release(&self, release_id: &str, score: u32) -> Result<ReleaseCandidate> {
+    async fn lookup_release_scored(
+        &self,
+        release_id: &str,
+        score: u32,
+    ) -> Result<ReleaseCandidate> {
         let release_id = urlencoding::encode(release_id);
         let url = format!("{API_BASE}/release/{release_id}?inc=recordings+artist-credits&fmt=json");
         let response = self.get_with_retry(&url).await?;
@@ -168,7 +199,7 @@ impl MetadataProvider for MusicBrainzProvider {
         let mut candidates = Vec::with_capacity(result.releases.len());
         let mut first_error = None;
         for release in result.releases {
-            match self.lookup_release(&release.id, release.score).await {
+            match self.lookup_release_scored(&release.id, release.score).await {
                 Ok(candidate) => candidates.push(candidate),
                 Err(error) if first_error.is_none() => first_error = Some(error),
                 Err(_) => {}
@@ -182,6 +213,40 @@ impl MetadataProvider for MusicBrainzProvider {
         Ok(candidates)
     }
 
+    async fn search_tracks(&self, query: &TrackQuery, limit: u32) -> Result<Vec<TrackCandidate>> {
+        let expression = format!(
+            "artist:\"{}\" AND recording:\"{}\"",
+            escape_lucene_phrase(&query.artist),
+            escape_lucene_phrase(&query.title)
+        );
+        let url = format!(
+            "{API_BASE}/recording?query={}&limit={limit}&fmt=json",
+            urlencoding::encode(&expression)
+        );
+        let response = self.get_with_retry(&url).await?;
+        ensure_success(&response, "recording search")?;
+        let result: RecordingSearchResult =
+            decode_json_limited(response, "recording search").await?;
+        Ok(result
+            .recordings
+            .into_iter()
+            .map(recording_candidate)
+            .collect())
+    }
+
+    async fn lookup_release(&self, release_id: &str) -> Result<ReleaseCandidate> {
+        self.lookup_release_scored(release_id, 100).await
+    }
+
+    async fn lookup_track(&self, track_id: &str) -> Result<TrackCandidate> {
+        let track_id = urlencoding::encode(track_id);
+        let url = format!("{API_BASE}/recording/{track_id}?inc=artist-credits+releases&fmt=json");
+        let response = self.get_with_retry(&url).await?;
+        ensure_success(&response, "recording lookup")?;
+        let entry: RecordingSearchEntry = decode_json_limited(response, "recording lookup").await?;
+        Ok(recording_candidate(entry))
+    }
+
     async fn fetch_cover_art(&self, release_id: &str) -> Result<Option<Vec<u8>>> {
         let release_id = urlencoding::encode(release_id);
         let url = format!("https://coverartarchive.org/release/{release_id}/front");
@@ -192,7 +257,7 @@ impl MetadataProvider for MusicBrainzProvider {
         ensure_success(&response, "cover-art lookup")?;
         if response
             .content_length()
-            .is_some_and(|length| length > MAX_COVER_ART_BYTES as u64)
+            .is_some_and(|length| length > MAX_COVER_ART_BYTES_U64)
         {
             return Err(Error::Provider(format!(
                 "cover art exceeds the {MAX_COVER_ART_BYTES}-byte limit"
@@ -207,6 +272,18 @@ impl MetadataProvider for MusicBrainzProvider {
             append_limited(&mut bytes, &chunk, MAX_COVER_ART_BYTES, "cover art")?;
         }
         Ok(Some(bytes))
+    }
+}
+
+fn recording_candidate(entry: RecordingSearchEntry) -> TrackCandidate {
+    TrackCandidate {
+        provider: "musicbrainz".into(),
+        external_id: entry.id,
+        title: entry.title,
+        artist: format_artist_credit(&entry.artist_credit),
+        length_ms: entry.length,
+        provider_score: f64::from(entry.score.min(100)) / 100.0,
+        release_external_id: entry.releases.first().map(|release| release.id.clone()),
     }
 }
 
@@ -294,7 +371,7 @@ async fn decode_json_limited<T: DeserializeOwned>(
 ) -> Result<T> {
     if response
         .content_length()
-        .is_some_and(|length| length > MAX_METADATA_BYTES as u64)
+        .is_some_and(|length| length > MAX_METADATA_BYTES_U64)
     {
         return Err(Error::Provider(format!(
             "{operation} response exceeds the {MAX_METADATA_BYTES}-byte limit"

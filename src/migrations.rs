@@ -7,7 +7,7 @@ use rusqlite::{Connection, DatabaseName, TransactionBehavior};
 
 use crate::{Error, Result};
 
-const LATEST_VERSION: u32 = 3;
+const LATEST_VERSION: u32 = 4;
 
 pub struct Migration {
     pub version: u32,
@@ -27,6 +27,10 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 3,
         sql: include_str!("migrations/003_source_identity.sql"),
     },
+    Migration {
+        version: 4,
+        sql: include_str!("migrations/004_core_metadata.sql"),
+    },
 ];
 
 #[derive(Debug, Clone, Default)]
@@ -40,8 +44,6 @@ pub fn run_migrations(
     conn: &mut Connection,
     database_path: Option<&Path>,
 ) -> Result<MigrationReport> {
-    verify_integrity(conn, "before migration")?;
-    verify_foreign_keys(conn)?;
     let had_schema = table_exists(conn, "items")?;
     let had_tracking = table_exists(conn, "_migrations")?;
     let recorded_version = if had_tracking {
@@ -71,6 +73,23 @@ pub fn run_migrations(
         verify_schema_version(conn, current)?;
     }
     let from_version = current;
+
+    // A current, tracked schema needs no writes and no deep scan. Full integrity and
+    // foreign-key checks are intentionally owned by explicit audit and real migrations.
+    if had_tracking && current == LATEST_VERSION {
+        return Ok(MigrationReport {
+            from_version,
+            to_version: current,
+            backup_path: None,
+        });
+    }
+
+    // Validate existing data before changing either its schema or migration bookkeeping.
+    // A brand-new empty database has nothing meaningful to scan before schema creation.
+    if had_schema {
+        verify_integrity(conn, "before migration")?;
+        verify_foreign_keys(conn)?;
+    }
 
     // The backup precedes even migration bookkeeping, so it is an exact legacy snapshot.
     let backup_path = if current > 0 && current < LATEST_VERSION {
@@ -122,6 +141,23 @@ fn detect_untracked_version(conn: &Connection) -> Result<u32> {
         has_journal && column_exists(conn, "operation_files", "source_identity")?;
     let has_owned_identity =
         has_journal && column_exists(conn, "operation_files", "owned_identity")?;
+    let has_singleton = column_exists(conn, "items", "singleton")?;
+    let has_entity_metadata = table_exists(conn, "entity_metadata")?;
+    let has_external_ids = table_exists(conn, "external_ids")?;
+    let v4_markers = [has_singleton, has_entity_metadata, has_external_ids];
+    if v4_markers.into_iter().any(|present| present) {
+        if v4_markers.into_iter().all(|present| present)
+            && has_journal
+            && has_source_identity
+            && has_owned_identity
+        {
+            return Ok(4);
+        }
+        return Err(Error::Recovery(
+            "database has a partial untracked core-metadata schema; refusing to guess a migration"
+                .into(),
+        ));
+    }
     if has_journal {
         if has_source_identity && has_owned_identity {
             Ok(3)
@@ -200,7 +236,11 @@ fn verify_schema_version(conn: &Connection, version: u32) -> Result<()> {
     let v3 = version < 3
         || (column_exists(conn, "operation_files", "source_identity")?
             && column_exists(conn, "operation_files", "owned_identity")?);
-    if v1 && v2 && v3 {
+    let v4 = version < 4
+        || (column_exists(conn, "items", "singleton")?
+            && table_exists(conn, "entity_metadata")?
+            && table_exists(conn, "external_ids")?);
+    if v1 && v2 && v3 && v4 {
         Ok(())
     } else {
         Err(Error::Recovery(format!(
@@ -274,22 +314,38 @@ fn create_verified_backup(conn: &Connection, database_path: &Path) -> Result<Pat
     Ok(backup_path)
 }
 
+pub(crate) fn integrity_issues(conn: &Connection) -> Result<Vec<String>> {
+    let mut statement = conn.prepare("PRAGMA integrity_check")?;
+    let results = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(results
+        .into_iter()
+        .filter(|result| result != "ok")
+        .collect())
+}
+
+pub(crate) fn foreign_key_violation_count(conn: &Connection) -> Result<u64> {
+    conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+        row.get(0)
+    })
+    .map_err(Into::into)
+}
+
 fn verify_integrity(conn: &Connection, context: &str) -> Result<()> {
-    let result: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
-    if result == "ok" {
+    let issues = integrity_issues(conn)?;
+    if issues.is_empty() {
         Ok(())
     } else {
         Err(Error::Recovery(format!(
-            "database integrity check failed {context}: {result}"
+            "database integrity check failed {context}: {}",
+            issues.join("; ")
         )))
     }
 }
 
 fn verify_foreign_keys(conn: &Connection) -> Result<()> {
-    let violations: u64 =
-        conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
-            row.get(0)
-        })?;
+    let violations = foreign_key_violation_count(conn)?;
     if violations == 0 {
         Ok(())
     } else {
@@ -301,7 +357,21 @@ fn verify_foreign_keys(conn: &Connection) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
+
+    thread_local! {
+        static TRACED_SQL: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    fn trace_sql(sql: &str) {
+        TRACED_SQL.with(|statements| statements.borrow_mut().push(sql.to_string()));
+    }
+
+    fn take_traced_sql() -> Vec<String> {
+        TRACED_SQL.with(|statements| std::mem::take(&mut *statements.borrow_mut()))
+    }
 
     #[test]
     fn migrations_are_idempotent() -> Result<()> {
@@ -311,6 +381,35 @@ mod tests {
         assert_eq!(first.to_version, LATEST_VERSION);
         assert_eq!(second.from_version, LATEST_VERSION);
         assert_eq!(current_version(&connection)?, LATEST_VERSION);
+        Ok(())
+    }
+
+    #[test]
+    fn current_schema_open_skips_deep_checks() -> Result<()> {
+        let mut connection = Connection::open_in_memory()?;
+        run_migrations(&mut connection, None)?;
+        connection.trace(Some(trace_sql));
+        let report = run_migrations(&mut connection, None)?;
+        connection.trace(None);
+
+        assert_eq!(report.from_version, LATEST_VERSION);
+        let traced = take_traced_sql().join("\n").to_ascii_lowercase();
+        assert!(!traced.contains("integrity_check"));
+        assert!(!traced.contains("foreign_key_check"));
+        Ok(())
+    }
+
+    #[test]
+    fn pending_migration_runs_deep_checks() -> Result<()> {
+        let mut connection = Connection::open_in_memory()?;
+        connection.execute_batch(include_str!("migrations/001_initial.sql"))?;
+        connection.trace(Some(trace_sql));
+        run_migrations(&mut connection, None)?;
+        connection.trace(None);
+
+        let traced = take_traced_sql().join("\n").to_ascii_lowercase();
+        assert!(traced.contains("integrity_check"));
+        assert!(traced.contains("foreign_key_check"));
         Ok(())
     }
 
@@ -353,6 +452,38 @@ mod tests {
             "operation_files",
             "owned_identity"
         )?);
+        Ok(())
+    }
+
+    #[test]
+    fn recognizes_untracked_v4_schema() -> Result<()> {
+        let mut connection = Connection::open_in_memory()?;
+        for migration in MIGRATIONS {
+            connection.execute_batch(migration.sql)?;
+        }
+
+        let report = run_migrations(&mut connection, None)?;
+
+        assert_eq!(report.from_version, 4);
+        assert_eq!(report.to_version, LATEST_VERSION);
+        assert_eq!(current_version(&connection)?, LATEST_VERSION);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_a_partial_untracked_core_metadata_migration() -> Result<()> {
+        let mut connection = Connection::open_in_memory()?;
+        connection.execute_batch(include_str!("migrations/001_initial.sql"))?;
+        connection.execute_batch(include_str!("migrations/002_safety.sql"))?;
+        connection.execute_batch(include_str!("migrations/003_source_identity.sql"))?;
+        connection.execute(
+            "ALTER TABLE items ADD COLUMN singleton INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+
+        assert!(run_migrations(&mut connection, None).is_err());
+        assert!(!table_exists(&connection, "entity_metadata")?);
+        assert!(!table_exists(&connection, "_migrations")?);
         Ok(())
     }
 

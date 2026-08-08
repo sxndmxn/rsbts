@@ -1,22 +1,22 @@
 //! Safe, plan-first music library management.
 
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss
-)]
-
+pub mod beets;
 pub mod config;
 pub mod db;
+pub mod discogs;
 pub mod import;
 pub mod migrations;
+pub mod move_files;
 pub mod musicbrainz;
 pub mod pathformat;
 pub mod provider;
+pub mod providers;
 pub mod query;
 pub mod remove;
 pub mod tags;
+pub mod write;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
@@ -88,7 +88,51 @@ impl AudioFormat {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalId {
     pub provider: String,
+    /// Provider-specific entity kind, for example `release`, `recording`, or `master`.
+    #[serde(default)]
+    pub kind: String,
     pub value: String,
+}
+
+/// A calendar date whose month and day may be unknown.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartialDate {
+    pub year: Option<i32>,
+    pub month: Option<u8>,
+    pub day: Option<u8>,
+}
+
+/// A typed value preserved from a migrated library or a built-in metadata provider.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum FlexibleValue {
+    String(String),
+    Integer(i64),
+    Float(f64),
+    Boolean(bool),
+    Date(PartialDate),
+    StringList(Vec<String>),
+}
+
+/// Metadata that extends the compact fields used by the common CLI path.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ExtendedMetadata {
+    pub date: PartialDate,
+    pub original_date: PartialDate,
+    pub track_total: Option<u32>,
+    pub disc_total: Option<u32>,
+    pub compilation: Option<bool>,
+    pub label: Option<String>,
+    pub catalog_number: Option<String>,
+    pub country: Option<String>,
+    pub media: Option<String>,
+    pub language: Option<String>,
+    pub artists: Vec<String>,
+    pub album_artists: Vec<String>,
+    pub genres: Vec<String>,
+    pub composers: Vec<String>,
+    pub external_ids: Vec<ExternalId>,
+    pub flexible_fields: BTreeMap<String, FlexibleValue>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +156,11 @@ pub struct Item {
     pub release_external_id: Option<ExternalId>,
     pub added: DateTime<Utc>,
     pub mtime: DateTime<Utc>,
+    /// True when the item is intentionally not associated with an album.
+    #[serde(default)]
+    pub singleton: bool,
+    #[serde(default)]
+    pub extended: ExtendedMetadata,
 }
 
 impl Item {
@@ -138,6 +187,7 @@ pub(crate) fn validate_item_metadata(item: &Item) -> Result<()> {
     }
     validate_external_id(item.track_external_id.as_ref())?;
     validate_external_id(item.release_external_id.as_ref())?;
+    validate_extended_metadata(&item.extended)?;
     if let (Some(track), Some(release)) = (
         item.track_external_id.as_ref(),
         item.release_external_id.as_ref(),
@@ -160,6 +210,8 @@ pub struct Album {
     pub artpath: Option<PathBuf>,
     pub external_id: Option<ExternalId>,
     pub added: DateTime<Utc>,
+    #[serde(default)]
+    pub extended: ExtendedMetadata,
 }
 
 pub(crate) fn validate_album_metadata(album: &Album) -> Result<()> {
@@ -168,7 +220,8 @@ pub(crate) fn validate_album_metadata(album: &Album) -> Result<()> {
             "album name and album artist cannot be empty".into(),
         ));
     }
-    validate_external_id(album.external_id.as_ref())
+    validate_external_id(album.external_id.as_ref())?;
+    validate_extended_metadata(&album.extended)
 }
 
 fn validate_external_id(external_id: Option<&ExternalId>) -> Result<()> {
@@ -179,6 +232,56 @@ fn validate_external_id(external_id: Option<&ExternalId>) -> Result<()> {
     } else {
         Ok(())
     }
+}
+
+fn validate_extended_metadata(metadata: &ExtendedMetadata) -> Result<()> {
+    validate_partial_date(&metadata.date)?;
+    validate_partial_date(&metadata.original_date)?;
+    for id in &metadata.external_ids {
+        validate_external_id(Some(id))?;
+    }
+    for (field, value) in &metadata.flexible_fields {
+        if field.is_empty()
+            || field == "__core"
+            || !field
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            return Err(Error::Import(format!(
+                "invalid flexible field name: {field}"
+            )));
+        }
+        match value {
+            FlexibleValue::Float(value) if !value.is_finite() => {
+                return Err(Error::Import(format!(
+                    "flexible field {field} must be finite"
+                )))
+            }
+            FlexibleValue::Date(value) => validate_partial_date(value)?,
+            FlexibleValue::String(_)
+            | FlexibleValue::Integer(_)
+            | FlexibleValue::Float(_)
+            | FlexibleValue::Boolean(_)
+            | FlexibleValue::StringList(_) => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_partial_date(date: &PartialDate) -> Result<()> {
+    if date.month.is_some_and(|month| !(1..=12).contains(&month))
+        || date.day.is_some_and(|day| !(1..=31).contains(&day))
+        || date.day.is_some() && date.month.is_none()
+        || date.month.is_some() && date.year.is_none()
+    {
+        return Err(Error::Import("partial date is invalid".into()));
+    }
+    if let (Some(year), Some(month), Some(day)) = (date.year, date.month, date.day) {
+        if chrono::NaiveDate::from_ymd_opt(year, u32::from(month), u32::from(day)).is_none() {
+            return Err(Error::Import("partial date is invalid".into()));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]

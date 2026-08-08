@@ -1,0 +1,43 @@
+schema_version = 1
+upstream_version = "2.11.0"
+upstream_commit = "26ab6b26361e8c9d77cdf04ba9cf5ca64bbbc722"
+platforms = ["linux", "macos"]
+executable = "rsbts"
+plugin_scope = "bundled"
+
+# This first manifest freezes the compatibility vocabulary and source identity.
+# Later phases generate the complete command, option, field, event, and plugin inventory.
+[statuses]
+allowed = ["missing", "partial", "parity", "divergence"]
+
+[subsystems.core_commands]
+status = "partial"
+evidence = ["tests/cli.rs"]
+
+[subsystems.catalog_schema]
+status = "missing"
+evidence = ["ARCHITECTURE_ROADMAP.md"]
+
+[subsystems.configuration]
+status = "missing"
+evidence = ["ARCHITECTURE_ROADMAP.md"]
+
+[subsystems.query_language]
+status = "partial"
+evidence = ["src/query.rs"]
+
+[subsystems.template_language]
+status = "partial"
+evidence = ["src/pathformat.rs"]
+
+[subsystems.media_fields]
+status = "partial"
+evidence = ["src/tags.rs", "src/write.rs"]
+
+[subsystems.bundled_plugins]
+status = "missing"
+evidence = ["ARCHITECTURE_ROADMAP.md"]
+
+[subsystems.import_pipeline]
+status = "partial"
+evidence = ["src/import.rs"]

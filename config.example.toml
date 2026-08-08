@@ -15,10 +15,10 @@ database = "~/.local/share/rsbts/library.db"
 format = "$albumartist/$album/$track - $title"
 
 [import]
-# Action: copy, move, or link
+# Action: copy, move, link, or in_place
 action = "copy"
 
-# Fetch album art from Cover Art Archive
+# Fetch album art from the provider that supplied the selected release
 fetch_art = true
 
 # Follow directory symlinks while scanning (disabled for containment safety)
@@ -31,17 +31,29 @@ auto_accept_threshold = 0.92
 # Required lead over the next-best release
 runner_up_margin = 0.05
 
+[providers]
+# Fixed, built-in providers only. Add "discogs" to enable it. rsbts has no
+# plugin system. Discogs authentication comes from RSBTS_DISCOGS_TOKEN.
+enabled = ["musicbrainz"]
+
 [musicbrainz]
 # Search result limit
 # Values above 100 are rejected.
 search_limit = 5
 
 # MusicBrainz requires an identifying user agent with a project URL or contact
-user_agent = "rsbts/0.2.0 (https://github.com/sxndmxn/rsbts)"
+user_agent = "rsbts/0.3.0 (https://github.com/sxndmxn/rsbts)"
 
 # Minimum interval between requests (values below 1.0 are rejected)
 rate_limit_seconds = 1.0
 
 # Retry transient 429/5xx responses
 # Values above 10 are rejected.
+max_retries = 3
+
+[discogs]
+# Used only when "discogs" is listed in providers.enabled
+search_limit = 5
+user_agent = "rsbts/0.3.0 +https://github.com/sxndmxn/rsbts"
+rate_limit_seconds = 1.0
 max_retries = 3

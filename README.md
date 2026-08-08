@@ -1,8 +1,11 @@
 # rsbts
 
-A safe, plan-first music library manager and reusable Rust library. rsbts scans
-local audio, searches a metadata provider, explains its match confidence, and
-organizes approved albums without silently overwriting files.
+A safe, plan-first Rust implementation progressing toward Beets 2.11 core and
+bundled-plugin compatibility on Linux and macOS. The current 0.3 implementation
+catalogs albums and singles, searches its built-in MusicBrainz and Discogs
+providers, explains match confidence, and organizes approved music without
+silently overwriting files. Its compatibility status and intentional Unix
+improvements are tracked under `compat/`; it is not yet a drop-in replacement.
 
 ## Safety model
 
@@ -12,10 +15,11 @@ organizes approved albums without silently overwriting files.
   following symlinks. Creation, staging, and no-clobber finalization stay
   relative to pinned directory handles and abort if the library root or a
   destination parent changes during execution.
-- Copy, move, link, cover-art, and file-deleting removal operations use a
-  persistent SQLite journal. Interrupted work is reconciled when the CLI opens
-  for a non-dry-run command; if ownership cannot be proven, recovery stops and
-  reports the paths requiring manual attention.
+- Copy, move, link, cover-art, explicit tag-write, managed-file move, and
+  file-deleting removal operations use a persistent SQLite journal.
+  Interrupted work is reconciled when the CLI opens for a non-dry-run command;
+  if ownership cannot be proven, recovery stops and reports the paths requiring
+  manual attention.
 - Move sources are deleted only after the album and tracks commit to SQLite;
   recovery also requires the journaled file identity and content hash to match.
 - Removal is planned and confirmed as one complete set. With `--delete`, files
@@ -48,7 +52,7 @@ cargo install --path . --locked
 
 ## Quick start
 
-The built-in defaults use `~/Music` for organized files and
+The built-in defaults use MusicBrainz, `~/Music` for organized files, and
 `~/.local/share/rsbts/library.db` for the catalog. Configuration loading is
 side-effect free, so it is safe to inspect a new installation before importing
 anything:
@@ -78,11 +82,12 @@ rsbts stats
 rsbts audit
 ```
 
-The interactive import lets you choose a MusicBrainz candidate, keep the
-existing file tags, or skip the album. Tied releases can all display excellent
+The interactive import lets you choose a provider candidate, keep the existing
+file tags, or skip the album or single. Tied results can all display excellent
 scores while still failing the runner-up-margin gate. This is intentional:
 `--yes` skips ambiguous matches instead of guessing and exits with status `2`
-when work was skipped.
+when work was skipped. Imports update only the catalog and file placement;
+audio tags change only when `rsbts write` is explicitly run.
 
 Relative paths in an explicit config are resolved from that config's directory.
 An explicit missing config or an unknown TOML key is an error; loading
@@ -105,6 +110,7 @@ rsbts import /path/to/album
 rsbts import --copy /path/to/album
 rsbts import --move /path/to/album
 rsbts import --link /path/to/album
+rsbts import --in-place /path/to/track.flac
 rsbts import --yes /path/to/albums
 ```
 
@@ -119,6 +125,53 @@ are printed and that album is skipped.
 
 Without a terminal, mutating imports require `--yes`; `--dry-run` never mutates.
 Failures are isolated per album so later albums can still be processed.
+Directly named files and files without usable album tags are treated as
+singletons and matched with provider track searches. Album grouping is scoped
+to source directories, with adjacent disc folders grouped under their parent,
+so unrelated releases with identical tags do not merge globally.
+
+## Metadata providers
+
+MusicBrainz and Discogs are compiled into rsbts; there are no plugins. The
+default is `providers.enabled = ["musicbrainz"]`. To add Discogs, list it in
+`providers.enabled` and export a personal token before running rsbts:
+
+```bash
+export RSBTS_DISCOGS_TOKEN='your-token'
+```
+
+Provider failures are isolated when another enabled provider succeeds. Search
+limits, request pacing, response-size limits, retries, explicit ID lookup, and
+provider-qualified cover-art lookup are built in.
+
+## Migrate from Beets
+
+Migration reads the Beets SQLite database and optional YAML configuration but
+never modifies them. Preview first, then create a new rsbts database:
+
+```bash
+rsbts migrate beets \
+  --beets-library ~/.config/beets/library.db \
+  --beets-config ~/.config/beets/config.yaml \
+  --output-database ~/.local/share/rsbts/library.db \
+  --output-config ~/.config/rsbts/config.toml \
+  --dry-run
+
+rsbts migrate beets \
+  --beets-library ~/.config/beets/library.db \
+  --beets-config ~/.config/beets/config.yaml \
+  --output-database ~/.local/share/rsbts/library.db \
+  --output-config ~/.config/rsbts/config.toml \
+  --yes
+```
+
+Use `--music-directory` if the Beets database stores relative paths and the
+directory cannot be derived from its config. The destination database and
+optional config must not already exist. Migration preserves albums, singletons,
+missing-file rows, partial dates, multi-value metadata, MusicBrainz/Discogs IDs,
+and fixed or flexible custom fields as typed values where SQLite retains their
+type. Beets plugin configuration and incompatible path-template behavior are
+reported rather than emulated.
 
 ## Query and manage
 
@@ -131,15 +184,22 @@ rsbts stats
 rsbts audit
 rsbts update "artist:beatles"
 rsbts modify "album:=Paranoid" genre=Metal year=1970
+rsbts write --dry-run "album:=Paranoid"
+rsbts write --yes "album:=Paranoid"
+rsbts move --dry-run "artist:beatles"
+rsbts move --yes "artist:beatles"
 rsbts rm --dry-run "artist:beatles"
 rsbts rm --yes "artist:beatles"
 rsbts rm --delete --yes "artist:beatles"
 ```
 
 Field filters support literal substring `field:value`, exact `field:=value`,
-SQLite glob `field::pattern` (`*`, `?`, and `[]`), ranges such as
-`year:1960..1969`, negation with `^`, relative added dates such as `added:-7d`,
-and ascending/descending sort suffixes `+`/`-`.
+regular expressions with `field::pattern`, globs with `field:~pattern` (`*`,
+`?`, and `[]`), ranges such as `year:1960..1969`, negation with `^`, relative
+added dates such as `added:-7d`, and ascending/descending sort suffixes `+`/`-`.
+Separate OR groups with a standalone comma, for example
+`artist:=Sabbath , artist:=Ozzy`. Migrated custom fields are queried as
+`flex.field_name:value`.
 Double-quote values containing spaces, for example
 `artist:"Black Sabbath" album:="Master of Reality"`; malformed quotes are
 rejected.
@@ -156,25 +216,37 @@ Changing canonical title/artist/track fields clears the affected provider track
 ID; changing album/album-artist/year clears the affected provider release ID.
 Changing artist also clears the release ID when that item has no explicit album
 artist. The same selective invalidation applies when `update` detects changed
-file tags.
+file tags. Singletons remain outside album rows when updated or modified.
+
+`write` previews and confirms a complete selection before rewriting audio tags
+from catalog metadata. Each file is copied to a sibling temporary file, tagged,
+re-read for verification, finalized without overwriting, and journaled for
+recovery. `move` separately previews and confirms reorganization of already
+managed files using the current path template. Both commands require either an
+explicit query or `--all`; neither runs implicitly during import or modify.
 
 `audit` prints every missing file, unknown file size, orphaned item, invalid
-timestamp, and full-text search index inconsistency. It exits with status `2`
-when it finds an issue. These deep checks run only for an explicit `audit`, so
-ordinary commands do not scan every library file at startup.
+timestamp, SQLite integrity or foreign-key problem, and full-text search index
+inconsistency. It exits with status `2` when it finds an issue. Database-wide
+checks run for explicit audit and actual schema migrations, not current-schema
+command startup; filesystem checks run only for explicit audit.
 
 Exit status is `0` for success, `2` when some work was skipped or failed while
 the rest continued, and `1` for validation or fatal runtime errors. Clap uses
 status `2` when the command-line arguments themselves are syntactically invalid.
+A downstream command closing stdout early is normal pipeline termination and
+also exits `0`; primary output stays on stdout while warnings and diagnostics
+use stderr.
 
 ## Library API
 
-The public API exposes provider-neutral metadata DTOs and an async
-`MetadataProvider` trait, typed `Query` values, explicit `ImportPlan` /
-`ApprovedAlbumPlan` and `RemovalPlan` types, journaled executors, library audit,
-and explicit `Library::recover_pending()` recovery. Library consumers choose
-when recovery runs; the CLI runs it automatically before every command except a
-dry run. `Library::open_snapshot()` provides a non-mutating database view.
+The public API exposes provider-neutral metadata DTOs, partial dates, typed
+flexible metadata, multi-provider IDs, and an async `MetadataProvider` trait.
+It also exposes typed `Query` values; explicit import, removal, move, and tag
+write plans; journaled executors; library audit; Beets migration; and explicit
+`Library::recover_pending()` recovery. Library consumers choose when recovery
+runs; the CLI runs it automatically before every command except a dry run.
+`Library::open_snapshot()` provides a non-mutating database view.
 
 ## Development checks
 
@@ -196,6 +268,10 @@ import dry run, an interactive or explicitly confirmed import, filtered `ls`,
 ## Supported audio
 
 MP3, FLAC, Ogg Vorbis, Opus, M4A/AAC, ALAC, WAV, and AIFF.
+
+The first stable target is macOS and Linux. The deliberately excluded scope is
+plugins, archive extraction, artwork embedding, transcoding, web/player
+integrations, and Windows support.
 
 ## License
 
