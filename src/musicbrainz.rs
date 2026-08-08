@@ -18,6 +18,8 @@ use crate::{Error, Result};
 const API_BASE: &str = "https://musicbrainz.org/ws/2";
 const MAX_METADATA_BYTES: usize = 8 * 1024 * 1024;
 const MAX_COVER_ART_BYTES: usize = 20 * 1024 * 1024;
+const MAX_METADATA_BYTES_U64: u64 = 8 * 1024 * 1024;
+const MAX_COVER_ART_BYTES_U64: u64 = 20 * 1024 * 1024;
 const MAX_RETRY_AFTER_SECONDS: u64 = 60;
 
 pub struct MusicBrainzProvider {
@@ -255,7 +257,7 @@ impl MetadataProvider for MusicBrainzProvider {
         ensure_success(&response, "cover-art lookup")?;
         if response
             .content_length()
-            .is_some_and(|length| length > MAX_COVER_ART_BYTES as u64)
+            .is_some_and(|length| length > MAX_COVER_ART_BYTES_U64)
         {
             return Err(Error::Provider(format!(
                 "cover art exceeds the {MAX_COVER_ART_BYTES}-byte limit"
@@ -369,7 +371,7 @@ async fn decode_json_limited<T: DeserializeOwned>(
 ) -> Result<T> {
     if response
         .content_length()
-        .is_some_and(|length| length > MAX_METADATA_BYTES as u64)
+        .is_some_and(|length| length > MAX_METADATA_BYTES_U64)
     {
         return Err(Error::Provider(format!(
             "{operation} response exceeds the {MAX_METADATA_BYTES}-byte limit"

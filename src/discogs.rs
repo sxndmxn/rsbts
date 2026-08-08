@@ -3,6 +3,7 @@
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use num_traits::ToPrimitive;
 use reqwest::{Response, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -185,10 +186,9 @@ impl MetadataProvider for DiscogsProvider {
         let count = ids.len().max(1);
         for (index, id) in ids.into_iter().enumerate() {
             let release = self.get_release(&id.to_string()).await?;
-            candidates.push(release_candidate(
-                release,
-                1.0 - index as f64 / count as f64,
-            ));
+            let index = index.to_f64().unwrap_or(f64::MAX);
+            let count = count.to_f64().unwrap_or(f64::MAX);
+            candidates.push(release_candidate(release, 1.0 - index / count));
         }
         Ok(candidates)
     }
@@ -208,7 +208,7 @@ impl MetadataProvider for DiscogsProvider {
                 }
             }
         }
-        candidates.truncate(limit as usize);
+        candidates.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
         Ok(candidates)
     }
 

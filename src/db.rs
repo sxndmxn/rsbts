@@ -38,6 +38,12 @@ pub struct Stats {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuditIssue {
+    DatabaseIntegrity {
+        detail: String,
+    },
+    ForeignKeyViolations {
+        count: u64,
+    },
     MissingFile {
         item_id: i64,
         path: PathBuf,
@@ -201,6 +207,15 @@ impl Library {
 
     pub fn audit(&self) -> Result<AuditReport> {
         let mut issues = Vec::new();
+        for detail in migrations::integrity_issues(&self.conn)? {
+            issues.push(AuditIssue::DatabaseIntegrity { detail });
+        }
+        let foreign_key_violations = migrations::foreign_key_violation_count(&self.conn)?;
+        if foreign_key_violations > 0 {
+            issues.push(AuditIssue::ForeignKeyViolations {
+                count: foreign_key_violations,
+            });
+        }
         let mut stmt = self
             .conn
             .prepare("SELECT id, path, file_size, added, mtime FROM items ORDER BY id")?;
@@ -1849,7 +1864,53 @@ fn hash_os_string(value: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
+
+    thread_local! {
+        static TRACED_SQL: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    fn trace_sql(sql: &str) {
+        TRACED_SQL.with(|statements| statements.borrow_mut().push(sql.to_string()));
+    }
+
+    fn take_traced_sql() -> Vec<String> {
+        TRACED_SQL.with(|statements| std::mem::take(&mut *statements.borrow_mut()))
+    }
+
+    #[test]
+    fn a_small_exact_query_has_a_bounded_statement_count() -> Result<()> {
+        let mut library = Library::open_in_memory()?;
+        library.conn.execute_batch(
+            "WITH RECURSIVE records(id) AS (
+                 SELECT 1 UNION ALL SELECT id + 1 FROM records WHERE id < 10
+             )
+             INSERT INTO items
+                 (path, title, artist, album, format, bitrate, length, added, mtime)
+             SELECT printf('/missing/%d.flac', id),
+                    CASE id WHEN 7 THEN 'Target' ELSE printf('Other %d', id) END,
+                    'Artist', 'Album', 'FLAC', 1, 1.0,
+                    '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z'
+             FROM records;",
+        )?;
+        library.conn.trace(Some(trace_sql));
+        let items = library.query_items(&Query::parse("title:=Target")?)?;
+        library.conn.trace(None);
+
+        assert_eq!(items.len(), 1);
+        let statements = take_traced_sql();
+        assert!(
+            statements.len() <= 4,
+            "small exact query executed {} statements: {statements:#?}",
+            statements.len()
+        );
+        assert!(statements
+            .iter()
+            .all(|statement| !statement.to_ascii_lowercase().contains("integrity_check")));
+        Ok(())
+    }
 
     #[test]
     fn audit_preserves_and_reports_missing_files() -> Result<()> {
@@ -1895,6 +1956,32 @@ mod tests {
             audit.issues.first(),
             Some(AuditIssue::MissingFile { .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn audit_reports_foreign_key_corruption_that_normal_open_allows() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let database_path = temporary.path().join("library.db");
+        drop(Library::open(&database_path)?);
+
+        let connection = Connection::open(&database_path)?;
+        connection.pragma_update(None, "foreign_keys", "OFF")?;
+        connection.execute(
+            "INSERT INTO items
+             (album_id, path, title, artist, album, format, bitrate, length, added, mtime)
+             VALUES (999, '/missing.flac', 'Track', 'Artist', 'Album', 'FLAC', 1, 1,
+                     '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            [],
+        )?;
+        drop(connection);
+
+        let library = Library::open(&database_path)?;
+        let report = library.audit()?;
+        assert!(report
+            .issues
+            .iter()
+            .any(|issue| matches!(issue, AuditIssue::ForeignKeyViolations { count: 1 })));
         Ok(())
     }
 

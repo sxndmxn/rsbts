@@ -1256,6 +1256,7 @@ dependencies = [
  "dirs",
  "indicatif",
  "lofty",
+ "num-traits",
  "pathfinding",
  "regex",
  "reqwest",

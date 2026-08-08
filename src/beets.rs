@@ -5,6 +5,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
+use num_traits::ToPrimitive;
 use rusqlite::types::Value;
 use rusqlite::{Connection, OpenFlags};
 
@@ -135,7 +136,7 @@ impl BeetsMigration {
         let mut library = crate::db::Library::open_in_memory()?;
         library.import_migrated_groups(&self.groups)?;
         let expected = self.report.album_tracks + self.report.singletons;
-        if library.stats()?.tracks as usize != expected {
+        if usize::try_from(library.stats()?.tracks).ok() != Some(expected) {
             return Err(Error::Recovery(
                 "migrated track count does not match the Beets source".into(),
             ));
@@ -524,8 +525,13 @@ fn timestamp(row: &SqlRow, field: &str) -> Result<DateTime<Utc>> {
     if !seconds.is_finite() || seconds < 0.0 {
         return Err(Error::Import(format!("Beets {field} timestamp is invalid")));
     }
-    let whole = seconds.floor() as i64;
-    let nanos = ((seconds - seconds.floor()) * 1_000_000_000.0) as u32;
+    let whole = seconds
+        .floor()
+        .to_i64()
+        .ok_or_else(|| Error::Import(format!("Beets {field} timestamp is out of range")))?;
+    let nanos = ((seconds - seconds.floor()) * 1_000_000_000.0)
+        .to_u32()
+        .ok_or_else(|| Error::Import(format!("Beets {field} timestamp is out of range")))?;
     DateTime::from_timestamp(whole, nanos)
         .ok_or_else(|| Error::Import(format!("Beets {field} timestamp is out of range")))
 }
@@ -554,7 +560,7 @@ fn text_or_integer(row: &SqlRow, field: &str) -> Option<String> {
 fn integer(row: &SqlRow, field: &str) -> Option<i64> {
     match row.get(field)? {
         Value::Integer(value) => Some(*value),
-        Value::Real(value) => Some(*value as i64),
+        Value::Real(value) => value.to_i64(),
         _ => None,
     }
 }
@@ -562,7 +568,7 @@ fn integer(row: &SqlRow, field: &str) -> Option<i64> {
 fn real(row: &SqlRow, field: &str) -> Option<f64> {
     match row.get(field)? {
         Value::Real(value) => Some(*value),
-        Value::Integer(value) => Some(*value as f64),
+        Value::Integer(value) => value.to_f64(),
         _ => None,
     }
 }

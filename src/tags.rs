@@ -177,7 +177,7 @@ mod tests {
         assert_eq!(item.artist, "Unknown Artist");
         assert_eq!(item.album, "Unknown Album");
         assert_eq!(item.format, AudioFormat::Wav);
-        assert_eq!(item.file_size, Some(bytes.len() as u64));
+        assert_eq!(item.file_size, u64::try_from(bytes.len()).ok());
         Ok(())
     }
 }

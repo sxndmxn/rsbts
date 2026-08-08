@@ -1,9 +1,4 @@
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss
-)]
-
+use std::io::{self, Write as _};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -190,11 +185,27 @@ enum MigrateSource {
 #[tokio::main]
 async fn main() -> ExitCode {
     let arguments = Cli::parse();
-    match cli::run(arguments.command, arguments.config).await {
+    let stdout = io::stdout();
+    let stderr = io::stderr();
+    let mut stdout = io::BufWriter::new(stdout.lock());
+    let mut stderr = io::BufWriter::new(stderr.lock());
+    let (result, flush_result) = {
+        let mut streams = cli::Streams::new(&mut stdout, &mut stderr);
+        let result = cli::run(arguments.command, arguments.config, &mut streams).await;
+        let flush_result = streams.finish();
+        (result, flush_result)
+    };
+    let result = match result {
+        Ok(outcome) => flush_result.map(|()| outcome),
+        Err(error) => Err(error),
+    };
+    match result {
         Ok(cli::Outcome::Success) => ExitCode::SUCCESS,
         Ok(cli::Outcome::Partial) => ExitCode::from(2),
+        Err(error) if error.is_stdout_broken_pipe() => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("rsbts: {}", cli::terminal_safe(error));
+            let _ = writeln!(stderr, "rsbts: {}", cli::terminal_safe(error));
+            let _ = stderr.flush();
             ExitCode::FAILURE
         }
     }

@@ -13,6 +13,7 @@ use std::io::{Seek, SeekFrom};
 
 use chrono::Utc;
 use indicatif::{ProgressBar, ProgressStyle};
+use num_traits::ToPrimitive;
 use pathfinding::matrix::Matrix;
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
@@ -991,7 +992,8 @@ fn score_track_candidates(
             let title = similarity(&item.title, &track.title);
             let duration_delta_seconds = track
                 .length_ms
-                .map(|length| (item.length - length as f64 / 1_000.0).abs());
+                .and_then(|length| length.to_f64())
+                .map(|length| (item.length - length / 1_000.0).abs());
             let duration_ok =
                 duration_delta_seconds.is_none_or(|delta| delta <= DURATION_GATE_SECONDS);
             let provider = if track.provider_score.is_finite() {
@@ -1121,7 +1123,7 @@ fn score_candidates(
                     .iter()
                     .map(|matched| matched.score)
                     .sum::<f64>()
-                    / track_matches.len() as f64
+                    / track_matches.len().to_f64().unwrap_or(f64::MAX)
             };
             let provider = if release.provider_score.is_finite() {
                 release.provider_score.clamp(0.0, 1.0)
@@ -1260,7 +1262,8 @@ fn match_tracks(items: &[Item], tracks: &[ProviderTrack]) -> Vec<TrackMatch> {
             let duration_delta_seconds = if item.length.is_finite() {
                 provider_track
                     .length_ms
-                    .map(|milliseconds| (item.length - milliseconds as f64 / 1000.0).abs())
+                    .and_then(|milliseconds| milliseconds.to_f64())
+                    .map(|milliseconds| (item.length - milliseconds / 1000.0).abs())
             } else {
                 None
             };
@@ -1280,7 +1283,8 @@ fn match_tracks(items: &[Item], tracks: &[ProviderTrack]) -> Vec<TrackMatch> {
                 && provider_track.number.is_some()
                 && (item.track == provider_track.number)
                 && (item.disc.unwrap_or(1) == provider_track.disc.unwrap_or(1));
-            costs[item_index][track_index] = (-(score * 100_000.0)).round() as i64;
+            costs[item_index][track_index] =
+                (-(score * 100_000.0)).round().to_i64().unwrap_or(-100_000);
             scores[item_index][track_index] = Some(TrackMatch {
                 item_index,
                 track_index,

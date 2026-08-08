@@ -1,10 +1,11 @@
 # rsbts
 
-A safe, plan-first, plugin-free Rust replacement for the core Beets music
-library workflow. rsbts catalogs albums and singles, searches its built-in
-MusicBrainz and Discogs providers, explains match confidence, and organizes
-approved music without silently overwriting files. It includes a read-only
-Beets database migration path; it is not a drop-in Beets CLI or plugin host.
+A safe, plan-first Rust implementation progressing toward Beets 2.11 core and
+bundled-plugin compatibility on Linux and macOS. The current 0.3 implementation
+catalogs albums and singles, searches its built-in MusicBrainz and Discogs
+providers, explains match confidence, and organizes approved music without
+silently overwriting files. Its compatibility status and intentional Unix
+improvements are tracked under `compat/`; it is not yet a drop-in replacement.
 
 ## Safety model
 
@@ -225,13 +226,17 @@ managed files using the current path template. Both commands require either an
 explicit query or `--all`; neither runs implicitly during import or modify.
 
 `audit` prints every missing file, unknown file size, orphaned item, invalid
-timestamp, and full-text search index inconsistency. It exits with status `2`
-when it finds an issue. These deep checks run only for an explicit `audit`, so
-ordinary commands do not scan every library file at startup.
+timestamp, SQLite integrity or foreign-key problem, and full-text search index
+inconsistency. It exits with status `2` when it finds an issue. Database-wide
+checks run for explicit audit and actual schema migrations, not current-schema
+command startup; filesystem checks run only for explicit audit.
 
 Exit status is `0` for success, `2` when some work was skipped or failed while
 the rest continued, and `1` for validation or fatal runtime errors. Clap uses
 status `2` when the command-line arguments themselves are syntactically invalid.
+A downstream command closing stdout early is normal pipeline termination and
+also exits `0`; primary output stays on stdout while warnings and diagnostics
+use stderr.
 
 ## Library API
 
