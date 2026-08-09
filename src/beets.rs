@@ -724,13 +724,13 @@ mod tests {
         drop(connection);
 
         let config_path = temporary.path().join("config.yaml");
-        std::fs::write(
-            &config_path,
-            format!(
-                "directory: \"{}\"\nplugins: [fetchart]\nimport:\n  copy: false\n",
-                music_directory.display()
-            ),
-        )?;
+        let yaml = serde_yaml::to_string(&serde_json::json!({
+            "directory": music_directory,
+            "plugins": ["fetchart"],
+            "import": {"copy": false},
+        }))
+        .map_err(|error| Error::Config(format!("cannot serialize Beets test config: {error}")))?;
+        std::fs::write(&config_path, yaml)?;
         let output_database = temporary.path().join("rsbts.db");
 
         let migration =

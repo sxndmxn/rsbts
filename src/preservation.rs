@@ -11,7 +11,7 @@ use serde_json::json;
 
 use crate::asset::{digest_reader, FileDigests};
 use crate::db::{file_identity, file_object_identity, JournalFile, Library, OperationKind};
-use crate::fsops::AnchoredRoot;
+use crate::fsops::{AnchoredRoot, ReadRoot};
 use crate::operations::{append_plan_event, PlanId, PlanKind, PlanState};
 use crate::roots::RootId;
 use crate::{Error, Result};
@@ -960,8 +960,8 @@ fn require_planned_shape(plan: &ManifestPlan, assets: u64, bytes: u64) -> Result
 /// Verify a standard two-space-delimited SHA-256 manifest beneath `root`.
 pub fn verify_sha256_manifest(root: &Path, manifest: &Path) -> Result<ManifestVerification> {
     require_absolute_directory(root, "manifest root")?;
-    let anchored = AnchoredRoot::open(root)?;
-    let manifest_root = AnchoredRoot::open(absolute_parent(manifest)?)?;
+    let anchored = ReadRoot::open(root)?;
+    let manifest_root = ReadRoot::open(absolute_parent(manifest)?)?;
     let file = manifest_root.open_file(manifest)?;
     let mut report = ManifestVerification::default();
     let mut seen = HashSet::new();
@@ -993,7 +993,7 @@ pub fn verify_sha256_manifest(root: &Path, manifest: &Path) -> Result<ManifestVe
 }
 
 fn manifest_shape(root: &Path, manifest: &Path) -> Result<(u64, u64)> {
-    let anchored = AnchoredRoot::open(root)?;
+    let anchored = ReadRoot::open(root)?;
     let mut files = 0_u64;
     let mut bytes = 0_u64;
     for line in BufReader::new(anchored.open_file(manifest)?).lines() {
@@ -1211,6 +1211,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn every_manifest_boundary_recovers_without_losing_source_bytes() -> Result<()> {
         let recording = tempfile::tempdir()?;

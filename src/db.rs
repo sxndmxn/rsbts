@@ -4202,6 +4202,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn rollback_preserves_a_destination_that_lost_the_race() -> Result<()> {
         let temporary = tempfile::tempdir()?;
@@ -4236,6 +4237,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn rollback_removes_a_hard_link_finalized_by_rsbts() -> Result<()> {
         let temporary = tempfile::tempdir()?;
@@ -4270,7 +4272,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn rollback_removes_a_finalized_import_link_owned_by_rsbts() -> Result<()> {
         let temporary = tempfile::tempdir()?;
@@ -4394,6 +4396,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn committed_move_recovery_removes_the_original_source() -> Result<()> {
         let temporary = tempfile::tempdir()?;
@@ -4429,6 +4432,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn uncommitted_removal_recovery_restores_a_regular_file() -> Result<()> {
         let temporary = tempfile::tempdir()?;
@@ -4603,7 +4607,7 @@ mod tests {
         assert!(path_to_storage(path).is_err());
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn removal_recovery_restores_a_dangling_symlink() -> Result<()> {
         let temporary = tempfile::tempdir()?;

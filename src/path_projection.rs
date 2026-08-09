@@ -614,6 +614,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn every_path_projection_boundary_preserves_one_verified_copy() -> Result<()> {
         let recording = tempfile::tempdir()?;

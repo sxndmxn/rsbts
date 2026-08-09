@@ -9,7 +9,7 @@ use serde_json::json;
 
 use crate::asset::digest_reader;
 use crate::db::{file_identity, Library};
-use crate::fsops::AnchoredRoot;
+use crate::fsops::ReadRoot;
 use crate::media::{decoded_audio_essence_hash_from_file, probe_media_from_file, MediaDescriptor};
 use crate::operations::{append_plan_event, PlanId, PlanKind, PlanState};
 use crate::{Error, Result};
@@ -1044,12 +1044,17 @@ fn inspect_asset(asset: &AssetEvidence, mode: FixityMode) -> (FixityResult, Obse
             ObservedEvidence::default(),
         );
     }
+    let legacy_root = asset
+        .absolute_path
+        .ancestors()
+        .last()
+        .unwrap_or(asset.absolute_path.as_path());
     let (anchored_root, anchored_relative) = if asset.root_state == "legacy" {
         (
-            Path::new("/"),
+            legacy_root,
             asset
                 .absolute_path
-                .strip_prefix("/")
+                .strip_prefix(legacy_root)
                 .unwrap_or(asset.absolute_path.as_path()),
         )
     } else {
@@ -1064,7 +1069,7 @@ fn inspect_asset(asset: &AssetEvidence, mode: FixityMode) -> (FixityResult, Obse
             ObservedEvidence::default(),
         );
     }
-    let root = match AnchoredRoot::open(anchored_root) {
+    let root = match ReadRoot::open(anchored_root) {
         Ok(root) => root,
         Err(error) => {
             return (

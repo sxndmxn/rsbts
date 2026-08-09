@@ -729,6 +729,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn source_replacement_after_preview_is_preserved() -> Result<()> {
         let temporary = tempfile::tempdir()?;

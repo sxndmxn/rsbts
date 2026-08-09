@@ -22,6 +22,122 @@ pub struct AnchoredRoot {
 #[derive(Debug)]
 pub struct AnchoredRoot;
 
+/// A component-checking root for read-only inspection on every supported platform.
+///
+/// Linux reuses the kernel-anchored backend. Other platforms validate every
+/// root-relative component immediately before opening the leaf. This fallback
+/// never authorizes mutation; mutation workflows still require the anchored
+/// backend and revalidate entry identity at their execution boundaries.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[derive(Debug)]
+pub struct ReadRoot {
+    anchored: AnchoredRoot,
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[derive(Debug)]
+pub struct ReadRoot {
+    path: PathBuf,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+impl ReadRoot {
+    pub fn open(path: &Path) -> Result<Self> {
+        AnchoredRoot::open(path).map(|anchored| Self { anchored })
+    }
+
+    pub fn open_file(&self, path: &Path) -> Result<std::fs::File> {
+        self.anchored.open_file(path)
+    }
+
+    pub fn entry_metadata(&self, path: &Path) -> Result<std::fs::Metadata> {
+        self.anchored.entry_metadata(path)
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+impl ReadRoot {
+    pub fn open(path: &Path) -> Result<Self> {
+        if !path.is_absolute() {
+            return Err(Error::Root(format!(
+                "read root must be absolute: {}",
+                path.display()
+            )));
+        }
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(Error::Root(format!(
+                "read root is not a real directory: {}",
+                path.display()
+            )));
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+        })
+    }
+
+    pub fn open_file(&self, path: &Path) -> Result<std::fs::File> {
+        let metadata = self.validate_entry(path)?;
+        if !metadata.is_file() {
+            return Err(Error::Root(format!(
+                "read target is not a regular file: {}",
+                path.display()
+            )));
+        }
+        Ok(std::fs::File::open(path)?)
+    }
+
+    pub fn entry_metadata(&self, path: &Path) -> Result<std::fs::Metadata> {
+        self.validate_entry(path)
+    }
+
+    fn validate_entry(&self, path: &Path) -> Result<std::fs::Metadata> {
+        let relative = path.strip_prefix(&self.path).map_err(|_error| {
+            Error::Root(format!(
+                "path escapes read root {}: {}",
+                self.path.display(),
+                path.display()
+            ))
+        })?;
+        if relative.as_os_str().is_empty()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(Error::Root(format!(
+                "path is not a safe root-relative file: {}",
+                path.display()
+            )));
+        }
+        let mut current = self.path.clone();
+        let mut components = relative.components().peekable();
+        let mut final_metadata = None;
+        while let Some(Component::Normal(component)) = components.next() {
+            current.push(component);
+            let metadata = std::fs::symlink_metadata(&current)?;
+            if metadata.file_type().is_symlink() {
+                return Err(Error::Root(format!(
+                    "read path contains a symlink: {}",
+                    current.display()
+                )));
+            }
+            if components.peek().is_some() && !metadata.is_dir() {
+                return Err(Error::Root(format!(
+                    "read path parent is not a directory: {}",
+                    current.display()
+                )));
+            }
+            final_metadata = Some(metadata);
+        }
+        final_metadata.ok_or_else(|| {
+            Error::Root(format!(
+                "read path has no file component: {}",
+                path.display()
+            ))
+        })
+    }
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 impl AnchoredRoot {
     pub fn open(_path: &Path) -> Result<Self> {
@@ -548,15 +664,7 @@ pub fn rename_noreplace(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(test, windows))]
-pub fn rename_noreplace(source: &Path, destination: &Path) -> Result<()> {
-    // Windows RenameFile does not replace an existing destination.
-    std::fs::rename(source, destination)?;
-    failpoints::hit("fs.rename-noreplace-unanchored")?;
-    Ok(())
-}
-
-#[cfg(all(test, not(any(target_os = "linux", target_os = "android", windows))))]
+#[cfg(all(test, not(any(target_os = "linux", target_os = "android"))))]
 pub fn rename_noreplace(_source: &Path, _destination: &Path) -> Result<()> {
     Err(crate::Error::Import(
         "this filesystem backend cannot prove no-replace rename semantics; refusing mutation"
@@ -582,6 +690,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn rename_noreplace_moves_when_destination_is_absent() -> Result<()> {
         let temporary = tempfile::tempdir()?;

@@ -143,5 +143,5 @@ artifact gates are in `.github/workflows/release.yml`.
 | ENG-008 | Implemented | `.github/workflows/release.yml`, `CHANGELOG.md`, `RELEASING.md` | checksums, CycloneDX, attestations, reproducible archives |
 | ENG-009 | Implemented | pinned `cargo-semver-checks` quality gate | baseline public-API compatibility run |
 | ENG-010 | Implemented | `deny.toml` and pinned cargo-deny job | advisory/license/source/ban check |
-| ENG-011 | Implemented | 75% safety-core line gate and selected mutation gate | 79.27% local line result; 21 selected mutations caught and 1 compiler-unviable |
+| ENG-011 | Implemented | 75% safety-core line gate and selected mutation gate | 79.31% local line result; 21 selected mutations caught and 1 compiler-unviable |
 | ENG-012 | Implemented | mock/fixture-only provider tests | test suite contains no live public-service dependency |

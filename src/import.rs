@@ -2232,6 +2232,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn regular_file_finalization_never_overwrites() -> Result<()> {
         let temporary = tempfile::tempdir()?;
