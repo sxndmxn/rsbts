@@ -1302,11 +1302,13 @@ pub fn read_tags(path: &Path) -> Result<Item> {
                 tag.get_string(ItemKey::MusicBrainzRecordingId)
                     .map(|value| crate::ExternalId {
                         provider: "musicbrainz".into(),
+                        kind: "recording".into(),
                         value: value.into(),
                     }),
                 tag.get_string(ItemKey::MusicBrainzReleaseId)
                     .map(|value| crate::ExternalId {
                         provider: "musicbrainz".into(),
+                        kind: "release".into(),
                         value: value.into(),
                     }),
             )

@@ -42,7 +42,7 @@ enabled = ["musicbrainz"]
 search_limit = 5
 
 # MusicBrainz requires an identifying user agent with a project URL or contact
-user_agent = "rsbts/0.3.0 (https://github.com/sxndmxn/rsbts)"
+user_agent = "rsbts/0.4.0 (https://github.com/sxndmxn/rsbts)"
 
 # Minimum interval between requests (values below 1.0 are rejected)
 rate_limit_seconds = 1.0
@@ -54,6 +54,6 @@ max_retries = 3
 [discogs]
 # Used only when "discogs" is listed in providers.enabled
 search_limit = 5
-user_agent = "rsbts/0.3.0 +https://github.com/sxndmxn/rsbts"
+user_agent = "rsbts/0.4.0 +https://github.com/sxndmxn/rsbts"
 rate_limit_seconds = 1.0
 max_retries = 3

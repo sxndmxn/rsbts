@@ -18,7 +18,7 @@ CREATE TABLE entity_metadata (
 CREATE INDEX idx_entity_metadata_lookup
     ON entity_metadata(entity_type, field, entity_id);
 
-CREATE TABLE external_ids (
+CREATE TABLE library_external_ids (
     entity_type TEXT NOT NULL CHECK (entity_type IN ('item', 'album')),
     entity_id INTEGER NOT NULL,
     provider TEXT NOT NULL,
@@ -27,20 +27,20 @@ CREATE TABLE external_ids (
     PRIMARY KEY (entity_type, entity_id, provider, kind, value)
 );
 
-CREATE INDEX idx_external_ids_lookup
-    ON external_ids(provider, kind, value);
+CREATE INDEX idx_library_external_ids_lookup
+    ON library_external_ids(provider, kind, value);
 
-INSERT OR IGNORE INTO external_ids(entity_type, entity_id, provider, kind, value)
+INSERT OR IGNORE INTO library_external_ids(entity_type, entity_id, provider, kind, value)
 SELECT 'album', id, metadata_provider, 'release', external_release_id
 FROM albums
 WHERE metadata_provider IS NOT NULL AND external_release_id IS NOT NULL;
 
-INSERT OR IGNORE INTO external_ids(entity_type, entity_id, provider, kind, value)
+INSERT OR IGNORE INTO library_external_ids(entity_type, entity_id, provider, kind, value)
 SELECT 'item', id, metadata_provider, 'recording', external_track_id
 FROM items
 WHERE metadata_provider IS NOT NULL AND external_track_id IS NOT NULL;
 
-INSERT OR IGNORE INTO external_ids(entity_type, entity_id, provider, kind, value)
+INSERT OR IGNORE INTO library_external_ids(entity_type, entity_id, provider, kind, value)
 SELECT 'item', id, metadata_provider, 'release', external_release_id
 FROM items
 WHERE metadata_provider IS NOT NULL AND external_release_id IS NOT NULL;

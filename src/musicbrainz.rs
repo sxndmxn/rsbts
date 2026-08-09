@@ -13,12 +13,14 @@ use crate::artwork::ArtworkRole;
 use crate::config::MusicBrainzConfig;
 use crate::provider::{
     ArtworkCandidate, EditionEvidence, MetadataProvider, ProviderEntityId, ProviderEntityKind,
-    ProviderFailure, ProviderTrack, ReleaseCandidate, ReleaseQuery, SearchPage,
+    ProviderFailure, ProviderTrack, ReleaseCandidate, ReleaseQuery, SearchPage, TrackCandidate,
+    TrackQuery,
 };
 use crate::{Error, Result};
 
 const API_BASE: &str = "https://musicbrainz.org/ws/2";
 const MAX_METADATA_BYTES: usize = 8 * 1024 * 1024;
+const MAX_METADATA_BYTES_U64: u64 = MAX_METADATA_BYTES as u64;
 const MAX_COVER_ART_BYTES: usize = 20 * 1024 * 1024;
 const MAX_COVER_ART_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_COVER_ART_IMAGES: usize = 32;
@@ -370,10 +372,6 @@ impl MetadataProvider for MusicBrainzProvider {
             .into_iter()
             .map(recording_candidate)
             .collect())
-    }
-
-    async fn lookup_release(&self, release_id: &str) -> Result<ReleaseCandidate> {
-        self.lookup_release_scored(release_id, 100).await
     }
 
     async fn lookup_track(&self, track_id: &str) -> Result<TrackCandidate> {

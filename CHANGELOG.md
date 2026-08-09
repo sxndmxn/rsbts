@@ -6,7 +6,7 @@ breaks.
 
 ## [Unreleased]
 
-## [0.3.0] - 2026-08-09
+## [0.4.0] - 2026-08-09
 
 ### Added
 
@@ -27,6 +27,14 @@ breaks.
 - SHA-256 manifests, BagIt export/restore, scheduled fixity history, explicit
   database integrity checking, machine-readable CLI output, pagination, and a
   one-million-track benchmark contract.
+- A read-only, plan-first Beets migration command that preserves albums,
+  singletons, external IDs, flexible fields, missing entries, and compatible
+  configuration while creating only new rsbts output paths.
+- Built-in MusicBrainz/Discogs aggregation with provider-qualified direct-ID
+  routing, partial-result disclosure, and Discogs release/track identity
+  separation.
+- Explicit `write` and `move` commands routed through retained-original,
+  identity-revalidating projection journals.
 - Cross-platform/MSRV CI, fuzz, coverage, mutation, dependency-policy, SBOM,
   checksums, provenance, and multi-platform release automation.
 
@@ -38,11 +46,14 @@ breaks.
   synchronous scan.
 - Removal defaults to retained quarantine; permanent deletion is an explicit
   purge plan.
+- Schema version 10 integrates legacy Beets-compatible metadata with asset
+  ownership, normalized provenance, durable operations, and constant-time
+  statistics without conflating their external-ID models.
 
 ### Compatibility
 
 - This is an intentional pre-1.0 minor-version API break from 0.2. See
   [API compatibility](docs/api-compatibility.md).
 
-[Unreleased]: https://github.com/sxndmxn/rsbts/compare/v0.3.0...HEAD
-[0.3.0]: https://github.com/sxndmxn/rsbts/compare/v0.2.0...v0.3.0
+[Unreleased]: https://github.com/sxndmxn/rsbts/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/sxndmxn/rsbts/compare/v0.2.0...v0.4.0

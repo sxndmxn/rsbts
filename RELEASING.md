@@ -26,8 +26,8 @@ workflow. Do not publish from an uncommitted workstation tree.
 4. Commit the final version and changelog, create an annotated tag, and push it:
 
    ```bash
-   git tag -a v0.3.0 -m "rsbts 0.3.0"
-   git push origin v0.3.0
+   git tag -a v0.4.0 -m "rsbts 0.4.0"
+   git push origin v0.4.0
    ```
 
 5. The release workflow builds four archives, generates CycloneDX JSON,

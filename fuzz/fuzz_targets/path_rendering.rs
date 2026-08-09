@@ -3,7 +3,7 @@
 use chrono::Utc;
 use libfuzzer_sys::fuzz_target;
 use rsbts::pathformat::format_relative_path;
-use rsbts::{AudioFormat, Item};
+use rsbts::{AudioFormat, ExtendedMetadata, Item};
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(template) = std::str::from_utf8(data) {
@@ -27,6 +27,8 @@ fuzz_target!(|data: &[u8]| {
             release_external_id: None,
             added: Utc::now(),
             mtime: Utc::now(),
+            singleton: false,
+            extended: ExtendedMetadata::default(),
         };
         let _path = format_relative_path(template, &item);
     }

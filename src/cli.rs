@@ -1,6 +1,5 @@
 use std::fmt::Display;
-use std::io::IsTerminal;
-use std::io::Write as _;
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 
 use chrono::Utc;
@@ -15,16 +14,120 @@ use rsbts::import::{
     Action, AlbumPlan, ApprovalChoice, ApprovedAlbumPlan, ImportExecutor, ImportOptions,
     ImportPlanner,
 };
-use rsbts::musicbrainz::MusicBrainzProvider;
+use rsbts::move_files::{MoveExecutor, MovePlan};
 use rsbts::naming::NamingProfile;
 use rsbts::operations::PlanId;
+use rsbts::providers::ProviderSet;
 use rsbts::query::Query;
 use rsbts::remove::{PurgeExecutor, PurgePlan, RemovalExecutor, RemovalPlan};
 use rsbts::tag_projection::TagProjectionExecutor;
 use rsbts::tags::{CanonicalTags, TagProfile};
+use rsbts::write::{TagWriteExecutor, TagWritePlan};
 use rsbts::{Error, Result};
 
-use crate::{Commands, FixityCommand, OutputFormat, PlanCommand};
+use crate::{Commands, FixityCommand, MigrateSource, OutputFormat, PlanCommand};
+
+#[derive(Debug, thiserror::Error)]
+pub enum CliError {
+    #[error(transparent)]
+    Application(#[from] Error),
+    #[error("cannot write command output: {0}")]
+    Stdout(#[source] io::Error),
+    #[error("cannot write command diagnostic: {0}")]
+    Stderr(#[source] io::Error),
+}
+
+impl CliError {
+    #[must_use]
+    pub fn is_stdout_broken_pipe(&self) -> bool {
+        matches!(self, Self::Stdout(error) if error.kind() == io::ErrorKind::BrokenPipe)
+            || matches!(self, Self::Application(Error::Stdout(error)) if error.kind() == io::ErrorKind::BrokenPipe)
+    }
+}
+
+impl From<serde_json::Error> for CliError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Application(Error::from(error))
+    }
+}
+
+type CliResult<T> = std::result::Result<T, CliError>;
+
+pub struct Streams<'a> {
+    stdout: &'a mut dyn Write,
+    stderr: &'a mut dyn Write,
+}
+
+impl<'a> Streams<'a> {
+    pub fn new(stdout: &'a mut dyn Write, stderr: &'a mut dyn Write) -> Self {
+        Self { stdout, stderr }
+    }
+
+    fn output(&mut self, arguments: std::fmt::Arguments<'_>) -> CliResult<()> {
+        self.stdout
+            .write_fmt(arguments)
+            .and_then(|()| self.stdout.write_all(b"\n"))
+            .map_err(CliError::Stdout)
+    }
+
+    fn diagnostic(&mut self, arguments: std::fmt::Arguments<'_>) -> CliResult<()> {
+        self.stderr
+            .write_fmt(arguments)
+            .and_then(|()| self.stderr.write_all(b"\n"))
+            .map_err(CliError::Stderr)
+    }
+
+    pub fn finish(&mut self) -> CliResult<()> {
+        self.stderr.flush().map_err(CliError::Stderr)?;
+        self.stdout.flush().map_err(CliError::Stdout)
+    }
+}
+
+macro_rules! outln {
+    ($streams:expr, $($arguments:tt)*) => {
+        $streams.output(format_args!($($arguments)*))?
+    };
+}
+
+macro_rules! errln {
+    ($streams:expr, $($arguments:tt)*) => {
+        $streams.diagnostic(format_args!($($arguments)*))?
+    };
+}
+
+fn command_output(arguments: std::fmt::Arguments<'_>) -> Result<()> {
+    let stdout = io::stdout();
+    let mut lock = stdout.lock();
+    lock.write_fmt(arguments)
+        .and_then(|()| lock.write_all(b"\n"))
+        .map_err(Error::Stdout)
+}
+
+fn command_diagnostic(arguments: std::fmt::Arguments<'_>) -> Result<()> {
+    let stderr = io::stderr();
+    let mut lock = stderr.lock();
+    lock.write_fmt(arguments)
+        .and_then(|()| lock.write_all(b"\n"))
+        .map_err(Error::Stderr)
+}
+
+macro_rules! println {
+    () => {
+        command_output(format_args!(""))?
+    };
+    ($($arguments:tt)*) => {
+        command_output(format_args!($($arguments)*))?
+    };
+}
+
+macro_rules! eprintln {
+    () => {
+        command_diagnostic(format_args!(""))?
+    };
+    ($($arguments:tt)*) => {
+        command_diagnostic(format_args!($($arguments)*))?
+    };
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -41,7 +144,8 @@ pub async fn run(
     command: Commands,
     config_path: Option<PathBuf>,
     output: OutputFormat,
-) -> Result<Outcome> {
+    streams: &mut Streams<'_>,
+) -> CliResult<Outcome> {
     let config = Config::load(config_path.as_deref())?;
     preflight(&command)?;
     if output != OutputFormat::Text
@@ -71,12 +175,26 @@ pub async fn run(
                 dry_run: false,
                 yes: false,
                 ..
+            } | Commands::Write {
+                dry_run: false,
+                yes: false,
+                ..
+            } | Commands::Move {
+                dry_run: false,
+                yes: false,
+                ..
+            } | Commands::Migrate {
+                source: MigrateSource::Beets {
+                    dry_run: false,
+                    yes: false,
+                    ..
+                },
             }
         )
     {
-        return Err(Error::Config(
-            "machine-readable mutation requires --dry-run or --yes".into(),
-        ));
+        return Err(
+            Error::Config("machine-readable mutation requires --dry-run or --yes".into()).into(),
+        );
     }
     match &command {
         Commands::Import { dry_run, yes, .. } => {
@@ -93,10 +211,21 @@ pub async fn run(
         | Commands::PathProject { dry_run, yes, .. } => {
             require_confirmation_channel(*dry_run, *yes, "projection")?;
         }
+        Commands::Write { dry_run, yes, .. } => {
+            require_confirmation_channel(*dry_run, *yes, "write")?;
+        }
+        Commands::Move { dry_run, yes, .. } => {
+            require_confirmation_channel(*dry_run, *yes, "move")?;
+        }
+        Commands::Migrate {
+            source: MigrateSource::Beets { dry_run, yes, .. },
+        } => {
+            require_confirmation_channel(*dry_run, *yes, "migration")?;
+        }
         _ => {}
     }
     let command = match command {
-        Commands::Migrate { source } => return migrate(source, &config, streams),
+        Commands::Migrate { source } => return migrate(source, &config, output, streams),
         command => command,
     };
     let dry_run = matches!(
@@ -107,6 +236,8 @@ pub async fn run(
             | Commands::ProviderRefresh { dry_run: true, .. }
             | Commands::TagProject { dry_run: true, .. }
             | Commands::PathProject { dry_run: true, .. }
+            | Commands::Write { dry_run: true, .. }
+            | Commands::Move { dry_run: true, .. }
     );
     let ordinary_read = matches!(
         &command,
@@ -132,9 +263,9 @@ pub async fn run(
     };
     if !dry_run && !read_only_open {
         if output == OutputFormat::Text {
-            report_migration(&library);
+            report_migration(&library, streams)?;
         }
-        recover(&mut library, output)?;
+        recover(&mut library, output, streams)?;
     }
     match command {
         Commands::Import {
@@ -157,39 +288,81 @@ pub async fn run(
             } else {
                 config.import.action
             };
-            import(&mut library, &config, &paths, action, dry_run, yes, output).await
+            import(
+                &mut library,
+                &config,
+                &paths,
+                action,
+                dry_run,
+                yes,
+                output,
+                streams,
+            )
+            .await
         }
         Commands::List {
             query,
             album,
             limit,
-        } => list(&library, query.as_deref(), album, limit, output),
-        Commands::Stats => stats(&library, output),
-        Commands::Audit { deep } => audit(&library, deep, output),
-        Commands::Integrity => integrity(&library, output),
-        Commands::Fixity { action } => fixity_command(&library, &action, output),
-        Commands::Verify { query } => {
-            verify(&mut library, &config.library.directory, query.as_deref())
+        } => list(&library, query.as_deref(), album, limit, output).map_err(Into::into),
+        Commands::Stats => stats(&library, output, streams),
+        Commands::Audit { deep } => audit(&library, deep, output, streams),
+        Commands::Integrity => integrity(&library, output).map_err(Into::into),
+        Commands::Fixity { action } => {
+            fixity_command(&library, &action, output).map_err(Into::into)
         }
-        Commands::Update { query } => update(&library, query.as_deref()),
+        Commands::Verify { query } => {
+            verify(&mut library, &config.library.directory, query.as_deref()).map_err(Into::into)
+        }
+        Commands::Update { query } => update(&library, query.as_deref(), streams),
+        Commands::Write {
+            query,
+            all,
+            dry_run,
+            yes,
+        } => write_tags(
+            &mut library,
+            query.as_deref(),
+            all,
+            dry_run,
+            yes,
+            output,
+            streams,
+        ),
+        Commands::Move {
+            query,
+            all,
+            dry_run,
+            yes,
+        } => move_files(
+            &mut library,
+            &config,
+            query.as_deref(),
+            all,
+            dry_run,
+            yes,
+            output,
+            streams,
+        ),
         Commands::Remove {
             query,
             delete,
             dry_run,
             yes,
-        } => remove(&mut library, &query, delete, dry_run, yes, output),
+        } => remove(&mut library, &query, delete, dry_run, yes, output, streams),
         Commands::Purge {
             older_than_days,
             dry_run,
             yes,
-        } => purge(&mut library, older_than_days, dry_run, yes),
-        Commands::Modify { query, fields } => modify(&library, &query, &fields),
+        } => purge(&mut library, older_than_days, dry_run, yes).map_err(Into::into),
+        Commands::Modify { query, fields } => modify(&library, &query, &fields, streams),
         Commands::ProviderRefresh {
             entity_kind,
             entity_id,
             dry_run,
             yes,
-        } => provider_refresh(&library, &entity_kind, &entity_id, dry_run, yes, output),
+        } => provider_refresh(&library, &entity_kind, &entity_id, dry_run, yes, output)
+            .map_err(Into::into),
         Commands::TagProject {
             item_id,
             title,
@@ -210,7 +383,8 @@ pub async fn run(
             dry_run,
             yes,
             output,
-        ),
+        )
+        .map_err(Into::into),
         Commands::PathProject {
             asset_id,
             destination_relative,
@@ -225,8 +399,13 @@ pub async fn run(
             dry_run,
             yes,
             output,
-        ),
-        Commands::Plan { action } => plan_command(&library, &action, output),
+        )
+        .map_err(Into::into),
+        Commands::Plan { action } => plan_command(&library, &action, output).map_err(Into::into),
+        Commands::Migrate { .. } => Err(Error::Config(
+            "migration command was not dispatched during preflight".into(),
+        )
+        .into()),
     }
 }
 
@@ -286,12 +465,28 @@ fn preflight(command: &Commands) -> Result<()> {
             PlanId::parse(id.clone())?;
         }
         Commands::Fixity { action } => preflight_fixity(action)?,
+        Commands::Write { query, all, .. } | Commands::Move { query, all, .. } => {
+            if *all {
+                if query.is_some() {
+                    return Err(Error::Query(
+                        "operation accepts either --all or a query, not both".into(),
+                    ));
+                }
+            } else {
+                let query = query.as_deref().ok_or_else(|| {
+                    Error::Query("operation requires --all or an explicit query".into())
+                })?;
+                require_selection(query, "operation")?;
+                Query::parse(query)?;
+            }
+        }
         Commands::Import { .. }
         | Commands::Purge { .. }
         | Commands::List { album: true, .. }
         | Commands::Stats
         | Commands::Audit { .. }
-        | Commands::Integrity => {}
+        | Commands::Integrity
+        | Commands::Migrate { .. } => {}
     }
     Ok(())
 }
@@ -376,10 +571,15 @@ fn report_migration(library: &Library, streams: &mut Streams<'_>) -> CliResult<(
     Ok(())
 }
 
-fn recover(library: &mut Library, output: OutputFormat) -> Result<()> {
+fn recover(
+    library: &mut Library,
+    output: OutputFormat,
+    streams: &mut Streams<'_>,
+) -> CliResult<()> {
     let report = library.recover_pending()?;
     if output == OutputFormat::Text && !report.recovered_operations.is_empty() {
-        eprintln!(
+        errln!(
+            streams,
             "Recovered {} interrupted operation(s)",
             report.recovered_operations.len()
         );
@@ -393,6 +593,7 @@ fn recover(library: &mut Library, output: OutputFormat) -> Result<()> {
 
 #[allow(clippy::future_not_send)]
 #[expect(
+    clippy::too_many_arguments,
     clippy::too_many_lines,
     reason = "import keeps preview, match review, approval, execution, and machine output as one ordered protocol"
 )]
@@ -404,7 +605,18 @@ async fn import(
     dry_run: bool,
     yes: bool,
     output: OutputFormat,
-) -> Result<Outcome> {
+    streams: &mut Streams<'_>,
+) -> CliResult<Outcome> {
+    let search_limit = config
+        .providers
+        .enabled
+        .iter()
+        .map(|provider| match provider.as_str() {
+            "discogs" => config.discogs.search_limit,
+            _ => config.musicbrainz.search_limit,
+        })
+        .max()
+        .unwrap_or(config.musicbrainz.search_limit);
     let options = ImportOptions {
         action,
         fetch_art: config.import.fetch_art,
@@ -449,7 +661,7 @@ async fn import(
 
     for album_plan in plan.albums {
         if output == OutputFormat::Text {
-            print_album_plan(&album_plan);
+            print_album_plan(&album_plan, streams)?;
         }
         let choice = choose_import(&album_plan, dry_run, yes || output != OutputFormat::Text)?;
         if choice == ApprovalChoice::Skip {
@@ -483,7 +695,7 @@ async fn import(
             continue;
         };
         if output == OutputFormat::Text {
-            print_approved(&approved);
+            print_approved(&approved, streams)?;
         }
         if dry_run {
             if output == OutputFormat::Text {
@@ -694,7 +906,9 @@ fn list(
                     );
                 }
             }
-            remaining = remaining.saturating_sub(page.len() as u32);
+            let emitted = u32::try_from(page.len())
+                .map_err(|_error| Error::Query("list page is too large".into()))?;
+            remaining = remaining.saturating_sub(emitted);
             after = page.last().and_then(|album| album.id);
             if page.len() < page_size as usize {
                 break;
@@ -729,7 +943,9 @@ fn list(
                     );
                 }
             }
-            remaining = remaining.saturating_sub(page.len() as u32);
+            let emitted = u32::try_from(page.len())
+                .map_err(|_error| Error::Query("list page is too large".into()))?;
+            remaining = remaining.saturating_sub(emitted);
             after = page.last().and_then(|item| item.id);
             if page.len() < page_size as usize {
                 break;
@@ -742,7 +958,7 @@ fn list(
     Ok(Outcome::Success)
 }
 
-fn stats(library: &Library, output: OutputFormat) -> Result<Outcome> {
+fn stats(library: &Library, output: OutputFormat, streams: &mut Streams<'_>) -> CliResult<Outcome> {
     let stats = library.stats()?;
     if output != OutputFormat::Text {
         emit(output, &stats)?;
@@ -760,7 +976,12 @@ fn stats(library: &Library, output: OutputFormat) -> Result<Outcome> {
 }
 
 #[allow(clippy::too_many_lines)]
-fn audit(library: &Library, deep: bool, output: OutputFormat) -> Result<Outcome> {
+fn audit(
+    library: &Library,
+    deep: bool,
+    output: OutputFormat,
+    streams: &mut Streams<'_>,
+) -> CliResult<Outcome> {
     if deep {
         let plan = library.plan_fixity(FixityMode::Deep)?;
         if output == OutputFormat::Text {
@@ -998,7 +1219,7 @@ fn integrity(library: &Library, output: OutputFormat) -> Result<Outcome> {
     })
 }
 
-fn update(library: &Library, query: Option<&str>) -> Result<Outcome> {
+fn update(library: &Library, query: Option<&str>, streams: &mut Streams<'_>) -> CliResult<Outcome> {
     let query = parse_query(query)?;
     let items = library.query_items_bounded(&query, 9_999)?;
     let mut tag_updates = Vec::new();
@@ -1048,6 +1269,349 @@ fn verify(library: &mut Library, root: &std::path::Path, query: Option<&str>) ->
     }
 }
 
+fn write_tags(
+    library: &mut Library,
+    raw_query: Option<&str>,
+    all: bool,
+    dry_run: bool,
+    yes: bool,
+    output: OutputFormat,
+    streams: &mut Streams<'_>,
+) -> CliResult<Outcome> {
+    let query = if all {
+        Query::all()
+    } else {
+        let raw_query = raw_query
+            .ok_or_else(|| Error::Query("write requires --all or an explicit query".into()))?;
+        require_selection(raw_query, "write")?;
+        Query::parse(raw_query)?
+    };
+    let plan = TagWritePlan::build(library, &query)?;
+    let preview = serde_json::json!({
+        "operation": "write",
+        "files": plan.files.iter().map(|file| &file.item.path).collect::<Vec<_>>(),
+        "dry_run": dry_run,
+    });
+    if output == OutputFormat::Text {
+        outln!(streams, "Tag-write plan: {} file(s)", plan.files.len());
+        for file in &plan.files {
+            outln!(streams, "  {}", terminal_safe(file.item.path.display()));
+        }
+    } else {
+        emit(output, &preview)?;
+    }
+    if dry_run || plan.files.is_empty() {
+        if output == OutputFormat::Text {
+            outln!(streams, "No changes made");
+        }
+        return Ok(Outcome::Success);
+    }
+    if !yes
+        && !Confirm::new()
+            .with_prompt("Write database metadata to every listed file?")
+            .default(false)
+            .interact()
+            .map_err(|error| Error::Import(format!("cannot read confirmation: {error}")))?
+    {
+        outln!(streams, "Cancelled; no changes made");
+        return Ok(Outcome::Partial);
+    }
+    let report = TagWriteExecutor::new(library).execute(plan);
+    if output == OutputFormat::Text {
+        outln!(
+            streams,
+            "Wrote {} file(s); {} failed",
+            report.written,
+            report.failures.len()
+        );
+        for failure in &report.failures {
+            errln!(
+                streams,
+                "Could not write {}: {}",
+                terminal_safe(failure.path.display()),
+                terminal_safe(&failure.error)
+            );
+        }
+    } else {
+        emit(
+            output,
+            &serde_json::json!({
+                "operation": "write",
+                "written": report.written,
+                "failures": report.failures.iter().map(|failure| serde_json::json!({
+                    "path": failure.path,
+                    "error": failure.error,
+                })).collect::<Vec<_>>(),
+            }),
+        )?;
+    }
+    Ok(if report.failures.is_empty() {
+        Outcome::Success
+    } else {
+        Outcome::Partial
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn move_files(
+    library: &mut Library,
+    config: &Config,
+    raw_query: Option<&str>,
+    all: bool,
+    dry_run: bool,
+    yes: bool,
+    output: OutputFormat,
+    streams: &mut Streams<'_>,
+) -> CliResult<Outcome> {
+    let query = if all {
+        Query::all()
+    } else {
+        let raw_query = raw_query
+            .ok_or_else(|| Error::Query("move requires --all or an explicit query".into()))?;
+        require_selection(raw_query, "move")?;
+        Query::parse(raw_query)?
+    };
+    let plan = MovePlan::build(
+        library,
+        &query,
+        &config.library.directory,
+        &config.paths.format,
+    )?;
+    let preview = serde_json::json!({
+        "operation": "move",
+        "tracks": plan.tracks.iter().map(|track| serde_json::json!({
+            "source": track.source,
+            "destination": track.destination,
+        })).collect::<Vec<_>>(),
+        "dry_run": dry_run,
+    });
+    if output == OutputFormat::Text {
+        outln!(streams, "Move plan: {} file(s)", plan.tracks.len());
+        for track in &plan.tracks {
+            outln!(
+                streams,
+                "  {} -> {}",
+                terminal_safe(track.source.display()),
+                terminal_safe(track.destination.display())
+            );
+        }
+    } else {
+        emit(output, &preview)?;
+    }
+    if dry_run || plan.tracks.is_empty() {
+        if output == OutputFormat::Text {
+            outln!(streams, "No changes made");
+        }
+        return Ok(Outcome::Success);
+    }
+    if !yes
+        && !Confirm::new()
+            .with_prompt("Move every listed file?")
+            .default(false)
+            .interact()
+            .map_err(|error| Error::Import(format!("cannot read confirmation: {error}")))?
+    {
+        outln!(streams, "Cancelled; no changes made");
+        return Ok(Outcome::Partial);
+    }
+    let report = MoveExecutor::new(library, config.library.directory.clone()).execute(plan);
+    if output == OutputFormat::Text {
+        outln!(
+            streams,
+            "Moved {} file(s); {} failed",
+            report.moved,
+            report.failures.len()
+        );
+        for failure in &report.failures {
+            errln!(
+                streams,
+                "Could not move {}: {}",
+                terminal_safe(failure.source.display()),
+                terminal_safe(&failure.error)
+            );
+        }
+    } else {
+        emit(
+            output,
+            &serde_json::json!({
+                "operation": "move",
+                "moved": report.moved,
+                "failures": report.failures.iter().map(|failure| serde_json::json!({
+                    "source": failure.source,
+                    "error": failure.error,
+                })).collect::<Vec<_>>(),
+            }),
+        )?;
+    }
+    Ok(if report.failures.is_empty() {
+        Outcome::Success
+    } else {
+        Outcome::Partial
+    })
+}
+
+fn migrate(
+    source: MigrateSource,
+    config: &Config,
+    output: OutputFormat,
+    streams: &mut Streams<'_>,
+) -> CliResult<Outcome> {
+    match source {
+        MigrateSource::Beets {
+            beets_library,
+            beets_config,
+            music_directory,
+            output_database,
+            output_config,
+            dry_run,
+            yes,
+        } => migrate_beets(
+            config,
+            &beets_library,
+            beets_config.as_deref(),
+            music_directory.as_deref(),
+            output_database.as_deref(),
+            output_config.as_deref(),
+            dry_run,
+            yes,
+            output,
+            streams,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn migrate_beets(
+    config: &Config,
+    beets_library: &std::path::Path,
+    beets_config: Option<&std::path::Path>,
+    music_directory: Option<&std::path::Path>,
+    output_database: Option<&std::path::Path>,
+    output_config: Option<&std::path::Path>,
+    dry_run: bool,
+    yes: bool,
+    output: OutputFormat,
+    streams: &mut Streams<'_>,
+) -> CliResult<Outcome> {
+    let output_database = output_database.map_or_else(
+        || config.library.database.clone(),
+        std::path::Path::to_path_buf,
+    );
+    if output_database.exists() || output_database.is_symlink() {
+        return Err(Error::Config(format!(
+            "migration output database already exists: {}",
+            output_database.display()
+        ))
+        .into());
+    }
+    if output_config.is_some_and(|path| path.exists() || path.is_symlink()) {
+        return Err(Error::Config("migration output config already exists".into()).into());
+    }
+    let migration = rsbts::beets::BeetsMigration::read(
+        beets_library,
+        beets_config,
+        music_directory,
+        output_database.clone(),
+    )?;
+    migration.validate_in_memory()?;
+    let preview = serde_json::json!({
+        "operation": "migrate-beets",
+        "albums": migration.report.albums,
+        "album_tracks": migration.report.album_tracks,
+        "singletons": migration.report.singletons,
+        "external_ids": migration.report.external_ids,
+        "flexible_fields": migration.report.flexible_fields,
+        "missing_files": migration.report.missing_files,
+        "warnings": migration.report.warnings,
+        "output_database": output_database,
+        "output_config": output_config,
+        "dry_run": dry_run,
+    });
+    if output == OutputFormat::Text {
+        outln!(
+            streams,
+            "Beets migration plan: {} album(s), {} album track(s), {} singleton(s), {} external ID(s), {} flexible field(s), {} missing file(s)",
+            migration.report.albums,
+            migration.report.album_tracks,
+            migration.report.singletons,
+            migration.report.external_ids,
+            migration.report.flexible_fields,
+            migration.report.missing_files,
+        );
+        for warning in &migration.report.warnings {
+            errln!(streams, "Migration warning: {}", terminal_safe(warning));
+        }
+    } else {
+        emit(output, &preview)?;
+    }
+    if dry_run {
+        if output == OutputFormat::Text {
+            outln!(streams, "Dry run: no output files created");
+        }
+        return Ok(if migration.report.warnings.is_empty() {
+            Outcome::Success
+        } else {
+            Outcome::Partial
+        });
+    }
+    if !yes
+        && !Confirm::new()
+            .with_prompt("Create the new rsbts database from this Beets library?")
+            .default(false)
+            .interact()
+            .map_err(|error| Error::Import(format!("cannot read confirmation: {error}")))?
+    {
+        outln!(streams, "Cancelled; no output files created");
+        return Ok(Outcome::Partial);
+    }
+    let parent = output_database
+        .parent()
+        .ok_or_else(|| Error::Config("migration output database has no parent directory".into()))?;
+    std::fs::create_dir_all(parent).map_err(Error::from)?;
+    let name = output_database
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| Error::Config("migration database filename is not valid UTF-8".into()))?;
+    let temporary = parent.join(format!(
+        ".{name}.rsbts-migrate-{}.tmp",
+        uuid::Uuid::new_v4()
+    ));
+    let import_result = (|| -> Result<()> {
+        let mut library = Library::open(&temporary)?;
+        library.import_migrated_groups(&migration.groups)?;
+        let expected = migration.report.album_tracks + migration.report.singletons;
+        if usize::try_from(library.stats()?.tracks).ok() != Some(expected) {
+            return Err(Error::Recovery(
+                "migrated track count changed before finalization".into(),
+            ));
+        }
+        drop(library);
+        std::fs::hard_link(&temporary, &output_database)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        std::fs::remove_file(&temporary)?;
+        if let Some(output_config) = output_config {
+            rsbts::beets::write_config_create_new(&migration.translated_config, output_config)?;
+        }
+        Ok(())
+    })();
+    if import_result.is_err() && temporary.exists() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    import_result?;
+    if output == OutputFormat::Text {
+        outln!(
+            streams,
+            "Created migrated rsbts database: {}",
+            terminal_safe(output_database.display())
+        );
+    }
+    Ok(if migration.report.warnings.is_empty() {
+        Outcome::Success
+    } else {
+        Outcome::Partial
+    })
+}
+
 fn remove(
     library: &mut Library,
     raw_query: &str,
@@ -1055,7 +1619,8 @@ fn remove(
     dry_run: bool,
     yes: bool,
     output: OutputFormat,
-) -> Result<Outcome> {
+    streams: &mut Streams<'_>,
+) -> CliResult<Outcome> {
     require_selection(raw_query, "removal")?;
     let query = Query::parse(raw_query)?;
     let plan = RemovalPlan::build(library, &query, delete)?;
@@ -1160,7 +1725,12 @@ fn purge(library: &mut Library, older_than_days: u64, dry_run: bool, yes: bool) 
     })
 }
 
-fn modify(library: &Library, raw_query: &str, fields: &[String]) -> Result<Outcome> {
+fn modify(
+    library: &Library,
+    raw_query: &str,
+    fields: &[String],
+    streams: &mut Streams<'_>,
+) -> CliResult<Outcome> {
     require_selection(raw_query, "modify")?;
     let query = Query::parse(raw_query)?;
     let items = library.query_items_bounded(&query, 9_999)?;
@@ -1679,19 +2249,18 @@ fn confirm(prompt: &str) -> Result<bool> {
 }
 
 fn emit<T: serde::Serialize>(output: OutputFormat, value: &T) -> Result<()> {
-    let stdout = std::io::stdout();
-    let mut lock = stdout.lock();
-    match output {
+    let mut bytes = match output {
         OutputFormat::Text => {
             return Err(Error::Operation(
                 "internal error: structured emitter used for text output".into(),
             ));
         }
-        OutputFormat::Json => serde_json::to_writer_pretty(&mut lock, value)?,
-        OutputFormat::Jsonl => serde_json::to_writer(&mut lock, value)?,
-    }
-    lock.write_all(b"\n")?;
-    Ok(())
+        OutputFormat::Json => serde_json::to_vec_pretty(value)?,
+        OutputFormat::Jsonl => serde_json::to_vec(value)?,
+    };
+    bytes.push(b'\n');
+    let stdout = std::io::stdout();
+    stdout.lock().write_all(&bytes).map_err(Error::Stdout)
 }
 
 fn parse_query(query: Option<&str>) -> Result<Query> {

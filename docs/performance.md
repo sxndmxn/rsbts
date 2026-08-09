@@ -16,7 +16,7 @@ this command on every change.
 
 ## Dataset and measurements
 
-The generator creates a schema-v9 catalog containing:
+The generator creates a schema-v10 catalog containing:
 
 - 1,000,000 tracks in 10,000 albums, with 100 tracks per album;
 - 10,000 distinct artist labels;
@@ -44,10 +44,10 @@ database and WAL were placed on the Btrfs filesystem; the page cache was warm.
 
 | Measurement | p95/result | Threshold |
 |---|---:|---:|
-| Current-schema read-only open | 117.655 ms | < 250 ms |
-| 100-row keyset browse | 0.428 ms | < 200 ms |
-| Exact cached statistics | 0.014 ms | < 1,000 ms |
-| Read-only removal-preview RSS | 7.184 MiB | < 128 MiB |
+| Current-schema read-only open | 1.694 ms | < 250 ms |
+| 100-row keyset browse | 0.462 ms | < 200 ms |
+| Exact cached statistics | 0.012 ms | < 1,000 ms |
+| Read-only removal-preview RSS | 7.801 MiB | < 128 MiB |
 
 The benchmark JSON schema is `rsbts-scale-benchmark-v1`. Hardware-dependent
 results must always be published with the command, dataset size, filesystem,

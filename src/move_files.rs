@@ -3,9 +3,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::db::{
-    file_identity, hash_path, remove_file_synced, JournalFile, Library, OperationKind,
-};
+use crate::asset::digest_file;
+use crate::db::{file_identity, JournalFile, Library, OperationKind};
 use crate::import::{stage_relocation, PlannedTrack, SourceFingerprint};
 use crate::pathformat::format_relative_path;
 use crate::query::Query;
@@ -57,7 +56,8 @@ impl MovePlan {
                 )));
             }
             let modified = metadata.modified()?;
-            let content_hash = hash_path(&source)?;
+            let digests = digest_file(&source)?;
+            let content_hash = digests.blake3().to_owned();
             item.path.clone_from(&destination);
             tracks.push(PlannedTrack {
                 source,
@@ -66,6 +66,7 @@ impl MovePlan {
                     size: metadata.len(),
                     modified,
                     content_hash,
+                    sha256: digests.sha256().to_owned(),
                     identity: file_identity(&metadata),
                 },
                 item,
@@ -127,6 +128,7 @@ impl<'a> MoveExecutor<'a> {
             staged,
             destination: track.destination.clone(),
             content_hash: Some(track.fingerprint.content_hash.clone()),
+            sha256: Some(track.fingerprint.sha256.clone()),
             source_identity: Some(track.fingerprint.identity.clone()),
             owned_identity: None,
             role: "track".into(),
@@ -149,21 +151,17 @@ impl<'a> MoveExecutor<'a> {
                 item_id,
                 &track.source,
                 &track.destination,
+                &self.library_dir,
             )?;
             committed = true;
             self.library
                 .set_operation_state(&operation_id, "cleanup-pending", None)?;
-            let metadata = std::fs::metadata(&track.source)?;
-            if file_identity(&metadata) != track.fingerprint.identity
-                || hash_path(&track.source)? != track.fingerprint.content_hash
-            {
-                return Err(Error::Recovery(format!(
-                    "move source changed before cleanup: {}",
-                    track.source.display()
-                )));
+            let recovery = self.library.recover_pending()?;
+            if recovery.unresolved.is_empty() {
+                Ok(())
+            } else {
+                Err(Error::Recovery(recovery.unresolved.join("; ")))
             }
-            remove_file_synced(&track.source)?;
-            self.library.complete_operation(&operation_id)
         })();
         if let Err(error) = result {
             let state = if committed {
@@ -209,6 +207,7 @@ mod tests {
     use crate::db::OperationKind;
     use crate::{AudioFormat, ExtendedMetadata, Item};
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn moves_managed_files_and_updates_the_catalog_path() -> Result<()> {
         let temporary = tempfile::tempdir()?;
@@ -259,6 +258,7 @@ mod tests {
         assert!(!source.exists());
         assert_eq!(std::fs::read(&destination)?, b"audio");
         assert_eq!(library.query_items(&Query::all())?[0].path, destination);
+        assert!(library.audit()?.issues().is_empty());
         Ok(())
     }
 }

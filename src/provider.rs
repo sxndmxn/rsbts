@@ -260,13 +260,6 @@ pub trait MetadataProvider: Send + Sync {
         Ok(Vec::new())
     }
 
-    async fn lookup_release(&self, _release_id: &str) -> Result<ReleaseCandidate> {
-        Err(crate::Error::Provider(format!(
-            "{} does not support release lookup",
-            self.name()
-        )))
-    }
-
     async fn lookup_track(&self, _track_id: &str) -> Result<TrackCandidate> {
         Err(crate::Error::Provider(format!(
             "{} does not support track lookup",
@@ -275,6 +268,22 @@ pub trait MetadataProvider: Send + Sync {
     }
 
     async fn fetch_cover_art(&self, release_id: &str) -> Result<Option<Vec<u8>>>;
+
+    async fn fetch_cover_art_for(
+        &self,
+        provider_name: &str,
+        release_id: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        if provider_name == self.name() {
+            self.fetch_cover_art(release_id).await
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn take_warnings(&self) -> Vec<String> {
+        Vec::new()
+    }
 
     /// Fetch typed artwork and provenance. Implementations may return several roles.
     async fn fetch_artwork(&self, release_id: &str) -> Result<Vec<ArtworkCandidate>> {

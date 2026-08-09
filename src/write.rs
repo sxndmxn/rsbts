@@ -1,20 +1,11 @@
-//! Previewed, journaled, explicit audio-tag writes.
+//! Previewed, approved, journaled audio-tag projections.
 
-use std::fs::OpenOptions;
-use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use chrono::{DateTime, Utc};
-use lofty::config::WriteOptions;
-use lofty::file::{AudioFile, TaggedFileExt};
-use lofty::probe::Probe;
-use lofty::tag::{Accessor, ItemKey, ItemValue, Tag, TagItem};
-
-use crate::db::{
-    file_identity, hash_path, remove_file_synced, sync_directory, JournalFile, Library,
-    OperationKind,
-};
+use crate::db::{file_identity, hash_path, Library};
 use crate::query::Query;
+use crate::tag_projection::TagProjectionExecutor;
+use crate::tags::{CanonicalTags, TagProfile};
 use crate::{Error, Item, Result};
 
 #[derive(Debug, Clone)]
@@ -95,181 +86,112 @@ impl<'a> TagWriteExecutor<'a> {
             .item
             .id
             .ok_or_else(|| Error::Import("tag-write item has no database ID".into()))?;
-        let operation_uuid = uuid::Uuid::new_v4();
-        let rewritten = sibling_path(&plan.item.path, operation_uuid, "write")?;
-        let backup = sibling_path(&plan.item.path, operation_uuid, "backup")?;
-        let journal = JournalFile {
-            source: plan.item.path.clone(),
-            staged: backup.clone(),
-            destination: rewritten.clone(),
-            content_hash: None,
-            source_identity: Some(plan.source_identity.clone()),
-            owned_identity: None,
-            role: "tag-write".into(),
-            state: "prepared".into(),
-        };
-        let operation_id = self
-            .library
-            .create_operation(OperationKind::TagWrite, &[journal])?;
-        let result = self.perform_write(&operation_id, plan, &rewritten, &backup, item_id);
-        if let Err(error) = result {
-            // Preserve the last durable journal state. In particular, a failure
-            // while removing the backup happens after the database commit; if
-            // that state were overwritten with `failed`, recovery would treat
-            // the write as uncommitted and incorrectly restore the old file.
-            let recovery = self.library.recover_pending();
-            return match recovery {
-                Ok(report) if report.unresolved.is_empty() => Err(error),
-                Ok(report) => Err(Error::Recovery(format!(
-                    "{error}; tag-write rollback needs attention: {}",
-                    report.unresolved.join("; ")
-                ))),
-                Err(recovery_error) => Err(Error::Recovery(format!(
-                    "{error}; tag-write rollback failed: {recovery_error}"
-                ))),
-            };
-        }
-        Ok(())
-    }
-
-    fn perform_write(
-        &mut self,
-        operation_id: &str,
-        plan: &PlannedTagWrite,
-        rewritten: &Path,
-        backup: &Path,
-        item_id: i64,
-    ) -> Result<()> {
-        self.library
-            .set_operation_state(operation_id, "staging", None)?;
-        copy_new(&plan.item.path, rewritten)?;
-        std::fs::set_permissions(rewritten, std::fs::metadata(&plan.item.path)?.permissions())?;
-        write_item_tags(rewritten, &plan.item)?;
-        verify_written_tags(rewritten, &plan.item)?;
-        let rewritten_metadata = std::fs::symlink_metadata(rewritten)?;
-        let rewritten_identity = file_identity(&rewritten_metadata);
-        self.library
-            .set_staged_file_identity(operation_id, 0, &rewritten_identity)?;
-
-        validate_source(plan)?;
-        std::fs::hard_link(&plan.item.path, backup)?;
-        sync_parent(&plan.item.path)?;
-        self.library
-            .set_file_state(operation_id, 0, "quarantined")?;
-        remove_file_synced(&plan.item.path)?;
-        std::fs::hard_link(rewritten, &plan.item.path)?;
-        sync_parent(&plan.item.path)?;
-        remove_file_synced(rewritten)?;
-        self.library.set_file_state(operation_id, 0, "finalized")?;
-
-        let final_metadata = std::fs::metadata(&plan.item.path)?;
-        if file_identity(&final_metadata) != rewritten_identity {
-            return Err(Error::Recovery(format!(
-                "rewritten file identity changed during finalization: {}",
-                plan.item.path.display()
-            )));
-        }
-        let modified: DateTime<Utc> = final_metadata.modified()?.into();
-        self.library.commit_tag_write(
-            operation_id,
+        let projection = self.library.plan_tag_projection(
             item_id,
-            &plan.item.path,
-            final_metadata.len(),
-            modified,
+            canonical_tags(&plan.item)?,
+            TagProfile::ArchivalNativeRich,
         )?;
-        let backup_metadata = std::fs::symlink_metadata(backup)?;
-        if file_identity(&backup_metadata) != plan.source_identity {
-            return Err(Error::Recovery(format!(
-                "tag-write backup identity changed: {}",
-                backup.display()
-            )));
-        }
-        remove_file_synced(backup)?;
-        self.library.complete_operation(operation_id)
+        self.library.approve_tag_projection(&projection)?;
+        TagProjectionExecutor::new(self.library)
+            .execute(&projection)
+            .map(|_receipt| ())
     }
 }
 
-fn write_item_tags(path: &Path, item: &Item) -> Result<()> {
-    let mut tagged = Probe::open(path)?.read()?;
-    if tagged.primary_tag().is_none() {
-        tagged.insert_tag(Tag::new(tagged.primary_tag_type()));
-    }
-    let tag = tagged.primary_tag_mut().ok_or_else(|| {
-        Error::Import(format!("cannot create a writable tag: {}", path.display()))
-    })?;
-    tag.set_title(item.title.clone());
-    tag.set_artist(item.artist.clone());
-    tag.set_album(item.album.clone());
-    if let Some(albumartist) = &item.albumartist {
-        tag.insert(TagItem::new(
-            ItemKey::AlbumArtist,
-            ItemValue::Text(albumartist.clone()),
-        ));
+fn canonical_tags(item: &Item) -> Result<CanonicalTags> {
+    let artists = if item.extended.artists.is_empty() {
+        vec![item.artist.clone()]
     } else {
-        tag.remove_key(ItemKey::AlbumArtist);
-    }
-    if let Some(genre) = &item.genre {
-        tag.set_genre(genre.clone());
+        item.extended.artists.clone()
+    };
+    let album_artists = if item.extended.album_artists.is_empty() {
+        vec![item
+            .albumartist
+            .clone()
+            .unwrap_or_else(|| item.artist.clone())]
     } else {
-        tag.remove_genre();
-    }
-    if let Some(track) = item.track {
-        tag.set_track(track);
+        item.extended.album_artists.clone()
+    };
+    let genres = if item.extended.genres.is_empty() {
+        item.genre.iter().cloned().collect()
     } else {
-        tag.remove_track();
-    }
-    if let Some(total) = item.extended.track_total {
-        tag.set_track_total(total);
-    } else {
-        tag.remove_track_total();
-    }
-    if let Some(disc) = item.disc {
-        tag.set_disk(disc);
-    } else {
-        tag.remove_disk();
-    }
-    if let Some(total) = item.extended.disc_total {
-        tag.set_disk_total(total);
-    } else {
-        tag.remove_disk_total();
-    }
-    if let Some(year) = item.year.and_then(|year| u16::try_from(year).ok()) {
-        tag.set_date(lofty::tag::items::Timestamp {
-            year,
-            month: item.extended.date.month,
-            day: item.extended.date.day,
-            hour: None,
-            minute: None,
-            second: None,
-        });
-    } else {
-        tag.remove_date();
-    }
-    tagged.save_to_path(path, WriteOptions::default())?;
-    let mut output = OpenOptions::new().write(true).open(path)?;
-    output.flush()?;
-    output.sync_all()?;
-    Ok(())
-}
-
-fn verify_written_tags(path: &Path, expected: &Item) -> Result<()> {
-    let actual = crate::tags::read_tags(path)?;
-    if actual.title != expected.title
-        || actual.artist != expected.artist
-        || actual.album != expected.album
-        || actual.albumartist != expected.albumartist
-        || actual.genre != expected.genre
-        || actual.year != expected.year
-        || actual.track != expected.track
-        || actual.disc != expected.disc
+        item.extended.genres.clone()
+    };
+    let recording_date = partial_date_text(&item.extended.date)
+        .or_else(|| item.year.map(|year| format!("{year:04}")));
+    let mut tags = CanonicalTags::new(&item.title, artists, &item.album, album_artists)?
+        .with_positions(
+            item.track.map(|number| (number, item.extended.track_total)),
+            item.disc.map(|number| (number, item.extended.disc_total)),
+        )?
+        .with_dates(
+            recording_date,
+            partial_date_text(&item.extended.original_date),
+        )?
+        .with_release_facts(
+            item.extended.label.iter().cloned().collect(),
+            item.extended.catalog_number.iter().cloned().collect(),
+            item.extended.country.clone(),
+            item.extended.media.clone(),
+            None,
+        )?
+        .with_genres(genres)?
+        .with_classical(
+            item.extended.composers.clone(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            None,
+        )?;
+    let mut recordings = Vec::new();
+    let mut release_tracks = Vec::new();
+    let mut releases = Vec::new();
+    let mut release_groups = Vec::new();
+    let mut artist_ids = Vec::new();
+    let mut album_artist_ids = Vec::new();
+    let mut works = Vec::new();
+    for id in item
+        .extended
+        .external_ids
+        .iter()
+        .chain(item.track_external_id.iter())
+        .chain(item.release_external_id.iter())
+        .filter(|id| id.provider() == "musicbrainz")
     {
-        Err(Error::Import(format!(
-            "tag verification failed after writing {}",
-            path.display()
-        )))
-    } else {
-        Ok(())
+        let values = match id.kind() {
+            "recording" | "track" => &mut recordings,
+            "release-track" | "release_track" => &mut release_tracks,
+            "release" | "legacy" => &mut releases,
+            "release-group" | "release_group" => &mut release_groups,
+            "artist" => &mut artist_ids,
+            "album-artist" => &mut album_artist_ids,
+            "work" => &mut works,
+            _ => continue,
+        };
+        if !values.iter().any(|value| value == id.value()) {
+            values.push(id.value().to_owned());
+        }
     }
+    tags = tags.with_musicbrainz_ids(
+        recordings,
+        release_tracks,
+        releases,
+        release_groups,
+        artist_ids,
+        album_artist_ids,
+        works,
+    )?;
+    Ok(tags)
+}
+
+fn partial_date_text(date: &crate::PartialDate) -> Option<String> {
+    date.year.map(|year| match (date.month, date.day) {
+        (Some(month), Some(day)) => format!("{year:04}-{month:02}-{day:02}"),
+        (Some(month), None) => format!("{year:04}-{month:02}"),
+        _ => format!("{year:04}"),
+    })
 }
 
 fn validate_source(plan: &PlannedTagWrite) -> Result<()> {
@@ -290,41 +212,12 @@ fn validate_source(plan: &PlannedTagWrite) -> Result<()> {
     }
 }
 
-fn copy_new(source: &Path, destination: &Path) -> Result<()> {
-    let mut input = std::fs::File::open(source)?;
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(destination)?;
-    std::io::copy(&mut input, &mut output)?;
-    output.sync_all()?;
-    Ok(())
-}
-
-fn sibling_path(path: &Path, id: uuid::Uuid, role: &str) -> Result<PathBuf> {
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| Error::Import("tag-write filename is not valid UTF-8".into()))?;
-    let extension = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or("audio");
-    Ok(path.with_file_name(format!(".{name}.rsbts-{id}.{role}.{extension}")))
-}
-
-fn sync_parent(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        sync_directory(parent)?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::OperationKind;
     use crate::{AudioFormat, ExtendedMetadata, PartialDate};
+    use chrono::Utc;
 
     fn minimal_wav() -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -344,11 +237,13 @@ mod tests {
         bytes
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn explicit_write_replaces_tags_and_commits_the_new_fingerprint() -> Result<()> {
         let temporary = tempfile::tempdir()?;
         let path = temporary.path().join("single.wav");
         std::fs::write(&path, minimal_wav())?;
+        let original = std::fs::read(&path)?;
         let metadata = std::fs::metadata(&path)?;
         let extended = ExtendedMetadata {
             date: PartialDate {
@@ -406,9 +301,11 @@ mod tests {
         assert_ne!(file_identity(&std::fs::metadata(&path)?), before_identity);
         let stored = library.query_items(&Query::all())?;
         assert_eq!(stored[0].file_size, Some(std::fs::metadata(&path)?.len()));
-        assert!(std::fs::read_dir(temporary.path())?
+        let retained = std::fs::read_dir(temporary.path())?
             .filter_map(std::result::Result::ok)
-            .all(|entry| !entry.file_name().to_string_lossy().contains(".rsbts-")));
+            .find(|entry| entry.file_name().to_string_lossy().contains("tag-original"))
+            .ok_or_else(|| Error::Recovery("tag write did not retain its original".into()))?;
+        assert_eq!(std::fs::read(retained.path())?, original);
         Ok(())
     }
 }

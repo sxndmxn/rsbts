@@ -3,6 +3,15 @@
 Status: proposed architecture, based on `codex/plugin-free-beets-core` at
 `077c46e` and Beets 2.11.0 at `26ab6b26361e8c9d77cdf04ba9cf5ca64bbbc722`.
 
+> Relationship to the current product: this is a non-normative compatibility
+> roadmap and historical critique. The implemented 0.4 contract is
+> [docs/media-library-requirements.md](docs/media-library-requirements.md), with
+> its research basis beside it in
+> [docs/media-library-research.md](docs/media-library-research.md). Where this
+> roadmap proposes a different path model, database ownership model, plugin
+> scope, or safety tradeoff, the numbered requirements and release gates take
+> precedence until they are explicitly revised.
+
 ## Product contract
 
 rsbts is a Rust implementation of the Beets 2.11 command-line application and
@@ -440,4 +449,3 @@ startup regression is removed.
   and Unix [`OsStrExt`](https://doc.rust-lang.org/std/os/unix/ffi/trait.OsStrExt.html).
 - [SQLite WAL documentation](https://www.sqlite.org/wal.html), used to avoid
   treating WAL as an unconditional optimization.
-

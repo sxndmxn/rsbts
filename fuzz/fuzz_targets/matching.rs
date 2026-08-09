@@ -4,7 +4,7 @@ use chrono::Utc;
 use libfuzzer_sys::fuzz_target;
 use rsbts::import::assign_release_tracks;
 use rsbts::provider::ProviderTrack;
-use rsbts::{AudioFormat, Item};
+use rsbts::{AudioFormat, ExtendedMetadata, Item};
 
 fuzz_target!(|data: &[u8]| {
     let count = data.first().map_or(0, |value| usize::from(*value % 32));
@@ -29,6 +29,8 @@ fuzz_target!(|data: &[u8]| {
             release_external_id: None,
             added: Utc::now(),
             mtime: Utc::now(),
+            singleton: false,
+            extended: ExtendedMetadata::default(),
         })
         .collect::<Vec<_>>();
     let tracks = (0..count)

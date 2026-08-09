@@ -7,7 +7,7 @@ use rusqlite::{Connection, DatabaseName, TransactionBehavior};
 
 use crate::{Error, Result};
 
-pub const LATEST_VERSION: u32 = 9;
+pub const LATEST_VERSION: u32 = 10;
 
 pub struct Migration {
     pub version: u32,
@@ -29,26 +29,30 @@ pub const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 4,
-        sql: include_str!("migrations/004_asset_ownership.sql"),
+        sql: include_str!("migrations/004_core_metadata.sql"),
     },
     Migration {
         version: 5,
-        sql: include_str!("migrations/005_canonical_catalog.sql"),
+        sql: include_str!("migrations/004_asset_ownership.sql"),
     },
     Migration {
         version: 6,
-        sql: include_str!("migrations/006_operations_and_preservation.sql"),
+        sql: include_str!("migrations/005_canonical_catalog.sql"),
     },
     Migration {
         version: 7,
-        sql: include_str!("migrations/007_fixity_scheduling.sql"),
+        sql: include_str!("migrations/006_operations_and_preservation.sql"),
     },
     Migration {
         version: 8,
-        sql: include_str!("migrations/008_ancillary_assets.sql"),
+        sql: include_str!("migrations/007_fixity_scheduling.sql"),
     },
     Migration {
         version: 9,
+        sql: include_str!("migrations/008_ancillary_assets.sql"),
+    },
+    Migration {
+        version: 10,
         sql: include_str!("migrations/009_constant_time_statistics.sql"),
     },
 ];
@@ -64,7 +68,6 @@ pub fn run_migrations(
     conn: &mut Connection,
     database_path: Option<&Path>,
 ) -> Result<MigrationReport> {
-    verify_foreign_keys(conn)?;
     let had_schema = table_exists(conn, "items")?;
     let had_tracking = table_exists(conn, "_migrations")?;
     let recorded_version = if had_tracking {
@@ -96,10 +99,6 @@ pub fn run_migrations(
     let from_version = current;
     let needs_migration = current < LATEST_VERSION || recorded_version == 0;
 
-    if needs_migration && current > 0 {
-        verify_integrity(conn, "before migration")?;
-    }
-
     // A current, tracked schema needs no writes and no deep scan. Full integrity and
     // foreign-key checks are intentionally owned by explicit audit and real migrations.
     if had_tracking && current == LATEST_VERSION {
@@ -125,6 +124,8 @@ pub fn run_migrations(
     } else {
         None
     };
+
+    normalize_legacy_core_metadata_table(conn, current)?;
 
     ensure_tracking_table(conn)?;
     if recorded_version == 0 && current > 0 {
@@ -163,6 +164,10 @@ pub fn run_migrations(
     })
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "schema fingerprinting intentionally keeps every supported historical shape explicit"
+)]
 fn detect_untracked_version(conn: &Connection) -> Result<u32> {
     let has_journal = table_exists(conn, "operation_journal")?;
     let has_assets = table_exists(conn, "assets")?
@@ -175,10 +180,12 @@ fn detect_untracked_version(conn: &Connection) -> Result<u32> {
         has_journal && column_exists(conn, "operation_files", "owned_identity")?;
     let has_singleton = column_exists(conn, "items", "singleton")?;
     let has_entity_metadata = table_exists(conn, "entity_metadata")?;
-    let has_external_ids = table_exists(conn, "external_ids")?;
+    let has_external_ids = table_exists(conn, "library_external_ids")?
+        || (table_exists(conn, "external_ids")? && column_exists(conn, "external_ids", "kind")?);
     let v4_markers = [has_singleton, has_entity_metadata, has_external_ids];
-    if v4_markers.into_iter().any(|present| present) {
+    if v4_markers.into_iter().any(|present| present) && !has_assets {
         if v4_markers.into_iter().all(|present| present)
+            && !has_assets
             && has_journal
             && has_source_identity
             && has_owned_identity
@@ -190,6 +197,13 @@ fn detect_untracked_version(conn: &Connection) -> Result<u32> {
                 .into(),
         ));
     }
+    if v4_markers.into_iter().any(|present| present)
+        && !v4_markers.into_iter().all(|present| present)
+    {
+        return Err(Error::Recovery(
+            "database has partial core-metadata tables; refusing to guess a migration".into(),
+        ));
+    }
     if has_journal {
         if has_source_identity
             && has_owned_identity
@@ -199,8 +213,19 @@ fn detect_untracked_version(conn: &Connection) -> Result<u32> {
             && table_exists(conn, "durable_plans")?
             && table_exists(conn, "fixity_schedules")?
             && table_exists(conn, "ancillary_metadata")?
+            && table_exists(conn, "library_statistics")?
         {
-            Ok(8)
+            Ok(10)
+        } else if has_source_identity
+            && has_owned_identity
+            && has_assets
+            && table_exists(conn, "release_groups")?
+            && table_exists(conn, "metadata_claims")?
+            && table_exists(conn, "durable_plans")?
+            && table_exists(conn, "fixity_schedules")?
+            && table_exists(conn, "ancillary_metadata")?
+        {
+            Ok(9)
         } else if has_source_identity
             && has_owned_identity
             && has_assets
@@ -209,7 +234,7 @@ fn detect_untracked_version(conn: &Connection) -> Result<u32> {
             && table_exists(conn, "durable_plans")?
             && table_exists(conn, "fixity_schedules")?
         {
-            Ok(7)
+            Ok(8)
         } else if has_source_identity
             && has_owned_identity
             && has_assets
@@ -217,16 +242,16 @@ fn detect_untracked_version(conn: &Connection) -> Result<u32> {
             && table_exists(conn, "metadata_claims")?
             && table_exists(conn, "durable_plans")?
         {
-            Ok(6)
+            Ok(7)
         } else if has_source_identity
             && has_owned_identity
             && has_assets
             && table_exists(conn, "release_groups")?
             && table_exists(conn, "metadata_claims")?
         {
-            Ok(5)
+            Ok(6)
         } else if has_source_identity && has_owned_identity && has_assets {
-            Ok(4)
+            Ok(5)
         } else if has_source_identity && has_owned_identity && !has_assets {
             Ok(3)
         } else if !has_source_identity
@@ -257,6 +282,22 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     conn.query_row(&sql, [column], |row| row.get::<_, u64>(0))
         .map(|count| count > 0)
         .map_err(Into::into)
+}
+
+fn normalize_legacy_core_metadata_table(conn: &Connection, current: u32) -> Result<()> {
+    if current != 4
+        || !table_exists(conn, "external_ids")?
+        || !column_exists(conn, "external_ids", "kind")?
+    {
+        return Ok(());
+    }
+    if table_exists(conn, "library_external_ids")? {
+        return Err(Error::Recovery(
+            "database contains both legacy and current library external-ID tables".into(),
+        ));
+    }
+    conn.execute_batch("ALTER TABLE external_ids RENAME TO library_external_ids")?;
+    Ok(())
 }
 
 pub fn current_version(conn: &Connection) -> Result<u32> {
@@ -305,6 +346,12 @@ fn verify_schema_version(conn: &Connection, version: u32) -> Result<()> {
         || (column_exists(conn, "operation_files", "source_identity")?
             && column_exists(conn, "operation_files", "owned_identity")?);
     let v4 = version < 4
+        || (column_exists(conn, "items", "singleton")?
+            && table_exists(conn, "entity_metadata")?
+            && (table_exists(conn, "library_external_ids")?
+                || (table_exists(conn, "external_ids")?
+                    && column_exists(conn, "external_ids", "kind")?)));
+    let v5 = version < 5
         || (table_exists(conn, "library_roots")?
             && table_exists(conn, "assets")?
             && table_exists(conn, "item_assets")?
@@ -313,7 +360,7 @@ fn verify_schema_version(conn: &Connection, version: u32) -> Result<()> {
             && column_exists(conn, "operation_journal", "completed_at")?
             && column_exists(conn, "operation_files", "sha256")?
             && column_exists(conn, "operation_files", "asset_id")?);
-    let v5 = version < 5
+    let v6 = version < 6
         || (table_exists(conn, "release_groups")?
             && table_exists(conn, "releases")?
             && table_exists(conn, "media")?
@@ -328,7 +375,7 @@ fn verify_schema_version(conn: &Connection, version: u32) -> Result<()> {
             && column_exists(conn, "albums", "canonical_release_id")?
             && column_exists(conn, "items", "release_track_id")?
             && column_exists(conn, "items", "recording_id")?);
-    let v6 = version < 6
+    let v7 = version < 7
         || (table_exists(conn, "durable_plans")?
             && table_exists(conn, "plan_events")?
             && table_exists(conn, "fixity_runs")?
@@ -342,15 +389,15 @@ fn verify_schema_version(conn: &Connection, version: u32) -> Result<()> {
             && table_exists(conn, "recording_assets")?
             && column_exists(conn, "operation_journal", "plan_id")?
             && column_exists(conn, "operation_files", "root_id")?);
-    let v7 = version < 7
+    let v8 = version < 8
         || (table_exists(conn, "fixity_schedules")?
             && column_exists(conn, "fixity_runs", "schedule_id")?);
-    let v8 = version < 8 || table_exists(conn, "ancillary_metadata")?;
-    let v9 = version < 9
+    let v9 = version < 9 || table_exists(conn, "ancillary_metadata")?;
+    let v10 = version < 10
         || (table_exists(conn, "library_statistics")?
             && table_exists(conn, "statistics_album_members")?
             && table_exists(conn, "statistics_artist_members")?);
-    if v1 && v2 && v3 && v4 && v5 && v6 && v7 && v8 && v9 {
+    if v1 && v2 && v3 && v4 && v5 && v6 && v7 && v8 && v9 && v10 {
         Ok(())
     } else {
         Err(Error::Recovery(format!(
@@ -361,7 +408,6 @@ fn verify_schema_version(conn: &Connection, version: u32) -> Result<()> {
 
 /// Validate that a read-only connection already uses the current schema.
 pub fn validate_current_schema(conn: &Connection) -> Result<MigrationReport> {
-    verify_foreign_keys(conn)?;
     let version = current_version(conn)?;
     if version != LATEST_VERSION {
         return Err(Error::Recovery(format!(
@@ -579,6 +625,57 @@ mod tests {
             "operation_files",
             "owned_identity"
         )?);
+        Ok(())
+    }
+
+    #[test]
+    fn upgrades_the_tracked_upstream_v4_external_id_table_without_data_loss() -> Result<()> {
+        let mut connection = Connection::open_in_memory()?;
+        connection.execute_batch(include_str!("migrations/001_initial.sql"))?;
+        connection.execute_batch(include_str!("migrations/002_safety.sql"))?;
+        connection.execute_batch(include_str!("migrations/003_source_identity.sql"))?;
+        connection.execute(
+            "INSERT INTO albums
+             (album, albumartist, added, metadata_provider, external_release_id)
+             VALUES ('Album', 'Artist', '2024-01-01T00:00:00Z', 'discogs', '123')",
+            [],
+        )?;
+        let album_id = connection.last_insert_rowid();
+        connection.execute(
+            "INSERT INTO items
+             (album_id, path, title, artist, album, format, bitrate, length, added, mtime,
+              metadata_provider, external_track_id, external_release_id)
+             VALUES (?1, '/legacy.flac', 'Track', 'Artist', 'Album', 'FLAC', 1, 1,
+                     '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z',
+                     'musicbrainz', '00000000-0000-0000-0000-000000000001',
+                     '00000000-0000-0000-0000-000000000002')",
+            [album_id],
+        )?;
+        let legacy_core = include_str!("migrations/004_core_metadata.sql")
+            .replace("library_external_ids", "external_ids")
+            .replace("idx_external_ids_lookup", "idx_legacy_external_ids_lookup");
+        connection.execute_batch(&legacy_core)?;
+        ensure_tracking_table(&connection)?;
+        connection.execute(
+            "INSERT INTO _migrations (version) VALUES (1), (2), (3), (4)",
+            [],
+        )?;
+
+        let report = run_migrations(&mut connection, None)?;
+
+        assert_eq!(report.from_version, 4);
+        assert_eq!(report.to_version, LATEST_VERSION);
+        assert!(table_exists(&connection, "library_external_ids")?);
+        let migrated: u64 = connection.query_row(
+            "SELECT COUNT(*) FROM library_external_ids
+             WHERE provider = 'musicbrainz' AND kind = 'recording'
+               AND value = '00000000-0000-0000-0000-000000000001'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(migrated, 1);
+        assert!(column_exists(&connection, "external_ids", "data_license")?);
+        verify_foreign_keys(&connection)?;
         Ok(())
     }
 

@@ -11,7 +11,8 @@ use tokio::sync::Mutex;
 
 use crate::config::DiscogsConfig;
 use crate::provider::{
-    MetadataProvider, ProviderTrack, ReleaseCandidate, ReleaseQuery, TrackCandidate, TrackQuery,
+    MetadataProvider, ProviderEntityId, ProviderEntityKind, ProviderTrack, ReleaseCandidate,
+    ReleaseQuery, SearchPage, TrackCandidate, TrackQuery,
 };
 use crate::{Error, Result};
 
@@ -174,23 +175,36 @@ impl MetadataProvider for DiscogsProvider {
         "discogs"
     }
 
-    async fn search_releases(
-        &self,
-        query: &ReleaseQuery,
-        limit: u32,
-    ) -> Result<Vec<ReleaseCandidate>> {
+    async fn search_releases(&self, query: &ReleaseQuery, limit: u32) -> Result<SearchPage> {
         let ids = self
             .search_ids(&query.artist, "release_title", &query.album, limit)
             .await?;
+        let requested = ids.len();
         let mut candidates = Vec::new();
-        let count = ids.len().max(1);
+        let mut errors = Vec::new();
+        let count = requested.max(1);
         for (index, id) in ids.into_iter().enumerate() {
-            let release = self.get_release(&id.to_string()).await?;
-            let index = index.to_f64().unwrap_or(f64::MAX);
-            let count = count.to_f64().unwrap_or(f64::MAX);
-            candidates.push(release_candidate(release, 1.0 - index / count));
+            match self.get_release(&id.to_string()).await {
+                Ok(release) => {
+                    let index = index.to_f64().unwrap_or(f64::MAX);
+                    let count = count.to_f64().unwrap_or(f64::MAX);
+                    candidates.push(release_candidate(release, 1.0 - index / count, false));
+                }
+                Err(error) => errors.push(crate::provider::ProviderFailure {
+                    external_id: Some(id.to_string()),
+                    detail: error.to_string(),
+                    retriable: true,
+                }),
+            }
         }
-        Ok(candidates)
+        let resolved = candidates.len();
+        Ok(SearchPage {
+            candidates,
+            requested,
+            resolved,
+            complete: errors.is_empty(),
+            errors,
+        })
     }
 
     async fn search_tracks(&self, query: &TrackQuery, limit: u32) -> Result<Vec<TrackCandidate>> {
@@ -212,8 +226,17 @@ impl MetadataProvider for DiscogsProvider {
         Ok(candidates)
     }
 
-    async fn lookup_release(&self, release_id: &str) -> Result<ReleaseCandidate> {
-        Ok(release_candidate(self.get_release(release_id).await?, 1.0))
+    async fn lookup_release(&self, id: &ProviderEntityId) -> Result<ReleaseCandidate> {
+        if id.provider() != self.name() || id.kind() != ProviderEntityKind::Release {
+            return Err(Error::Provider(
+                "Discogs direct release lookup requires a Discogs release ID".into(),
+            ));
+        }
+        Ok(release_candidate(
+            self.get_release(id.value()).await?,
+            1.0,
+            true,
+        ))
     }
 
     async fn lookup_track(&self, track_id: &str) -> Result<TrackCandidate> {
@@ -256,7 +279,7 @@ impl MetadataProvider for DiscogsProvider {
     }
 }
 
-fn release_candidate(release: Release, provider_score: f64) -> ReleaseCandidate {
+fn release_candidate(release: Release, provider_score: f64, explicit_id: bool) -> ReleaseCandidate {
     let artist = release.artists_sort.clone();
     let release_id = release.id.to_string();
     let tracks = release
@@ -265,12 +288,17 @@ fn release_candidate(release: Release, provider_score: f64) -> ReleaseCandidate 
         .map(|track| {
             let (disc, number) = parse_position(&track.position);
             ProviderTrack {
-                external_id: format!("{}:{}", release.id, track.position),
+                external_id: String::new(),
+                release_track_external_id: Some(format!("{}:{}", release.id, track.position)),
                 title: track.title.clone(),
                 artist: track_artist(track, &artist),
                 number,
+                printed_position: Some(track.position.clone()),
                 disc,
                 length_ms: parse_duration(&track.duration),
+                is_hidden: false,
+                is_data_track: false,
+                pregap_ms: None,
             }
         })
         .collect();
@@ -282,6 +310,10 @@ fn release_candidate(release: Release, provider_score: f64) -> ReleaseCandidate 
         year: release.year,
         provider_score,
         tracks,
+        edition: crate::provider::EditionEvidence {
+            explicit_id,
+            ..crate::provider::EditionEvidence::default()
+        },
     }
 }
 

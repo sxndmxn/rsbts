@@ -52,6 +52,7 @@ loading itself has no side effects.
 rsbts stats
 rsbts import --dry-run ~/Music/Incoming/album
 rsbts import ~/Music/Incoming/album
+rsbts import --in-place ~/Music/Already-Organized/album
 rsbts ls --limit 100
 rsbts audit
 ```
@@ -66,6 +67,30 @@ cp config.example.toml ~/.config/rsbts/config.toml
 Relative paths in an explicit config resolve from that config's directory.
 Missing explicit config files, unknown TOML keys, non-finite thresholds, and
 invalid path templates fail closed.
+
+### Migrating an existing Beets catalog
+
+Migration reads Beets without modifying it, validates the translated catalog in
+memory, and creates a new rsbts database with no-replace finalization. Missing
+files remain cataloged for audit, flexible fields are retained as sourced
+claims, and incompatible configuration is reported as a warning.
+
+```bash
+rsbts migrate beets \
+  --beets-library ~/.config/beets/library.db \
+  --beets-config ~/.config/beets/config.yaml \
+  --output-database ~/.local/share/rsbts/library.db \
+  --output-config ~/.config/rsbts/config.toml \
+  --dry-run
+
+# Remove --dry-run only after reviewing the plan. Both output paths must be new.
+rsbts migrate beets \
+  --beets-library ~/.config/beets/library.db \
+  --beets-config ~/.config/beets/config.yaml \
+  --output-database ~/.local/share/rsbts/library.db \
+  --output-config ~/.config/rsbts/config.toml \
+  --yes
+```
 
 ## Matching and provenance
 
@@ -84,6 +109,11 @@ Provider responses are cached as licensed raw snapshots. Canonical values are
 materialized from immutable claims by an explicit resolution policy; manual
 claims may be locked. Provider refresh produces a reviewable field diff and
 does not rewrite tags or paths.
+
+MusicBrainz is enabled by default. Discogs is an optional built-in provider:
+add `discogs` to `providers.enabled` and supply `RSBTS_DISCOGS_TOKEN`. Direct,
+provider-qualified IDs route only to their owning provider. Partial provider
+results are disclosed and cannot satisfy unattended acceptance gates.
 
 ## Query and machine output
 
@@ -154,6 +184,17 @@ validation where available, and no-clobber publication. Original artwork is
 fully decoded under resource limits and retained content-addressably; player
 derivatives are deterministic sRGB PNGs that are never cropped or upscaled.
 
+```bash
+rsbts write --dry-run 'artist:=Black Sabbath'
+rsbts write --yes 'artist:=Black Sabbath'
+rsbts move --dry-run 'album:=Paranoid'
+rsbts move --yes 'album:=Paranoid'
+```
+
+Explicit tag writes retain the prior file as a verified original. Managed-file
+moves update the root-relative asset identity and both digests in the same
+catalog transaction; recovery never deletes a source whose identity changed.
+
 Capability contract version 2 covers:
 
 - FLAC
@@ -196,9 +237,13 @@ Release artifacts include checksums, CycloneDX SBOM, and GitHub provenance
 attestations. See [RELEASING.md](RELEASING.md) and
 [performance.md](docs/performance.md).
 
-The first stable target is macOS and Linux. The deliberately excluded scope is
-plugins, archive extraction, artwork embedding, transcoding, web/player
-integrations, and Windows support.
+CI compiles and tests supported behavior on Linux, macOS, and Windows. Mutating
+filesystem workflows run only where the capability probe can prove anchored,
+symlink-rejecting, atomic no-clobber semantics; unsupported platforms fail
+closed while read-only catalog behavior remains available. Longer-term Beets
+compatibility work is tracked separately in
+[ARCHITECTURE_ROADMAP.md](ARCHITECTURE_ROADMAP.md) and cannot weaken the
+normative requirements above.
 
 ## License
 

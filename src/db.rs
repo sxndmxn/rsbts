@@ -18,7 +18,10 @@ use crate::migrations::{self, MigrationReport};
 use crate::operations::{append_plan_event, PlanId};
 use crate::query::Query;
 use crate::roots::RootCapabilities;
-use crate::{validate_item_metadata, Album, AudioFormat, Error, ExternalId, Item, Result};
+use crate::{
+    validate_album_metadata, validate_item_metadata, Album, AudioFormat, Error, ExtendedMetadata,
+    ExternalId, FlexibleValue, Item, Result,
+};
 
 pub struct Library {
     pub(crate) conn: Connection,
@@ -229,7 +232,6 @@ pub(crate) enum OperationKind {
     ImportInPlace,
     TagWrite,
     RemoveDelete,
-    TagWrite,
     ManifestWrite,
     RestoreCopy,
     PurgeDelete,
@@ -247,7 +249,6 @@ impl OperationKind {
             Self::ImportInPlace => "import-in-place",
             Self::TagWrite => "tag-write",
             Self::RemoveDelete => "remove-delete",
-            Self::TagWrite => "tag-write",
             Self::ManifestWrite => "manifest-write",
             Self::RestoreCopy => "restore-copy",
             Self::PurgeDelete => "purge-delete",
@@ -265,7 +266,6 @@ impl OperationKind {
             "import-in-place" => Ok(Self::ImportInPlace),
             "tag-write" => Ok(Self::TagWrite),
             "remove-delete" => Ok(Self::RemoveDelete),
-            "tag-write" => Ok(Self::TagWrite),
             "manifest-write" => Ok(Self::ManifestWrite),
             "restore-copy" => Ok(Self::RestoreCopy),
             "purge-delete" => Ok(Self::PurgeDelete),
@@ -1217,6 +1217,78 @@ impl Library {
             .map_err(Into::into)
     }
 
+    /// Import a validated external-library snapshot in one database transaction.
+    pub fn import_migrated_groups(&mut self, groups: &[(Option<Album>, Vec<Item>)]) -> Result<()> {
+        let existing: u64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))?;
+        if existing != 0 {
+            return Err(Error::Import(
+                "Beets migration requires an empty destination library".into(),
+            ));
+        }
+        let mut prepared_groups = Vec::with_capacity(groups.len());
+        for (album, items) in groups {
+            if let Some(album) = album {
+                validate_album_metadata(album)?;
+            }
+            for item in items {
+                validate_item_metadata(item)?;
+            }
+            prepared_groups.push(prepare_import_assets(album.as_ref(), items)?);
+        }
+
+        let transaction = self.conn.transaction()?;
+        let root_id = find_or_insert_root(&transaction, None)?;
+        for ((album, items), prepared_assets) in groups.iter().zip(&prepared_groups) {
+            let album_id = album
+                .as_ref()
+                .map(|album| find_or_insert_album(&transaction, album))
+                .transpose()?;
+            let release_id = match (album_id, album.as_ref()) {
+                (Some(album_id), Some(album)) => {
+                    Some(ensure_normalized_album(&transaction, album_id, album)?)
+                }
+                _ => None,
+            };
+            for (item, asset) in items.iter().zip(&prepared_assets[..items.len()]) {
+                let item_id = insert_item(&transaction, item, album_id)?;
+                let (release_track_id, recording_id) = if let Some(release_id) = &release_id {
+                    let (release_track_id, recording_id) =
+                        ensure_normalized_item(&transaction, item_id, release_id, item)?;
+                    (Some(release_track_id), recording_id)
+                } else {
+                    (
+                        None,
+                        ensure_normalized_singleton(&transaction, item_id, item)?,
+                    )
+                };
+                let asset_id = insert_asset(&transaction, &root_id, None, asset)?;
+                transaction.execute(
+                    "INSERT INTO item_assets (item_id, asset_id, relationship)
+                     VALUES (?1, ?2, 'audio')",
+                    params![item_id, asset_id],
+                )?;
+                transaction.execute(
+                    "INSERT INTO recording_assets
+                     (recording_id, release_track_id, asset_id, relationship)
+                     VALUES (?1, ?2, ?3, 'audio')",
+                    params![recording_id, release_track_id, asset_id],
+                )?;
+            }
+            if let (Some(album_id), Some(artwork)) = (album_id, prepared_assets.get(items.len())) {
+                let asset_id = insert_asset(&transaction, &root_id, None, artwork)?;
+                transaction.execute(
+                    "INSERT INTO album_assets (album_id, asset_id, relationship)
+                     VALUES (?1, ?2, 'front')",
+                    params![album_id, asset_id],
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub(crate) fn verified_asset_for_item(
         &self,
         item_id: i64,
@@ -1566,36 +1638,50 @@ impl Library {
         failpoints::hit("db.staged-file-full-evidence")
     }
 
-    #[cfg(test)]
     pub(crate) fn commit_import(
         &mut self,
         operation_id: &str,
         album: Option<&Album>,
         items: &[Item],
-    ) -> Result<i64> {
+    ) -> Result<Option<i64>> {
         self.commit_import_at_root_with_artwork(operation_id, album, items, None, None)
     }
 
     pub(crate) fn commit_import_at_root_with_artwork(
         &mut self,
         operation_id: &str,
-        album: &Album,
+        album: Option<&Album>,
         items: &[Item],
         library_root: Option<&Path>,
         original_artwork: Option<&ArtworkAssetMetadata>,
-    ) -> Result<i64> {
+    ) -> Result<Option<i64>> {
         let prepared_assets = prepare_import_assets(album, items)?;
         let prepared_original = original_artwork
             .map(|metadata| prepare_asset(metadata.path(), "artwork-original"))
             .transpose()?;
         let transaction = self.conn.transaction()?;
         let root_id = find_or_insert_root(&transaction, library_root)?;
-        let album_id = find_or_insert_album(&transaction, album)?;
-        let release_id = ensure_normalized_album(&transaction, album_id, album)?;
+        let album_id = album
+            .map(|album| find_or_insert_album(&transaction, album))
+            .transpose()?;
+        let release_id = match (album_id, album) {
+            (Some(album_id), Some(album)) => {
+                Some(ensure_normalized_album(&transaction, album_id, album)?)
+            }
+            _ => None,
+        };
         for (item, asset) in items.iter().zip(&prepared_assets[..items.len()]) {
             let item_id = insert_item(&transaction, item, album_id)?;
-            let (release_track_id, recording_id) =
-                ensure_normalized_item(&transaction, item_id, &release_id, item)?;
+            let (release_track_id, recording_id) = if let Some(release_id) = &release_id {
+                let (release_track_id, recording_id) =
+                    ensure_normalized_item(&transaction, item_id, release_id, item)?;
+                (Some(release_track_id), recording_id)
+            } else {
+                (
+                    None,
+                    ensure_normalized_singleton(&transaction, item_id, item)?,
+                )
+            };
             let asset_id = insert_asset(&transaction, &root_id, library_root, asset)?;
             transaction.execute(
                 "INSERT INTO item_assets (item_id, asset_id, relationship)
@@ -1609,18 +1695,24 @@ impl Library {
                 params![recording_id, release_track_id, asset_id],
             )?;
         }
-        let projection_asset_id = if let Some(artwork) = prepared_assets.get(items.len()) {
-            let asset_id = insert_asset(&transaction, &root_id, library_root, artwork)?;
-            transaction.execute(
-                "INSERT INTO album_assets (album_id, asset_id, relationship)
+        let projection_asset_id =
+            if let (Some(album_id), Some(artwork)) = (album_id, prepared_assets.get(items.len())) {
+                let asset_id = insert_asset(&transaction, &root_id, library_root, artwork)?;
+                transaction.execute(
+                    "INSERT INTO album_assets (album_id, asset_id, relationship)
                  VALUES (?1, ?2, 'front')",
-                params![album_id, asset_id],
-            )?;
-            Some(asset_id)
-        } else {
-            None
-        };
-        if let (Some(metadata), Some(original)) = (original_artwork, prepared_original.as_ref()) {
+                    params![album_id, asset_id],
+                )?;
+                Some(asset_id)
+            } else {
+                None
+            };
+        if let (Some(metadata), Some(original), Some(album_id), Some(release_id)) = (
+            original_artwork,
+            prepared_original.as_ref(),
+            album_id,
+            release_id.as_deref(),
+        ) {
             let original_asset_id =
                 find_or_reuse_asset(&transaction, &root_id, library_root, original)?;
             let relationship = format!("original-{}", metadata.provenance().role.as_str());
@@ -1633,7 +1725,7 @@ impl Library {
                 &transaction,
                 &original_asset_id,
                 &original_asset_id,
-                &release_id,
+                release_id,
                 metadata,
             )?;
             if let Some(projection_asset_id) = projection_asset_id.as_deref() {
@@ -1641,7 +1733,7 @@ impl Library {
                     &transaction,
                     projection_asset_id,
                     &original_asset_id,
-                    &release_id,
+                    release_id,
                     metadata,
                 )?;
             }
@@ -1717,50 +1809,58 @@ impl Library {
         Ok(())
     }
 
-    pub(crate) fn commit_tag_write(
-        &mut self,
-        operation_id: &str,
-        item_id: i64,
-        path: &Path,
-        file_size: u64,
-        modified: DateTime<Utc>,
-    ) -> Result<()> {
-        let stored_path = path_to_storage(path)?;
-        let transaction = self.conn.transaction()?;
-        if transaction.execute(
-            "UPDATE items SET file_size = ?1, mtime = ?2
-             WHERE id = ?3 AND path = ?4",
-            params![file_size, modified.to_rfc3339(), item_id, stored_path],
-        )? != 1
-        {
-            return Err(Error::Import(format!(
-                "tag-write plan is stale for {}; no row was updated",
-                path.display()
-            )));
-        }
-        let changed = transaction.execute(
-            "UPDATE operation_journal SET state = 'db-committed', updated_at = ?1
-             WHERE id = ?2",
-            params![Utc::now().to_rfc3339(), operation_id],
-        )?;
-        require_journal_row(changed, "tag-write commit")?;
-        transaction.commit()?;
-        Ok(())
-    }
-
     pub(crate) fn commit_path_move(
         &mut self,
         operation_id: &str,
         item_id: i64,
         source: &Path,
         destination: &Path,
+        library_root: &Path,
     ) -> Result<()> {
-        let source = path_to_storage(source)?;
-        let destination = path_to_storage(destination)?;
+        let source = path_to_storage(source)?.to_owned();
+        let destination_storage = path_to_storage(destination)?.to_owned();
+        let prepared = prepare_asset(destination, "audio")?;
         let transaction = self.conn.transaction()?;
+        let root_id = find_or_insert_root(&transaction, Some(library_root))?;
+        let relative =
+            path_to_storage(destination.strip_prefix(library_root).map_err(|_error| {
+                Error::Import(format!(
+                    "move destination escapes its library root: {}",
+                    destination.display()
+                ))
+            })?)?;
+        let changed_asset = transaction.execute(
+            "UPDATE assets
+             SET root_id = ?1, relative_path = ?2, absolute_path = ?3,
+                 byte_size = ?4, blake3 = ?5, sha256 = ?6, mtime = ?7,
+                 entry_identity = ?8, verification_state = ?9,
+                 last_verified_at = ?10, managed = 1
+             WHERE absolute_path = ?11
+               AND id IN (SELECT asset_id FROM item_assets
+                          WHERE item_id = ?12 AND relationship = 'audio')",
+            params![
+                root_id,
+                relative,
+                destination_storage,
+                prepared.byte_size,
+                prepared.blake3,
+                prepared.sha256,
+                prepared.mtime.map(|mtime| mtime.to_rfc3339()),
+                prepared.entry_identity,
+                prepared.verification_state,
+                Utc::now().to_rfc3339(),
+                source,
+                item_id,
+            ],
+        )?;
+        if changed_asset != 1 {
+            return Err(Error::Import(
+                "move plan is stale; its managed asset row was not updated".into(),
+            ));
+        }
         if transaction.execute(
             "UPDATE items SET path = ?1 WHERE id = ?2 AND path = ?3",
-            params![destination, item_id, source],
+            params![destination_storage, item_id, source],
         )? != 1
         {
             return Err(Error::Import(
@@ -2064,7 +2164,7 @@ fn invalidate_external_ids(
 ) -> Result<()> {
     if track_identity {
         transaction.execute(
-            "DELETE FROM external_ids
+            "DELETE FROM library_external_ids
              WHERE entity_type = 'item' AND entity_id = ?1
                AND kind IN ('recording', 'release_track')",
             [item_id],
@@ -2072,7 +2172,7 @@ fn invalidate_external_ids(
     }
     if release_identity {
         transaction.execute(
-            "DELETE FROM external_ids
+            "DELETE FROM library_external_ids
              WHERE entity_type = 'item' AND entity_id = ?1 AND kind = 'release'",
             [item_id],
         )?;
@@ -2084,8 +2184,8 @@ fn cleanup_orphan_metadata(transaction: &Transaction<'_>) -> Result<()> {
     for (table, entity_type, entity_table) in [
         ("entity_metadata", "item", "items"),
         ("entity_metadata", "album", "albums"),
-        ("external_ids", "item", "items"),
-        ("external_ids", "album", "albums"),
+        ("library_external_ids", "item", "items"),
+        ("library_external_ids", "album", "albums"),
     ] {
         let sql = format!(
             "DELETE FROM {table}
@@ -2264,9 +2364,8 @@ fn save_extended_metadata(
         "DELETE FROM entity_metadata WHERE entity_type = ?1 AND entity_id = ?2",
         params![entity_type, entity_id],
     )?;
-    let core = serde_json::to_string(metadata).map_err(|error| {
-        Error::Database(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
-    })?;
+    let core = serde_json::to_string(metadata)
+        .map_err(|error| Error::Database(format!("cannot serialize extended metadata: {error}")))?;
     transaction.execute(
         "INSERT INTO entity_metadata
          (entity_type, entity_id, field, ordinal, value_type, value_json)
@@ -2276,7 +2375,9 @@ fn save_extended_metadata(
     for (field, value) in &metadata.flexible_fields {
         validate_flexible_field_name(field)?;
         let json = serde_json::to_string(value).map_err(|error| {
-            Error::Database(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+            Error::Database(format!(
+                "cannot serialize flexible metadata field {field}: {error}"
+            ))
         })?;
         transaction.execute(
             "INSERT INTO entity_metadata
@@ -2301,7 +2402,7 @@ fn save_external_ids<'a>(
     ids: impl Iterator<Item = &'a ExternalId>,
 ) -> Result<()> {
     transaction.execute(
-        "DELETE FROM external_ids WHERE entity_type = ?1 AND entity_id = ?2",
+        "DELETE FROM library_external_ids WHERE entity_type = ?1 AND entity_id = ?2",
         params![entity_type, entity_id],
     )?;
     let mut seen = HashSet::new();
@@ -2318,7 +2419,7 @@ fn save_external_ids<'a>(
         };
         if seen.insert((id.provider.as_str(), kind, id.value.as_str())) {
             transaction.execute(
-                "INSERT INTO external_ids
+                "INSERT INTO library_external_ids
                  (entity_type, entity_id, provider, kind, value)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![entity_type, entity_id, id.provider, kind, id.value],
@@ -2363,7 +2464,7 @@ fn load_extended_metadata(
         metadata.flexible_fields.insert(field, value);
     }
     let mut statement = conn.prepare(
-        "SELECT provider, kind, value FROM external_ids
+        "SELECT provider, kind, value FROM library_external_ids
          WHERE entity_type = ?1 AND entity_id = ?2 ORDER BY provider, kind, value",
     )?;
     metadata.external_ids = statement
@@ -2626,6 +2727,70 @@ fn ensure_normalized_item(
     Ok((release_track_id, recording_id))
 }
 
+fn ensure_normalized_singleton(
+    transaction: &Transaction<'_>,
+    item_id: i64,
+    item: &Item,
+) -> Result<String> {
+    let recording_id = if let Some(external) = &item.track_external_id {
+        transaction
+            .query_row(
+                "SELECT entity_id FROM external_ids
+                 WHERE provider = ?1 AND entity_type = 'recording' AND external_id = ?2",
+                params![external.provider, external.value],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+    } else {
+        None
+    }
+    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let now = Utc::now().to_rfc3339();
+    transaction.execute(
+        "INSERT OR IGNORE INTO recordings
+         (id, title, duration_ms, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?4)",
+        params![
+            recording_id,
+            item.title,
+            (item.length * 1000.0).round() as u64,
+            now
+        ],
+    )?;
+    attach_single_artist_credit(
+        transaction,
+        "recording",
+        &recording_id,
+        "performance",
+        &item.artist,
+    )?;
+    if let Some(external) = &item.track_external_id {
+        transaction.execute(
+            "INSERT OR IGNORE INTO external_ids
+             (entity_type, entity_id, provider, external_id, data_license)
+             VALUES ('recording', ?1, ?2, ?3, ?4)",
+            params![
+                recording_id,
+                external.provider,
+                external.value,
+                provider_license(&external.provider)
+            ],
+        )?;
+    }
+    transaction.execute(
+        "UPDATE items SET release_track_id = NULL, recording_id = ?1 WHERE id = ?2",
+        params![recording_id, item_id],
+    )?;
+    insert_local_claim(
+        transaction,
+        "recording",
+        &recording_id,
+        "title",
+        &item.title,
+    )?;
+    Ok(recording_id)
+}
+
 fn attach_single_artist_credit(
     transaction: &Transaction<'_>,
     entity_type: &str,
@@ -2710,12 +2875,14 @@ fn provider_license(provider: &str) -> &'static str {
     }
 }
 
-fn prepare_import_assets(album: &Album, items: &[Item]) -> Result<Vec<PreparedAsset>> {
-    let mut assets = Vec::with_capacity(items.len() + usize::from(album.artpath.is_some()));
+fn prepare_import_assets(album: Option<&Album>, items: &[Item]) -> Result<Vec<PreparedAsset>> {
+    let mut assets = Vec::with_capacity(
+        items.len() + usize::from(album.is_some_and(|album| album.artpath.is_some())),
+    );
     for item in items {
         assets.push(prepare_asset(&item.path, "audio")?);
     }
-    if let Some(artwork) = &album.artpath {
+    if let Some(artwork) = album.and_then(|album| album.artpath.as_ref()) {
         assets.push(prepare_asset(artwork, "artwork")?);
     }
     Ok(assets)
@@ -3062,10 +3229,12 @@ fn row_to_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
         track_external_id: external_id(
             provider.as_deref(),
             row.get::<_, Option<String>>("external_track_id")?,
+            "recording",
         ),
         release_external_id: external_id(
             provider.as_deref(),
             row.get::<_, Option<String>>("external_release_id")?,
+            "release",
         ),
         added: parse_datetime(&row.get::<_, String>("added")?)?,
         mtime: parse_datetime(&row.get::<_, String>("mtime")?)?,
@@ -3085,16 +3254,17 @@ fn row_to_album(row: &rusqlite::Row<'_>) -> rusqlite::Result<Album> {
             row.get::<_, Option<String>>("metadata_provider")?
                 .as_deref(),
             row.get::<_, Option<String>>("external_release_id")?,
+            "release",
         ),
         added: parse_datetime(&row.get::<_, String>("added")?)?,
         extended: crate::ExtendedMetadata::default(),
     })
 }
 
-fn external_id(provider: Option<&str>, value: Option<String>) -> Option<ExternalId> {
+fn external_id(provider: Option<&str>, value: Option<String>, kind: &str) -> Option<ExternalId> {
     provider.zip(value).map(|(provider, value)| ExternalId {
         provider: provider.to_string(),
-        kind: String::new(),
+        kind: kind.to_owned(),
         value,
     })
 }
@@ -3222,6 +3392,12 @@ fn recover_operation(operation: &PendingOperation) -> Result<()> {
             }
             (OperationKind::ImportLink, false) => {
                 rollback_link_import(file)?;
+            }
+            (OperationKind::ImportInPlace, _) => {
+                return Err(Error::Recovery(format!(
+                    "in-place import journal unexpectedly contains file role {:?}",
+                    file.role
+                )));
             }
             (OperationKind::TagWrite, _) => {
                 return Err(Error::Recovery(format!(
@@ -3593,22 +3769,6 @@ fn rename_sibling_anchored(source: &Path, destination: &Path) -> Result<()> {
     AnchoredRoot::open(parent)?.rename_noreplace(source, destination)
 }
 
-#[cfg(all(test, unix))]
-pub(crate) fn sync_directory(path: &Path) -> Result<()> {
-    match std::fs::File::open(path).and_then(|directory| directory.sync_all()) {
-        Ok(()) => failpoints::hit("fs.sync-directory"),
-        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => Ok(()),
-        Err(error) => Err(error.into()),
-    }
-}
-
-#[cfg(all(test, not(unix)))]
-#[allow(clippy::unnecessary_wraps)]
-#[doc(hidden)]
-pub const fn sync_directory(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
 #[cfg(unix)]
 fn hash_os_string(value: &Path) -> String {
     use std::os::unix::ffi::OsStrExt;
@@ -3761,6 +3921,7 @@ mod tests {
             artpath: None,
             external_id: None,
             added: Utc::now(),
+            extended: crate::ExtendedMetadata::default(),
         };
         let item = Item {
             id: None,
@@ -3782,8 +3943,10 @@ mod tests {
             release_external_id: None,
             added: Utc::now(),
             mtime: Utc::now(),
+            singleton: false,
+            extended: crate::ExtendedMetadata::default(),
         };
-        library.commit_import(&operation, &album, &[item])?;
+        library.commit_import(&operation, Some(&album), &[item])?;
         library.complete_operation(&operation)?;
 
         std::fs::write(&path, b"changed")?;

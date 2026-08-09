@@ -1,11 +1,11 @@
 # Public API compatibility
 
-`rsbts` 0.3 is a pre-1.0 Rust library and CLI. Minor releases may make
+`rsbts` 0.4 is a pre-1.0 Rust library and CLI. Minor releases may make
 intentional breaking API changes, but patch releases preserve the documented
 public API and machine-output contracts. Every intentional break requires a
 minor version bump, a changelog entry, and a migration note.
 
-## Stable commitments in 0.3
+## Stable commitments in 0.4
 
 - Validated identifiers and bounded numeric domain values cannot be
   deserialized around their constructors. Construction-invariant fields are

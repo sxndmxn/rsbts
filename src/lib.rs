@@ -10,9 +10,11 @@ pub mod ancillary;
 pub mod artwork;
 pub mod artwork_projection;
 pub mod asset;
+pub mod beets;
 pub mod catalog;
 pub mod config;
 pub mod db;
+pub mod discogs;
 mod failpoints;
 pub mod fixity;
 mod fsops;
@@ -30,6 +32,7 @@ pub mod pathformat;
 pub mod preservation;
 pub mod provider;
 pub mod provider_policy;
+pub mod providers;
 pub mod query;
 pub mod remove;
 pub mod roots;
@@ -126,6 +129,7 @@ impl AudioFormat {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ExternalId {
     pub(crate) provider: String,
+    pub(crate) kind: String,
     pub(crate) value: String,
 }
 
@@ -137,31 +141,49 @@ impl<'de> Deserialize<'de> for ExternalId {
         #[derive(Deserialize)]
         struct Wire {
             provider: String,
+            #[serde(default = "default_external_id_kind")]
+            kind: String,
             value: String,
         }
 
         let value = Wire::deserialize(deserializer)?;
-        Self::new(value.provider, value.value).map_err(serde::de::Error::custom)
+        Self::new_typed(value.provider, value.kind, value.value).map_err(serde::de::Error::custom)
     }
 }
 
 impl ExternalId {
     pub fn new(provider: impl Into<String>, value: impl Into<String>) -> Result<Self> {
+        Self::new_typed(provider, default_external_id_kind(), value)
+    }
+
+    pub fn new_typed(
+        provider: impl Into<String>,
+        kind: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<Self> {
         let provider = provider.into();
+        let kind = kind.into();
         let value = value.into();
         if provider.trim().is_empty()
+            || kind.trim().is_empty()
             || value.trim().is_empty()
             || provider.len() > 128
+            || kind.len() > 128
             || value.len() > 512
             || provider.chars().any(char::is_control)
+            || kind.chars().any(char::is_control)
             || value.chars().any(char::is_control)
         {
             return Err(Error::Import(
-                "external ID provider and value must be non-empty, bounded, and control-free"
+                "external ID provider, kind, and value must be non-empty, bounded, and control-free"
                     .into(),
             ));
         }
-        Ok(Self { provider, value })
+        Ok(Self {
+            provider,
+            kind,
+            value,
+        })
     }
 
     #[must_use]
@@ -173,6 +195,15 @@ impl ExternalId {
     pub fn value(&self) -> &str {
         &self.value
     }
+
+    #[must_use]
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+}
+
+fn default_external_id_kind() -> String {
+    "legacy".into()
 }
 
 /// A calendar date whose month and day may be unknown.
@@ -186,6 +217,7 @@ pub struct PartialDate {
 /// A typed value preserved from a migrated library or a built-in metadata provider.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum FlexibleValue {
     String(String),
     Integer(i64),
@@ -306,13 +338,10 @@ pub(crate) fn validate_album_metadata(album: &Album) -> Result<()> {
 }
 
 fn validate_external_id(external_id: Option<&ExternalId>) -> Result<()> {
-    if external_id.is_some_and(|id| id.provider.trim().is_empty() || id.value.trim().is_empty()) {
-        Err(Error::Import(
-            "external ID provider and value cannot be empty".into(),
-        ))
-    } else {
-        Ok(())
+    if let Some(id) = external_id {
+        ExternalId::new_typed(&id.provider, &id.kind, &id.value)?;
     }
+    Ok(())
 }
 
 fn validate_extended_metadata(metadata: &ExtendedMetadata) -> Result<()> {
@@ -372,6 +401,10 @@ pub enum Error {
     Database(String),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("cannot write command output: {0}")]
+    Stdout(#[source] std::io::Error),
+    #[error("cannot write command diagnostic: {0}")]
+    Stderr(#[source] std::io::Error),
     #[error("Tag error: {0}")]
     Tag(String),
     #[error("Configuration error: {0}")]

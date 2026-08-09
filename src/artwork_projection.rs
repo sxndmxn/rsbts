@@ -1405,6 +1405,7 @@ mod tests {
             artpath: None,
             external_id: None,
             added: Utc::now(),
+            extended: crate::ExtendedMetadata::default(),
         };
         let item = Item {
             id: None,
@@ -1426,10 +1427,12 @@ mod tests {
             release_external_id: None,
             added: Utc::now(),
             mtime: metadata.modified()?.into(),
+            singleton: false,
+            extended: crate::ExtendedMetadata::default(),
         };
         library.commit_import_at_root_with_artwork(
             &operation,
-            &album,
+            Some(&album),
             &[item],
             Some(root_path),
             None,

@@ -8,8 +8,6 @@ use std::time::SystemTime;
 
 #[cfg(not(unix))]
 use std::fs::OpenOptions;
-#[cfg(unix)]
-use std::io::{Seek, SeekFrom};
 
 use chrono::Utc;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -23,8 +21,6 @@ use crate::artwork::{
     original_path, validate_artwork, ArtworkAssetMetadata, ArtworkProvenance, ArtworkRole,
 };
 use crate::asset::{digest_file, digest_reader};
-#[cfg(test)]
-use crate::db::sync_directory;
 use crate::db::{
     file_identity, file_object_identity, hash_path, JournalFile, Library, OperationKind,
 };
@@ -32,7 +28,7 @@ use crate::fsops::AnchoredRoot;
 use crate::pathformat::format_relative_path;
 use crate::provider::{
     MetadataProvider, ProviderEntityId, ProviderEntityKind, ProviderTrack, ReleaseCandidate,
-    ReleaseQuery, SearchPage,
+    ReleaseQuery, SearchPage, TrackCandidate, TrackQuery,
 };
 use crate::roots::RootCapabilities;
 use crate::tags::{is_audio_file, read_tags};
@@ -218,6 +214,10 @@ impl<'a> ImportPlanner<'a> {
 
     /// Scan paths and query the metadata provider without mutating the library.
     #[allow(clippy::future_not_send)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "planning keeps singleton and release candidate completeness decisions together"
+    )]
     pub async fn plan(&self, paths: &[PathBuf]) -> ImportPlan {
         let progress = ConsoleProgress::new();
         let (items, scan_issues) = scan_paths(paths, self.options.follow_symlinks, &progress);
@@ -248,6 +248,7 @@ impl<'a> ImportPlanner<'a> {
                             self.options.runner_up_margin,
                         ),
                         items: group.items,
+                        candidate_set_complete: false,
                         lookup_error: None,
                         singleton: true,
                     }),
@@ -256,6 +257,7 @@ impl<'a> ImportPlanner<'a> {
                         source_album: group.album,
                         items: group.items,
                         candidates: Vec::new(),
+                        candidate_set_complete: false,
                         lookup_error: Some(error.to_string()),
                         singleton: true,
                     }),
@@ -267,9 +269,10 @@ impl<'a> ImportPlanner<'a> {
                 album: group.album.clone(),
                 track_count: group.items.len(),
             };
-            let direct_id = common_release_id(&group.items, self.provider.name());
+            let direct_id = common_release_id(&group.items);
             let lookup = if let Some(id) = direct_id {
-                match ProviderEntityId::new(self.provider.name(), ProviderEntityKind::Release, id) {
+                match ProviderEntityId::new(id.provider(), ProviderEntityKind::Release, id.value())
+                {
                     Ok(id) => self
                         .provider
                         .lookup_release(&id)
@@ -304,6 +307,7 @@ impl<'a> ImportPlanner<'a> {
                         items: group.items,
                         candidate_set_complete: page.complete,
                         lookup_error,
+                        singleton: false,
                     });
                 }
                 Err(error) => albums.push(AlbumPlan {
@@ -385,7 +389,6 @@ impl<'a> ImportPlanner<'a> {
 
             let digests = digest_file(&source)?;
             let content_hash = digests.blake3().to_string();
-            let destination_exists = destination.exists() || destination.is_symlink();
             let managed = self.library.item_exists(&destination)?;
             let destination_exists = destination.exists() || destination.is_symlink();
             let already_managed =
@@ -485,7 +488,9 @@ impl<'a> ImportPlanner<'a> {
                     warnings.push("existing cover art will not be overwritten".into());
                     Ok(None)
                 } else {
-                    album.artpath = Some(destination.clone());
+                    if let Some(album) = album {
+                        album.artpath = Some(destination.clone());
+                    }
                     let content_hash = blake3::hash(&bytes).to_hex().to_string();
                     let provenance = ArtworkProvenance {
                         role: candidate_artwork.role().clone(),
@@ -532,7 +537,6 @@ impl<'a> ImportExecutor<'a> {
     #[allow(clippy::too_many_lines)]
     pub fn execute(&mut self, mut plan: ApprovedAlbumPlan) -> Result<ImportReport> {
         self.validate_plan_shape(&plan)?;
-        RootCapabilities::detect(&plan.library_dir)?.require_safe_mutation()?;
         let active_tracks = plan
             .tracks
             .iter()
@@ -550,6 +554,7 @@ impl<'a> ImportExecutor<'a> {
         if plan.action == Action::InPlace {
             return self.execute_in_place(&plan, &active_tracks, already_managed_tracks);
         }
+        RootCapabilities::detect(&plan.library_dir)?.require_safe_mutation()?;
 
         let transfer_id = uuid::Uuid::new_v4();
         let mut journal_files = Vec::with_capacity(
@@ -621,7 +626,7 @@ impl<'a> ImportExecutor<'a> {
             .collect::<Vec<_>>();
         if let Err(error) = self.library.commit_import_at_root_with_artwork(
             &operation_id,
-            &plan.album,
+            plan.album.as_ref(),
             &items,
             Some(&plan.library_dir),
             plan.artwork.as_ref().map(|artwork| &artwork.original),
@@ -767,8 +772,6 @@ impl<'a> ImportExecutor<'a> {
         tracks: &[&PlannedTrack],
         files: &[JournalFile],
     ) -> Result<()> {
-        let destination_root = DestinationRoot::open(&plan.library_dir)?;
-        let mut prepared = Vec::with_capacity(files.len());
         self.library
             .set_operation_state(operation_id, "staging", None)?;
         for (ordinal, track) in tracks.iter().enumerate() {
@@ -784,10 +787,11 @@ impl<'a> ImportExecutor<'a> {
                             &file_object_identity(metadata),
                         )
                     })?;
-                    verify_anchored_hash(
+                    verify_anchored_digests(
                         root,
                         &files[ordinal].staged,
                         &track.fingerprint.content_hash,
+                        &track.fingerprint.sha256,
                     )?;
                 }
                 Action::Link => {
@@ -805,14 +809,15 @@ impl<'a> ImportExecutor<'a> {
                         )));
                     }
                 }
+                Action::InPlace => {
+                    return Err(Error::Import(
+                        "in-place imports do not have a file-staging phase".into(),
+                    ));
+                }
             }
             let staged_identity = file_identity(&root.entry_metadata(&files[ordinal].staged)?);
             self.library
                 .set_staged_file_identity(operation_id, ordinal, &staged_identity)?;
-            prepared.push(PreparedDestination {
-                destination,
-                identity: staged_identity,
-            });
         }
 
         if let Some(artwork) = &plan.artwork {
@@ -826,7 +831,12 @@ impl<'a> ImportExecutor<'a> {
                         &file_object_identity(metadata),
                     )
                 })?;
-                verify_anchored_hash(root, &file.staged, &artwork.content_hash)?;
+                verify_anchored_digests(
+                    root,
+                    &file.staged,
+                    &artwork.content_hash,
+                    &artwork.sha256,
+                )?;
                 validate_artwork(&read_anchored(root, &file.staged)?)?;
                 let staged_identity = file_identity(&root.entry_metadata(&file.staged)?);
                 self.library
@@ -1177,12 +1187,18 @@ fn score_track_candidates(
                 provider_score: provider,
                 tracks: vec![ProviderTrack {
                     external_id: track.external_id,
+                    release_track_external_id: None,
                     title: track.title,
                     artist: track.artist,
                     number: item.track,
+                    printed_position: item.track.map(|value| value.to_string()),
                     disc: item.disc,
                     length_ms: track.length_ms,
+                    is_hidden: false,
+                    is_data_track: false,
+                    pregap_ms: None,
                 }],
+                edition: crate::provider::EditionEvidence::default(),
             };
             ScoredCandidate {
                 release,
@@ -1192,7 +1208,11 @@ fn score_track_candidates(
                     mean_track: title,
                     provider,
                     composite,
-                    runner_up_margin: 0.0,
+                    recording_identity: title,
+                    release_group_identity: 0.0,
+                    exact_release_identity: 0.0,
+                    runner_up_margin: None,
+                    candidate_set_complete: false,
                     high_confidence: false,
                     gate_failures: failures,
                 },
@@ -1202,6 +1222,10 @@ fn score_track_candidates(
                     title_similarity: title,
                     duration_delta_seconds,
                     number_and_disc_match: true,
+                    medium_match: true,
+                    printed_position_match: true,
+                    special_track_compatible: true,
+                    pregap_compatible: true,
                     score: title,
                 }],
             }
@@ -1229,13 +1253,18 @@ fn apply_singleton_confidence_gates(
     threshold: f64,
     required_margin: f64,
 ) {
-    best.confidence.runner_up_margin = best.confidence.composite - runner_up;
+    best.confidence.runner_up_margin = Some(best.confidence.composite - runner_up);
     let thresholds_valid =
         (0.0..=1.0).contains(&threshold) && (0.0..=1.0).contains(&required_margin);
     if !thresholds_valid {
         best.confidence
             .gate_failures
             .push("matching thresholds are invalid".into());
+    }
+    if !best.confidence.candidate_set_complete {
+        best.confidence
+            .gate_failures
+            .push("provider candidate set is incomplete".into());
     }
     if thresholds_valid && best.confidence.composite < threshold {
         best.confidence.gate_failures.push(format!(
@@ -1244,10 +1273,15 @@ fn apply_singleton_confidence_gates(
             threshold * 100.0
         ));
     }
-    if thresholds_valid && best.confidence.runner_up_margin < required_margin {
+    if thresholds_valid
+        && best
+            .confidence
+            .runner_up_margin
+            .is_none_or(|margin| margin < required_margin)
+    {
         best.confidence.gate_failures.push(format!(
             "runner-up margin {:.1}% is below {:.1}%",
-            best.confidence.runner_up_margin * 100.0,
+            best.confidence.runner_up_margin.unwrap_or_default() * 100.0,
             required_margin * 100.0
         ));
     }
@@ -1437,18 +1471,16 @@ fn confidence_gate_failures(
     failures
 }
 
-fn common_release_id(items: &[Item], provider: &str) -> Option<String> {
+fn common_release_id(items: &[Item]) -> Option<&ExternalId> {
     let first = items.first()?.release_external_id.as_ref()?;
-    if first.provider != provider
-        || !items.iter().all(|item| {
-            item.release_external_id
-                .as_ref()
-                .is_some_and(|id| id.provider == first.provider && id.value == first.value)
+    if !items.iter().all(|item| {
+        item.release_external_id.as_ref().is_some_and(|id| {
+            id.provider == first.provider && id.kind == first.kind && id.value == first.value
         })
-    {
+    }) {
         return None;
     }
-    Some(first.value.clone())
+    Some(first)
 }
 
 fn exact_release_confidence(release: &ReleaseCandidate) -> f64 {
@@ -1614,14 +1646,26 @@ fn apply_release_metadata(items: &mut [Item], candidate: &ScoredCandidate) {
         item.artist.clone_from(&track.artist);
         item.track = track.number;
         item.disc = track.disc;
-        let track_id = ExternalId {
-            provider: candidate.release.provider.clone(),
-            kind: "recording".into(),
-            value: track.external_id.clone(),
-        };
-        item.track_external_id = Some(track_id.clone());
-        if !item.extended.external_ids.contains(&track_id) {
-            item.extended.external_ids.push(track_id);
+        if !track.external_id.is_empty() {
+            let recording_id = ExternalId {
+                provider: candidate.release.provider.clone(),
+                kind: "recording".into(),
+                value: track.external_id.clone(),
+            };
+            item.track_external_id = Some(recording_id.clone());
+            if !item.extended.external_ids.contains(&recording_id) {
+                item.extended.external_ids.push(recording_id);
+            }
+        }
+        if let Some(value) = &track.release_track_external_id {
+            let release_track_id = ExternalId {
+                provider: candidate.release.provider.clone(),
+                kind: "release-track".into(),
+                value: value.clone(),
+            };
+            if !item.extended.external_ids.contains(&release_track_id) {
+                item.extended.external_ids.push(release_track_id);
+            }
         }
     }
 }
@@ -1741,13 +1785,14 @@ fn append_extension(path: &Path, extension: &std::ffi::OsStr) -> PathBuf {
 
 fn validate_source(track: &PlannedTrack) -> Result<()> {
     let before = std::fs::metadata(&track.source)?;
-    let content_hash = hash_path(&track.source)?;
+    let digests = digest_file(&track.source)?;
     let after = std::fs::metadata(&track.source)?;
     if before.len() != track.fingerprint.size
         || before.modified()? != track.fingerprint.modified
         || file_identity(&before) != track.fingerprint.identity
         || file_identity(&after) != track.fingerprint.identity
-        || content_hash != track.fingerprint.content_hash
+        || digests.blake3() != track.fingerprint.content_hash
+        || digests.sha256() != track.fingerprint.sha256
     {
         return Err(Error::Import(format!(
             "source changed after planning: {}",
@@ -1757,45 +1802,50 @@ fn validate_source(track: &PlannedTrack) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-fn create_parent(path: &Path) -> Result<()> {
-    let Some(parent) = path.parent() else {
-        return Ok(());
-    };
-    let mut missing = Vec::new();
-    let mut current = parent;
-    loop {
-        match std::fs::symlink_metadata(current) {
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => break,
-            Ok(_) => {
-                return Err(Error::Import(format!(
-                    "destination parent is not a real directory: {}",
-                    current.display()
-                )));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                missing.push(current.to_path_buf());
-                current = current.parent().ok_or_else(|| {
-                    Error::Import(format!(
-                        "cannot locate an existing ancestor for {}",
-                        parent.display()
-                    ))
-                })?;
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-    for directory in missing.iter().rev() {
-        std::fs::create_dir(directory)?;
-        if let Some(ancestor) = directory.parent() {
-            sync_directory(ancestor)?;
-        }
-    }
+/// Stage and finalize one already-journaled regular file below a pinned library root.
+pub(crate) fn stage_relocation(
+    library: &Library,
+    operation_id: &str,
+    library_dir: &Path,
+    track: &PlannedTrack,
+    journal_file: &JournalFile,
+) -> Result<()> {
+    validate_source(track)?;
+    validate_destination(library_dir, &track.destination)?;
+    let root = AnchoredRoot::open_or_create(library_dir)?;
+    root.create_parent_all(&journal_file.staged)?;
+    library.set_operation_state(operation_id, "staging", None)?;
+    root.copy_new_observed(&track.source, &journal_file.staged, |metadata| {
+        library.set_acquired_file_identity(operation_id, 0, &file_object_identity(metadata))
+    })?;
+    verify_anchored_digests(
+        &root,
+        &journal_file.staged,
+        &track.fingerprint.content_hash,
+        &track.fingerprint.sha256,
+    )?;
+    let identity = file_identity(&root.entry_metadata(&journal_file.staged)?);
+    library.set_staged_file_full_evidence(
+        operation_id,
+        0,
+        &identity,
+        &track.fingerprint.content_hash,
+        &track.fingerprint.sha256,
+    )?;
+    library.set_operation_state(operation_id, "finalizing", None)?;
+    root.rename_noreplace(&journal_file.staged, &track.destination)?;
+    library.set_file_state(operation_id, 0, "finalized")?;
     Ok(())
 }
 
-fn verify_anchored_hash(root: &AnchoredRoot, path: &Path, expected: &str) -> Result<()> {
-    if digest_reader(root.open_file(path)?)?.blake3() == expected {
+fn verify_anchored_digests(
+    root: &AnchoredRoot,
+    path: &Path,
+    expected_blake3: &str,
+    expected_sha256: &str,
+) -> Result<()> {
+    let digests = digest_reader(root.open_file(path)?)?;
+    if digests.blake3() == expected_blake3 && digests.sha256() == expected_sha256 {
         Ok(())
     } else {
         Err(Error::Import(format!(
@@ -1810,16 +1860,6 @@ fn read_anchored(root: &AnchoredRoot, path: &Path) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     input.read_to_end(&mut bytes)?;
     Ok(bytes)
-}
-
-#[cfg(test)]
-fn finalize_regular_file(staged: &Path, destination: &Path) -> Result<()> {
-    std::fs::hard_link(staged, destination)?;
-    std::fs::remove_file(staged)?;
-    if let Some(parent) = destination.parent() {
-        sync_directory(parent)?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -2200,17 +2240,15 @@ mod tests {
         let destination = temporary_path.join("destination");
         std::fs::write(&staged, b"new")?;
         std::fs::write(&destination, b"old")?;
-        let root = DestinationRoot::open(&temporary_path)?;
-        let destination_file = root.resolve(&staged, &destination)?;
-        let identity = file_identity(&std::fs::symlink_metadata(&staged)?);
-        assert!(destination_file.finalize(&identity).is_err());
+        let root = AnchoredRoot::open_or_create(&temporary_path)?;
+        assert!(root.rename_noreplace(&staged, &destination).is_err());
         let mut value = String::new();
         std::fs::File::open(destination)?.read_to_string(&mut value)?;
         assert_eq!(value, "old");
         Ok(())
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn library_creation_rejects_a_symlinked_ancestor() -> Result<()> {
         let temporary = tempfile::tempdir()?;
@@ -2219,12 +2257,12 @@ mod tests {
         std::fs::create_dir(&outside)?;
         std::os::unix::fs::symlink(&outside, &redirected)?;
 
-        assert!(DestinationRoot::open(&redirected.join("library")).is_err());
+        assert!(AnchoredRoot::open_or_create(&redirected.join("library")).is_err());
         assert!(!outside.join("library").exists());
         Ok(())
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn staging_rejects_a_parent_replaced_by_a_symlink() -> Result<()> {
         let temporary = tempfile::tempdir()?;
@@ -2235,18 +2273,16 @@ mod tests {
         let detached = temporary_path.join("detached-album");
         let outside = temporary_path.join("outside");
         let staged = parent.join(".track.stage");
-        let destination = parent.join("track.flac");
         std::fs::write(&source, b"audio")?;
         std::fs::create_dir_all(&parent)?;
         std::fs::create_dir(&outside)?;
 
-        let root = DestinationRoot::open(&library_dir)?;
-        let destination_file = root.resolve(&staged, &destination)?;
+        let root = AnchoredRoot::open_or_create(&library_dir)?;
         std::fs::rename(&parent, &detached)?;
         std::os::unix::fs::symlink(&outside, &parent)?;
 
-        assert!(destination_file
-            .stage_regular(&source, &hash_path(&source)?)
+        assert!(root
+            .copy_new_observed(&source, &staged, |_metadata| Ok(()))
             .is_err());
         assert!(!outside.join(".track.stage").exists());
         assert!(!outside.join("track.flac").exists());
@@ -2254,7 +2290,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn finalization_rejects_a_parent_replaced_by_a_symlink() -> Result<()> {
         let temporary = tempfile::tempdir()?;
@@ -2270,13 +2306,12 @@ mod tests {
         std::fs::create_dir_all(&parent)?;
         std::fs::create_dir(&outside)?;
 
-        let root = DestinationRoot::open(&library_dir)?;
-        let destination_file = root.resolve(&staged, &destination)?;
-        let identity = destination_file.stage_regular(&source, &hash_path(&source)?)?;
+        let root = AnchoredRoot::open_or_create(&library_dir)?;
+        root.copy_new_observed(&source, &staged, |_metadata| Ok(()))?;
         std::fs::rename(&parent, &detached)?;
         std::os::unix::fs::symlink(&outside, &parent)?;
 
-        assert!(destination_file.finalize(&identity).is_err());
+        assert!(root.rename_noreplace(&staged, &destination).is_err());
         assert!(!outside.join(".track.stage").exists());
         assert!(!outside.join("track.flac").exists());
         assert!(detached.join(".track.stage").exists());

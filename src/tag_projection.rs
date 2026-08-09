@@ -648,6 +648,7 @@ mod tests {
             artpath: None,
             external_id: None,
             added: Utc::now(),
+            extended: crate::ExtendedMetadata::default(),
         };
         let item = Item {
             id: None,
@@ -669,8 +670,10 @@ mod tests {
             release_external_id: None,
             added: Utc::now(),
             mtime: metadata.modified()?.into(),
+            singleton: false,
+            extended: crate::ExtendedMetadata::default(),
         };
-        library.commit_import(&operation, &album, &[item])?;
+        library.commit_import(&operation, Some(&album), &[item])?;
         library.complete_operation(&operation)?;
         let id = library
             .query_items(&crate::query::Query::all())?

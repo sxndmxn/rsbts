@@ -19,7 +19,7 @@ CREATE TABLE statistics_artist_members (
 );
 
 INSERT INTO statistics_album_members (album_id, member_count)
-SELECT album_id, COUNT(*) FROM items GROUP BY album_id;
+SELECT album_id, COUNT(*) FROM items WHERE album_id IS NOT NULL GROUP BY album_id;
 
 INSERT INTO statistics_artist_members (artist, member_count)
 SELECT artist, COUNT(*) FROM items GROUP BY artist;
@@ -39,7 +39,7 @@ CREATE TRIGGER statistics_items_insert
 AFTER INSERT ON items
 BEGIN
     INSERT INTO statistics_album_members (album_id, member_count)
-    VALUES (NEW.album_id, 1)
+    SELECT NEW.album_id, 1 WHERE NEW.album_id IS NOT NULL
     ON CONFLICT(album_id) DO UPDATE SET member_count = member_count + 1;
 
     INSERT INTO statistics_artist_members (artist, member_count)
@@ -48,10 +48,10 @@ BEGIN
 
     UPDATE library_statistics
     SET tracks = tracks + 1,
-        albums = albums + (
+        albums = albums + COALESCE((
             SELECT member_count = 1
             FROM statistics_album_members WHERE album_id = NEW.album_id
-        ),
+        ), 0),
         artists = artists + (
             SELECT member_count = 1
             FROM statistics_artist_members WHERE artist = NEW.artist
@@ -98,7 +98,7 @@ BEGIN
     UPDATE statistics_album_members
     SET member_count = member_count - 1 WHERE album_id = OLD.album_id;
     INSERT INTO statistics_album_members (album_id, member_count)
-    VALUES (NEW.album_id, 1)
+    SELECT NEW.album_id, 1 WHERE NEW.album_id IS NOT NULL
     ON CONFLICT(album_id) DO UPDATE SET member_count = member_count + 1;
     UPDATE library_statistics
     SET albums = albums
@@ -106,10 +106,10 @@ BEGIN
             SELECT member_count = 0
             FROM statistics_album_members WHERE album_id = OLD.album_id
         ), 0)
-        + (
+        + COALESCE((
             SELECT member_count = 1
             FROM statistics_album_members WHERE album_id = NEW.album_id
-        )
+        ), 0)
     WHERE singleton = 1;
     DELETE FROM statistics_album_members
     WHERE album_id = OLD.album_id AND member_count = 0;

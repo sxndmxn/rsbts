@@ -231,6 +231,33 @@ enum Commands {
         #[command(subcommand)]
         action: PlanCommand,
     },
+
+    /// Migrate an external music library into a new rsbts database
+    Migrate {
+        #[command(subcommand)]
+        source: MigrateSource,
+    },
+}
+
+#[derive(Subcommand)]
+enum MigrateSource {
+    /// Read a Beets library database and optional YAML configuration
+    Beets {
+        #[arg(long)]
+        beets_library: PathBuf,
+        #[arg(long)]
+        beets_config: Option<PathBuf>,
+        #[arg(long)]
+        music_directory: Option<PathBuf>,
+        #[arg(long)]
+        output_database: Option<PathBuf>,
+        #[arg(long)]
+        output_config: Option<PathBuf>,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -312,7 +339,27 @@ enum FixityCommand {
 #[tokio::main]
 async fn main() -> ExitCode {
     let arguments = Cli::parse();
-    match cli::run(arguments.command, arguments.config, arguments.output).await {
+    let stdout = io::stdout();
+    let stderr = io::stderr();
+    let mut stdout = io::BufWriter::new(stdout.lock());
+    let mut stderr = io::BufWriter::new(stderr.lock());
+    let (result, flush_result) = {
+        let mut streams = cli::Streams::new(&mut stdout, &mut stderr);
+        let result = cli::run(
+            arguments.command,
+            arguments.config,
+            arguments.output,
+            &mut streams,
+        )
+        .await;
+        let flush_result = streams.finish();
+        (result, flush_result)
+    };
+    let result = match result {
+        Ok(outcome) => flush_result.map(|()| outcome),
+        Err(error) => Err(error),
+    };
+    match result {
         Ok(cli::Outcome::Success) => ExitCode::SUCCESS,
         Ok(cli::Outcome::Partial) => ExitCode::from(2),
         Err(error) if error.is_stdout_broken_pipe() => ExitCode::SUCCESS,

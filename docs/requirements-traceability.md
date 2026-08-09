@@ -2,7 +2,7 @@
 
 This matrix is the implementation index for
 [the normative requirements](./media-library-requirements.md). “Implemented”
-means the behavior is present in rsbts 0.3 and covered by the cited automated
+means the behavior is present in rsbts 0.4 and covered by the cited automated
 evidence; it is not a waiver of the release-blocking gates. The research note
 remains rationale, not executable evidence.
 
@@ -14,17 +14,17 @@ artifact gates are in `.github/workflows/release.yml`.
 | Requirement | Status | Implementation | Verification |
 |---|---|---|---|
 | SAF-001 | Implemented | `src/lease.rs`, lease acquisition in `src/db.rs` | lease contention and pre-I/O writer tests |
-| SAF-002 | Implemented | `src/asset.rs`, migration 004, `src/db.rs` | asset migration, verification, and ownership tests |
-| SAF-003 | Implemented | `src/asset.rs`, migration 004, `src/db.rs` | asset migration, verification, and ownership tests |
-| SAF-004 | Implemented | `src/asset.rs`, migration 004, `src/db.rs` | asset migration, verification, and ownership tests |
-| SAF-005 | Implemented | `src/asset.rs`, migration 004, `src/db.rs` | asset migration, verification, and ownership tests |
+| SAF-002 | Implemented | `src/asset.rs`, migration 005, `src/db.rs` | asset migration, verification, and ownership tests |
+| SAF-003 | Implemented | `src/asset.rs`, migration 005, `src/db.rs` | asset migration, verification, and ownership tests |
+| SAF-004 | Implemented | `src/asset.rs`, migration 005, `src/db.rs` | asset migration, verification, and ownership tests |
+| SAF-005 | Implemented | `src/asset.rs`, migration 005, `src/db.rs` | asset migration, verification, and ownership tests |
 | SAF-006 | Implemented | `src/fsops.rs`, `src/import.rs`, `src/remove.rs` | symlink/dangling/newcomer/no-clobber race tests |
 | SAF-007 | Implemented | `src/fsops.rs`, `src/import.rs`, `src/remove.rs` | symlink/dangling/newcomer/no-clobber race tests |
 | SAF-008 | Implemented | `src/fsops.rs`, `src/import.rs`, `src/remove.rs` | symlink/dangling/newcomer/no-clobber race tests |
 | SAF-009 | Implemented | `src/fsops.rs`, `src/import.rs`, `src/remove.rs` | symlink/dangling/newcomer/no-clobber race tests |
-| SAF-010 | Implemented | typed journals across executors and migrations 004–008 | exhaustive failpoint and repeated-recovery tests |
-| SAF-011 | Implemented | typed journals across executors and migrations 004–008 | exhaustive failpoint and repeated-recovery tests |
-| SAF-012 | Implemented | typed journals across executors and migrations 004–008 | exhaustive failpoint and repeated-recovery tests |
+| SAF-010 | Implemented | typed journals across executors and migrations 005–009 | exhaustive failpoint and repeated-recovery tests |
+| SAF-011 | Implemented | typed journals across executors and migrations 005–009 | exhaustive failpoint and repeated-recovery tests |
+| SAF-012 | Implemented | typed journals across executors and migrations 005–009 | exhaustive failpoint and repeated-recovery tests |
 | SAF-013 | Implemented | `src/remove.rs` quarantine and explicit purge plans | removal, retention, purge, and purge-recovery tests |
 | SAF-014 | Implemented | read-only CLI preflight and shared planners in `src/cli.rs` | CLI dry-run filesystem/database snapshot tests |
 | SAF-015 | Implemented | read-only CLI preflight and shared planners in `src/cli.rs` | CLI dry-run filesystem/database snapshot tests |
@@ -41,22 +41,22 @@ artifact gates are in `.github/workflows/release.yml`.
 | AUD-008 | Implemented | `src/fixity.rs`, durable plans/events | paged resume/cancel/progress CLI and unit tests |
 | AUD-009 | Implemented | `src/preservation.rs` | SHA-256, BagIt, verification, and restore tests |
 | AUD-010 | Implemented | `src/preservation.rs` | SHA-256, BagIt, verification, and restore tests |
-| AUD-011 | Implemented | fixity schedules/history in `src/fixity.rs` and migration 007 | schedule, due-run, result-history tests |
-| CAT-001 | Implemented | `src/catalog.rs` and migration 005 | entity, claim, snapshot, resolution, lock, and refresh tests |
-| CAT-002 | Implemented | `src/catalog.rs` and migration 005 | entity, claim, snapshot, resolution, lock, and refresh tests |
-| CAT-003 | Implemented | `src/catalog.rs` and migration 005 | entity, claim, snapshot, resolution, lock, and refresh tests |
-| CAT-004 | Implemented | `src/catalog.rs` and migration 005 | entity, claim, snapshot, resolution, lock, and refresh tests |
-| CAT-005 | Implemented | `src/catalog.rs` and migration 005 | entity, claim, snapshot, resolution, lock, and refresh tests |
-| CAT-006 | Implemented | `src/catalog.rs` and migration 005 | entity, claim, snapshot, resolution, lock, and refresh tests |
-| CAT-007 | Implemented | `src/catalog.rs` and migration 005 | entity, claim, snapshot, resolution, lock, and refresh tests |
-| CAT-008 | Implemented | `src/catalog.rs` and migration 005 | entity, claim, snapshot, resolution, lock, and refresh tests |
-| CAT-009 | Implemented | `src/catalog.rs` and migration 005 | entity, claim, snapshot, resolution, lock, and refresh tests |
-| CAT-010 | Implemented | `src/catalog.rs` and migration 005 | entity, claim, snapshot, resolution, lock, and refresh tests |
-| CAT-011 | Implemented | `src/catalog.rs` and migration 005 | entity, claim, snapshot, resolution, lock, and refresh tests |
-| CAT-012 | Implemented | `src/catalog.rs` and migration 005 | entity, claim, snapshot, resolution, lock, and refresh tests |
-| CAT-013 | Implemented | `src/catalog.rs` and migration 005 | entity, claim, snapshot, resolution, lock, and refresh tests |
-| CAT-014 | Implemented | `src/ancillary.rs` and migration 008 | bounded scan/import/recovery tests for related assets |
-| CAT-015 | Implemented | normalized entity/link/segment schema in migration 005 | multidisc, compilation, role, and segment model tests |
+| AUD-011 | Implemented | fixity schedules/history in `src/fixity.rs` and migration 008 | schedule, due-run, result-history tests |
+| CAT-001 | Implemented | `src/catalog.rs` and migration 006 | entity, claim, snapshot, resolution, lock, and refresh tests |
+| CAT-002 | Implemented | `src/catalog.rs` and migration 006 | entity, claim, snapshot, resolution, lock, and refresh tests |
+| CAT-003 | Implemented | `src/catalog.rs` and migration 006 | entity, claim, snapshot, resolution, lock, and refresh tests |
+| CAT-004 | Implemented | `src/catalog.rs` and migration 006 | entity, claim, snapshot, resolution, lock, and refresh tests |
+| CAT-005 | Implemented | `src/catalog.rs` and migration 006 | entity, claim, snapshot, resolution, lock, and refresh tests |
+| CAT-006 | Implemented | `src/catalog.rs` and migration 006 | entity, claim, snapshot, resolution, lock, and refresh tests |
+| CAT-007 | Implemented | `src/catalog.rs` and migration 006 | entity, claim, snapshot, resolution, lock, and refresh tests |
+| CAT-008 | Implemented | `src/catalog.rs` and migration 006 | entity, claim, snapshot, resolution, lock, and refresh tests |
+| CAT-009 | Implemented | `src/catalog.rs` and migration 006 | entity, claim, snapshot, resolution, lock, and refresh tests |
+| CAT-010 | Implemented | `src/catalog.rs` and migration 006 | entity, claim, snapshot, resolution, lock, and refresh tests |
+| CAT-011 | Implemented | `src/catalog.rs` and migration 006 | entity, claim, snapshot, resolution, lock, and refresh tests |
+| CAT-012 | Implemented | `src/catalog.rs` and migration 006 | entity, claim, snapshot, resolution, lock, and refresh tests |
+| CAT-013 | Implemented | `src/catalog.rs` and migration 006 | entity, claim, snapshot, resolution, lock, and refresh tests |
+| CAT-014 | Implemented | `src/ancillary.rs` and migration 009 | bounded scan/import/recovery tests for related assets |
+| CAT-015 | Implemented | normalized entity/link/segment schema in migration 006 | multidisc, compilation, role, and segment model tests |
 | MAT-001 | Implemented | `src/import.rs`, `src/provider.rs`, `src/provider_policy.rs` | matching gates, direct-ID, structural-track, lock, and abstention tests |
 | MAT-002 | Implemented | `src/import.rs`, `src/provider.rs`, `src/provider_policy.rs` | matching gates, direct-ID, structural-track, lock, and abstention tests |
 | MAT-003 | Implemented | `src/import.rs`, `src/provider.rs`, `src/provider_policy.rs` | matching gates, direct-ID, structural-track, lock, and abstention tests |
@@ -70,14 +70,14 @@ artifact gates are in `.github/workflows/release.yml`.
 | MAT-011 | Implemented | `src/import.rs`, `src/provider.rs`, `src/provider_policy.rs` | matching gates, direct-ID, structural-track, lock, and abstention tests |
 | MAT-012 | Implemented | `src/matching_eval.rs` | 30,000 hard-negative attestation and calibrated-report tests |
 | MAT-013 | Implemented | `src/matching_eval.rs` | 30,000 hard-negative attestation and calibrated-report tests |
-| PRO-001 | Implemented | `src/provider.rs`, `src/musicbrainz.rs`, `src/operations.rs`, `src/catalog.rs` | mock provider completeness/direct-ID/queue/snapshot tests |
-| PRO-002 | Implemented | `src/provider.rs`, `src/musicbrainz.rs`, `src/operations.rs`, `src/catalog.rs` | mock provider completeness/direct-ID/queue/snapshot tests |
-| PRO-003 | Implemented | `src/provider.rs`, `src/musicbrainz.rs`, `src/operations.rs`, `src/catalog.rs` | mock provider completeness/direct-ID/queue/snapshot tests |
-| PRO-004 | Implemented | `src/provider.rs`, `src/musicbrainz.rs`, `src/operations.rs`, `src/catalog.rs` | mock provider completeness/direct-ID/queue/snapshot tests |
-| PRO-005 | Implemented | `src/provider.rs`, `src/musicbrainz.rs`, `src/operations.rs`, `src/catalog.rs` | mock provider completeness/direct-ID/queue/snapshot tests |
-| PRO-006 | Implemented | Discogs lossless/import-license types in `src/provider_policy.rs` | Discogs shape, genre/style, and license-policy tests |
-| PRO-007 | Implemented | Discogs lossless/import-license types in `src/provider_policy.rs` | Discogs shape, genre/style, and license-policy tests |
-| PRO-008 | Implemented | Discogs lossless/import-license types in `src/provider_policy.rs` | Discogs shape, genre/style, and license-policy tests |
+| PRO-001 | Implemented | `src/provider.rs`, `src/providers.rs`, `src/musicbrainz.rs`, `src/operations.rs`, `src/catalog.rs` | mock provider completeness/direct-ID/queue/snapshot tests |
+| PRO-002 | Implemented | `src/provider.rs`, `src/providers.rs`, `src/musicbrainz.rs`, `src/operations.rs`, `src/catalog.rs` | mock provider completeness/direct-ID/queue/snapshot tests |
+| PRO-003 | Implemented | `src/provider.rs`, `src/providers.rs`, `src/musicbrainz.rs`, `src/operations.rs`, `src/catalog.rs` | mock provider completeness/direct-ID/queue/snapshot tests |
+| PRO-004 | Implemented | `src/provider.rs`, `src/providers.rs`, `src/musicbrainz.rs`, `src/operations.rs`, `src/catalog.rs` | mock provider completeness/direct-ID/queue/snapshot tests |
+| PRO-005 | Implemented | `src/provider.rs`, `src/providers.rs`, `src/musicbrainz.rs`, `src/operations.rs`, `src/catalog.rs` | mock provider completeness/direct-ID/queue/snapshot tests |
+| PRO-006 | Implemented | `src/discogs.rs`, lossless/import-license types in `src/provider_policy.rs` | Discogs response, shape, genre/style, and license-policy tests |
+| PRO-007 | Implemented | `src/discogs.rs`, lossless/import-license types in `src/provider_policy.rs` | Discogs response, shape, genre/style, and license-policy tests |
+| PRO-008 | Implemented | `src/discogs.rs`, lossless/import-license types in `src/provider_policy.rs` | Discogs response, shape, genre/style, and license-policy tests |
 | PRO-009 | Implemented | typed AcoustID recording evidence in `src/provider_policy.rs` | scope-enforcement and deserialization tests |
 | PRO-010 | Implemented | curation provenance and lawful-ingest policy in `src/provider_policy.rs` | source-policy, rating-boundary, and prohibition tests |
 | PRO-011 | Implemented | curation provenance and lawful-ingest policy in `src/provider_policy.rs` | source-policy, rating-boundary, and prohibition tests |
@@ -104,8 +104,8 @@ artifact gates are in `.github/workflows/release.yml`.
 | ART-007 | Implemented | `src/artwork.rs`, provider artwork provenance | bounded decode, roles, content-addressing, deterministic ICC-sRGB tests |
 | ART-008 | Implemented | `src/artwork_projection.rs` | embedded/external replace/remove and exhaustive recovery-boundary tests |
 | ART-009 | Implemented | `src/artwork_projection.rs` | embedded/external replace/remove and exhaustive recovery-boundary tests |
-| NAM-001 | Implemented | `src/roots.rs`, migration 004 | root registration, capability, state, and relative-identity tests |
-| NAM-002 | Implemented | `src/roots.rs`, migration 004 | root registration, capability, state, and relative-identity tests |
+| NAM-001 | Implemented | `src/roots.rs`, migration 005 | root registration, capability, state, and relative-identity tests |
+| NAM-002 | Implemented | `src/roots.rs`, migration 005 | root registration, capability, state, and relative-identity tests |
 | NAM-003 | Implemented | `src/naming.rs`, `src/pathformat.rs` | Unicode, reserved-name, grapheme, collision, edition-profile property tests |
 | NAM-004 | Implemented | `src/naming.rs`, `src/pathformat.rs` | Unicode, reserved-name, grapheme, collision, edition-profile property tests |
 | NAM-005 | Implemented | `src/naming.rs`, `src/pathformat.rs` | Unicode, reserved-name, grapheme, collision, edition-profile property tests |
@@ -121,8 +121,8 @@ artifact gates are in `.github/workflows/release.yml`.
 | OPS-005 | Implemented | `benchmarks/` release benchmark | million-track threshold-enforcing benchmark |
 | OPS-006 | Implemented | durable plan cursors/events/jobs in `src/fixity.rs` and `src/operations.rs` | resume/cancel and provider retry tests |
 | OPS-007 | Implemented | durable plan cursors/events/jobs in `src/fixity.rs` and `src/operations.rs` | resume/cancel and provider retry tests |
-| OPS-008 | Implemented | measured indexes, WAL, aggregate schema in migrations 005/009 | migration and million-track workload tests |
-| OPS-009 | Implemented | measured indexes, WAL, aggregate schema in migrations 005/009 | migration and million-track workload tests |
+| OPS-008 | Implemented | measured indexes, WAL, aggregate schema in migrations 006/010 | migration and million-track workload tests |
+| OPS-009 | Implemented | measured indexes, WAL, aggregate schema in migrations 006/010 | migration and million-track workload tests |
 | OPS-010 | Implemented | `docs/performance.md` and `benchmarks/` | published 30-sample p95 methodology and reference result |
 | CLI-001 | Implemented | command orchestration in `src/cli.rs`/`src/main.rs` | plan/approve/run integration workflows |
 | CLI-002 | Implemented | mutating-query preflight in `src/cli.rs` | empty/malformed query no-database tests |
@@ -138,10 +138,10 @@ artifact gates are in `.github/workflows/release.yml`.
 | ENG-003 | Implemented | failpoint framework and all journaled executors | mutation/sync/commit, writer-contention, race, ENOSPC, permission tests |
 | ENG-004 | Implemented | 13 real format fixtures and matrix-v2 golden test | all profiles and preservation assertions |
 | ENG-005 | Implemented | proptest suites and `fuzz/` targets | parser/path/matching/journal property tests and pinned fuzz smoke |
-| ENG-006 | Implemented | `.github/workflows/rust.yml` OS matrix and Rust 1.89 job | Exact Rust 1.89 local suite plus Linux/macOS/Windows CI matrix |
+| ENG-006 | Implemented | `.github/workflows/rust.yml` OS matrix and full Rust 1.89 job | hosted Rust 1.89 and Linux/macOS/Windows test suites |
 | ENG-007 | Implemented | SHA-pinned GitHub Actions and pinned tool versions | actionlint validation and workflow review |
 | ENG-008 | Implemented | `.github/workflows/release.yml`, `CHANGELOG.md`, `RELEASING.md` | checksums, CycloneDX, attestations, reproducible archives |
 | ENG-009 | Implemented | pinned `cargo-semver-checks` quality gate | baseline public-API compatibility run |
 | ENG-010 | Implemented | `deny.toml` and pinned cargo-deny job | advisory/license/source/ban check |
-| ENG-011 | Implemented | 75% safety-core line gate and selected mutation gate | 80.58% local line result; 21 caught and 1 compiler-unviable selected mutations |
+| ENG-011 | Implemented | 75% safety-core line gate and selected mutation gate | 79.27% local line result; 21 selected mutations caught and 1 compiler-unviable |
 | ENG-012 | Implemented | mock/fixture-only provider tests | test suite contains no live public-service dependency |

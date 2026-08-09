@@ -912,6 +912,7 @@ mod tests {
             artpath: Some(artwork.clone()),
             external_id: None,
             added: Utc::now(),
+            extended: crate::ExtendedMetadata::default(),
         };
         let metadata = std::fs::metadata(&track)?;
         let item = Item {
@@ -934,8 +935,10 @@ mod tests {
             release_external_id: None,
             added: Utc::now(),
             mtime: metadata.modified()?.into(),
+            singleton: false,
+            extended: crate::ExtendedMetadata::default(),
         };
-        library.commit_import(&operation, &album, &[item])?;
+        library.commit_import(&operation, Some(&album), &[item])?;
         library.complete_operation(&operation)?;
 
         let plan = RemovalPlan::build(&library, &Query::all(), true)?.approve(&library)?;

@@ -1,6 +1,6 @@
 # Requirements: Accurate, Safe, Large-Scale Music Library Management
 
-> Status: implemented product contract for rsbts 0.3, derived from the 2026-08-08 research snapshot
+> Status: implemented product contract for rsbts 0.4, derived from the 2026-08-08 research snapshot
 >
 > Rationale and evidence: [Media-library research](./media-library-research.md)
 >
