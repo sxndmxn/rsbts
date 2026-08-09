@@ -6,15 +6,33 @@
     clippy::cast_sign_loss
 )]
 
+pub mod ancillary;
+pub mod artwork;
+pub mod artwork_projection;
+pub mod asset;
+pub mod catalog;
 pub mod config;
 pub mod db;
+mod failpoints;
+pub mod fixity;
+mod fsops;
 pub mod import;
+mod lease;
+pub mod matching_eval;
+pub mod media;
 pub mod migrations;
 pub mod musicbrainz;
+pub mod naming;
+pub mod operations;
+pub mod path_projection;
 pub mod pathformat;
+pub mod preservation;
 pub mod provider;
+pub mod provider_policy;
 pub mod query;
 pub mod remove;
+pub mod roots;
+pub mod tag_projection;
 pub mod tags;
 
 use std::path::PathBuf;
@@ -24,6 +42,7 @@ use serde::{Deserialize, Serialize};
 
 /// Audio container/codec family recorded for a library item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum AudioFormat {
     Mp3,
     Flac,
@@ -33,6 +52,10 @@ pub enum AudioFormat {
     Alac,
     Wav,
     Aiff,
+    WavPack,
+    Ape,
+    Musepack,
+    Speex,
     Unknown,
 }
 
@@ -48,6 +71,10 @@ impl AudioFormat {
             "alac" => Self::Alac,
             "wav" => Self::Wav,
             "aiff" | "aif" => Self::Aiff,
+            "wv" => Self::WavPack,
+            "ape" => Self::Ape,
+            "mpc" | "mp+" | "mpp" => Self::Musepack,
+            "spx" | "speex" => Self::Speex,
             _ => Self::Unknown,
         }
     }
@@ -64,6 +91,10 @@ impl AudioFormat {
             "alac" => Self::Alac,
             "wav" => Self::Wav,
             "aiff" => Self::Aiff,
+            "wavpack" => Self::WavPack,
+            "ape" => Self::Ape,
+            "musepack" => Self::Musepack,
+            "speex" => Self::Speex,
             _ => Self::Unknown,
         }
     }
@@ -79,16 +110,66 @@ impl AudioFormat {
             Self::Alac => "ALAC",
             Self::Wav => "WAV",
             Self::Aiff => "AIFF",
+            Self::WavPack => "WavPack",
+            Self::Ape => "APE",
+            Self::Musepack => "Musepack",
+            Self::Speex => "Speex",
             Self::Unknown => "Unknown",
         }
     }
 }
 
 /// Provider-neutral external metadata identity.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ExternalId {
-    pub provider: String,
-    pub value: String,
+    pub(crate) provider: String,
+    pub(crate) value: String,
+}
+
+impl<'de> Deserialize<'de> for ExternalId {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            provider: String,
+            value: String,
+        }
+
+        let value = Wire::deserialize(deserializer)?;
+        Self::new(value.provider, value.value).map_err(serde::de::Error::custom)
+    }
+}
+
+impl ExternalId {
+    pub fn new(provider: impl Into<String>, value: impl Into<String>) -> Result<Self> {
+        let provider = provider.into();
+        let value = value.into();
+        if provider.trim().is_empty()
+            || value.trim().is_empty()
+            || provider.len() > 128
+            || value.len() > 512
+            || provider.chars().any(char::is_control)
+            || value.chars().any(char::is_control)
+        {
+            return Err(Error::Import(
+                "external ID provider and value must be non-empty, bounded, and control-free"
+                    .into(),
+            ));
+        }
+        Ok(Self { provider, value })
+    }
+
+    #[must_use]
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    #[must_use]
+    pub fn value(&self) -> &str {
+        &self.value
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,13 +263,14 @@ fn validate_external_id(external_id: Option<&ExternalId>) -> Result<()> {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("Database error: {0}")]
-    Database(#[from] rusqlite::Error),
+    Database(String),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     #[error("Tag error: {0}")]
-    Tag(#[from] lofty::error::LoftyError),
+    Tag(String),
     #[error("Configuration error: {0}")]
     Config(String),
     #[error("Import error: {0}")]
@@ -201,6 +283,48 @@ pub enum Error {
     Query(String),
     #[error("Recovery required: {0}")]
     Recovery(String),
+    #[error("Collection lease error: {0}")]
+    Lease(String),
+    #[error("Catalog error: {0}")]
+    Catalog(String),
+    #[error("JSON error: {0}")]
+    Json(String),
+    #[error("Media error: {0}")]
+    Media(String),
+    #[error("Library root error: {0}")]
+    Root(String),
+    #[error("Operation state error: {0}")]
+    Operation(String),
+    #[error("Artwork error: {0}")]
+    Artwork(String),
+    #[error("Image decoding error: {0}")]
+    Image(String),
+    #[error("Preservation error: {0}")]
+    Preservation(String),
+}
+
+impl From<rusqlite::Error> for Error {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Database(error.to_string())
+    }
+}
+
+impl From<lofty::error::LoftyError> for Error {
+    fn from(error: lofty::error::LoftyError) -> Self {
+        Self::Tag(error.to_string())
+    }
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Json(error.to_string())
+    }
+}
+
+impl From<image::ImageError> for Error {
+    fn from(error: image::ImageError) -> Self {
+        Self::Image(error.to_string())
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -220,8 +344,34 @@ mod tests {
             AudioFormat::Alac,
             AudioFormat::Wav,
             AudioFormat::Aiff,
+            AudioFormat::WavPack,
+            AudioFormat::Ape,
+            AudioFormat::Musepack,
+            AudioFormat::Speex,
         ] {
             assert_eq!(AudioFormat::from_storage(format.as_str()), format);
         }
+    }
+
+    #[test]
+    fn invariant_newtypes_validate_deserialization_boundaries() {
+        use crate::catalog::{Confidence, EntityId, PartialDate};
+        use crate::fixity::FixityScheduleId;
+        use crate::operations::PlanId;
+        use crate::provider_policy::{AcousticFingerprint, CommunityRating};
+        use crate::roots::RootId;
+        use crate::ExternalId;
+
+        assert!(serde_json::from_str::<EntityId>(r#""not-a-uuid""#).is_err());
+        assert!(serde_json::from_str::<PlanId>(r#""not-a-uuid""#).is_err());
+        assert!(serde_json::from_str::<RootId>(r#""not-a-uuid""#).is_err());
+        assert!(serde_json::from_str::<FixityScheduleId>(r#""not-a-uuid""#).is_err());
+        assert!(serde_json::from_str::<Confidence>("1.01").is_err());
+        assert!(serde_json::from_str::<CommunityRating>("5.01").is_err());
+        assert!(serde_json::from_str::<PartialDate>(r#""2026-99""#).is_err());
+        assert!(serde_json::from_str::<AcousticFingerprint>(r#""""#).is_err());
+        assert!(
+            serde_json::from_str::<ExternalId>(r#"{"provider":"", "value":"release"}"#).is_err()
+        );
     }
 }

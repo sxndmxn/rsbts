@@ -9,13 +9,19 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
+use crate::artwork::ArtworkRole;
 use crate::config::MusicBrainzConfig;
-use crate::provider::{MetadataProvider, ProviderTrack, ReleaseCandidate, ReleaseQuery};
+use crate::provider::{
+    ArtworkCandidate, EditionEvidence, MetadataProvider, ProviderEntityId, ProviderEntityKind,
+    ProviderFailure, ProviderTrack, ReleaseCandidate, ReleaseQuery, SearchPage,
+};
 use crate::{Error, Result};
 
 const API_BASE: &str = "https://musicbrainz.org/ws/2";
 const MAX_METADATA_BYTES: usize = 8 * 1024 * 1024;
 const MAX_COVER_ART_BYTES: usize = 20 * 1024 * 1024;
+const MAX_COVER_ART_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+const MAX_COVER_ART_IMAGES: usize = 32;
 const MAX_RETRY_AFTER_SECONDS: u64 = 60;
 
 pub struct MusicBrainzProvider {
@@ -36,6 +42,20 @@ struct Release {
     title: String,
     #[serde(default)]
     date: Option<String>,
+    #[serde(default)]
+    country: Option<String>,
+    #[serde(default)]
+    disambiguation: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    packaging: Option<String>,
+    #[serde(default)]
+    barcode: Option<String>,
+    #[serde(rename = "release-group", default)]
+    group: Option<ReleaseGroup>,
+    #[serde(rename = "label-info", default)]
+    label_info: Vec<LabelInfo>,
     #[serde(rename = "artist-credit", default)]
     artist_credit: Vec<ArtistCredit>,
     #[serde(default)]
@@ -48,11 +68,34 @@ struct Release {
 struct ArtistCredit {
     artist: Artist,
     #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
     joinphrase: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct Artist {
+    id: String,
+    name: String,
+    #[serde(rename = "sort-name", default)]
+    sort_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ReleaseGroup {
+    id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LabelInfo {
+    #[serde(rename = "catalog-number", default)]
+    catalog_number: Option<String>,
+    #[serde(default)]
+    label: Option<Label>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct Label {
     name: String,
 }
 
@@ -61,12 +104,27 @@ struct Medium {
     #[serde(default)]
     position: u32,
     #[serde(default)]
+    format: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(rename = "track-count", default)]
+    track_count: Option<u32>,
+    #[serde(default)]
+    discs: Vec<Disc>,
+    #[serde(rename = "data-tracks", default)]
+    data_tracks: Vec<Track>,
+    #[serde(default)]
+    pregap: Option<Track>,
+    #[serde(default)]
     tracks: Vec<Track>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct Track {
+    id: String,
     number: String,
+    #[serde(default)]
+    position: Option<u32>,
     title: String,
     length: Option<u64>,
     recording: Recording,
@@ -79,12 +137,37 @@ struct Recording {
     id: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct Disc {
+    id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CoverArtResponse {
+    #[serde(default)]
+    images: Vec<CoverArtImage>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CoverArtImage {
+    image: String,
+    #[serde(default)]
+    types: Vec<String>,
+    #[serde(default)]
+    front: bool,
+    #[serde(default)]
+    back: bool,
+    #[serde(default)]
+    approved: bool,
+}
+
 impl MusicBrainzProvider {
     pub fn new(config: &MusicBrainzConfig) -> Result<Self> {
         config.validate()?;
         let http = reqwest::Client::builder()
             .user_agent(&config.user_agent)
             .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::limited(5))
             .build()
             .map_err(|error| Error::Provider(format!("cannot create HTTP client: {error}")))?;
         let request_interval = Duration::try_from_secs_f64(config.rate_limit_seconds)
@@ -130,14 +213,63 @@ impl MusicBrainzProvider {
         }
     }
 
-    async fn lookup_release(&self, release_id: &str, score: u32) -> Result<ReleaseCandidate> {
+    async fn lookup_release_detail(
+        &self,
+        release_id: &str,
+        score: u32,
+        explicit_id: bool,
+    ) -> Result<ReleaseCandidate> {
         let release_id = urlencoding::encode(release_id);
-        let url = format!("{API_BASE}/release/{release_id}?inc=recordings+artist-credits&fmt=json");
+        let url = format!(
+            "{API_BASE}/release/{release_id}?inc=recordings+artist-credits+release-groups+labels+discids&fmt=json"
+        );
         let response = self.get_with_retry(&url).await?;
         ensure_success(&response, "release lookup")?;
         let mut release: Release = decode_json_limited(response, "release lookup").await?;
         release.score = score;
-        Ok(release.into_candidate())
+        Ok(release.into_candidate(explicit_id))
+    }
+
+    async fn fetch_limited_bytes(
+        &self,
+        url: &str,
+        limit: usize,
+        description: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let parsed = reqwest::Url::parse(url)
+            .map_err(|error| Error::Provider(format!("invalid {description} URL: {error}")))?;
+        let host = parsed.host_str().unwrap_or_default();
+        if parsed.scheme() != "https"
+            || !(host == "coverartarchive.org"
+                || host == "archive.org"
+                || host.ends_with(".archive.org"))
+        {
+            return Err(Error::Provider(format!(
+                "refusing untrusted {description} URL"
+            )));
+        }
+        let mut response = self.get_with_retry(parsed.as_str()).await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        ensure_success(&response, description)?;
+        if response
+            .content_length()
+            .is_some_and(|length| length > limit as u64)
+        {
+            return Err(Error::Provider(format!(
+                "{description} exceeds the {limit}-byte limit"
+            )));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| Error::Provider(error.to_string()))?
+        {
+            append_limited(&mut bytes, &chunk, limit, description)?;
+        }
+        Ok(Some(bytes))
     }
 }
 
@@ -147,11 +279,7 @@ impl MetadataProvider for MusicBrainzProvider {
         "musicbrainz"
     }
 
-    async fn search_releases(
-        &self,
-        query: &ReleaseQuery,
-        limit: u32,
-    ) -> Result<Vec<ReleaseCandidate>> {
+    async fn search_releases(&self, query: &ReleaseQuery, limit: u32) -> Result<SearchPage> {
         let expression = format!(
             "artist:\"{}\" AND release:\"{}\"",
             escape_lucene_phrase(&query.artist),
@@ -165,48 +293,139 @@ impl MetadataProvider for MusicBrainzProvider {
         ensure_success(&response, "release search")?;
         let result: ReleaseSearchResult = decode_json_limited(response, "release search").await?;
 
-        let mut candidates = Vec::with_capacity(result.releases.len());
-        let mut first_error = None;
+        let requested = result.releases.len();
+        let mut candidates = Vec::with_capacity(requested);
+        let mut errors = Vec::new();
         for release in result.releases {
-            match self.lookup_release(&release.id, release.score).await {
+            match self
+                .lookup_release_detail(&release.id, release.score, false)
+                .await
+            {
                 Ok(candidate) => candidates.push(candidate),
-                Err(error) if first_error.is_none() => first_error = Some(error),
-                Err(_) => {}
+                Err(error) => errors.push(ProviderFailure {
+                    external_id: Some(release.id),
+                    detail: error.to_string(),
+                    retriable: true,
+                }),
             }
         }
-        if candidates.is_empty() {
-            if let Some(error) = first_error {
-                return Err(error);
-            }
+        let resolved = candidates.len();
+        Ok(SearchPage {
+            candidates,
+            requested,
+            resolved,
+            complete: errors.is_empty(),
+            errors,
+        })
+    }
+
+    async fn lookup_release(&self, id: &ProviderEntityId) -> Result<ReleaseCandidate> {
+        if id.provider() != self.name() || id.kind() != ProviderEntityKind::Release {
+            return Err(Error::Provider(
+                "MusicBrainz direct release lookup requires a MusicBrainz release ID".into(),
+            ));
         }
-        Ok(candidates)
+        self.lookup_release_detail(id.value(), 0, true).await
     }
 
     async fn fetch_cover_art(&self, release_id: &str) -> Result<Option<Vec<u8>>> {
-        let release_id = urlencoding::encode(release_id);
-        let url = format!("https://coverartarchive.org/release/{release_id}/front");
-        let mut response = self.get_with_retry(&url).await?;
-        if response.status() == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        ensure_success(&response, "cover-art lookup")?;
-        if response
-            .content_length()
-            .is_some_and(|length| length > MAX_COVER_ART_BYTES as u64)
-        {
+        let artwork = self.fetch_artwork(release_id).await?;
+        Ok(artwork
+            .into_iter()
+            .find(|candidate| candidate.role() == &ArtworkRole::Front)
+            .map(|candidate| candidate.bytes().to_vec()))
+    }
+
+    async fn fetch_artwork(&self, release_id: &str) -> Result<Vec<ArtworkCandidate>> {
+        let encoded = urlencoding::encode(release_id);
+        let endpoint = format!("https://coverartarchive.org/release/{encoded}");
+        let Some(payload) = self
+            .fetch_limited_bytes(&endpoint, MAX_METADATA_BYTES, "cover-art metadata")
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
+        let response: CoverArtResponse = serde_json::from_slice(&payload)
+            .map_err(|error| Error::Provider(format!("invalid cover-art metadata: {error}")))?;
+        if response.images.len() > MAX_COVER_ART_IMAGES {
             return Err(Error::Provider(format!(
-                "cover art exceeds the {MAX_COVER_ART_BYTES}-byte limit"
+                "cover-art response exceeds the {MAX_COVER_ART_IMAGES}-image limit"
             )));
         }
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|error| Error::Provider(error.to_string()))?
-        {
-            append_limited(&mut bytes, &chunk, MAX_COVER_ART_BYTES, "cover art")?;
+        let mut total = 0_usize;
+        let mut output = Vec::new();
+        for image in response.images.into_iter().filter(|image| image.approved) {
+            let Some(bytes) = self
+                .fetch_limited_bytes(&image.image, MAX_COVER_ART_BYTES, "cover art")
+                .await?
+            else {
+                continue;
+            };
+            total = total
+                .checked_add(bytes.len())
+                .filter(|total| *total <= MAX_COVER_ART_TOTAL_BYTES)
+                .ok_or_else(|| Error::Provider("cover-art set exceeds total byte limit".into()))?;
+            let role = cover_art_role(&image);
+            output.push(ArtworkCandidate::new(
+                bytes,
+                role,
+                image.image,
+                Some(release_id.to_owned()),
+                true,
+                Some("source-specific:cover-art-archive".into()),
+            )?);
         }
-        Ok(Some(bytes))
+        Ok(output)
+    }
+}
+
+fn cover_art_role(image: &CoverArtImage) -> ArtworkRole {
+    if image.front
+        || image
+            .types
+            .iter()
+            .any(|kind| kind.eq_ignore_ascii_case("front"))
+    {
+        ArtworkRole::Front
+    } else if image.back
+        || image
+            .types
+            .iter()
+            .any(|kind| kind.eq_ignore_ascii_case("back"))
+    {
+        ArtworkRole::Back
+    } else if image
+        .types
+        .iter()
+        .any(|kind| kind.eq_ignore_ascii_case("booklet"))
+    {
+        ArtworkRole::Booklet
+    } else if image
+        .types
+        .iter()
+        .any(|kind| kind.eq_ignore_ascii_case("medium") || kind.eq_ignore_ascii_case("disc"))
+    {
+        ArtworkRole::Disc
+    } else if image
+        .types
+        .iter()
+        .any(|kind| kind.eq_ignore_ascii_case("obi"))
+    {
+        ArtworkRole::Obi
+    } else if image
+        .types
+        .iter()
+        .any(|kind| kind.eq_ignore_ascii_case("spine"))
+    {
+        ArtworkRole::Spine
+    } else {
+        ArtworkRole::Other(
+            image
+                .types
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "other".into()),
+        )
     }
 }
 
@@ -222,7 +441,7 @@ impl Release {
             .and_then(|year| year.parse().ok())
     }
 
-    fn into_candidate(self) -> ReleaseCandidate {
+    fn into_candidate(self, explicit_id: bool) -> ReleaseCandidate {
         let artist = self.artist_name();
         let year = self.year();
         let tracks = self
@@ -230,23 +449,87 @@ impl Release {
             .iter()
             .flat_map(|medium| {
                 let artist = artist.clone();
-                medium.tracks.iter().map(move |track| {
-                    let track_artist = if track.artist_credit.is_empty() {
-                        artist.clone()
-                    } else {
-                        format_artist_credit(&track.artist_credit)
-                    };
-                    ProviderTrack {
-                        external_id: track.recording.id.clone(),
-                        title: track.title.clone(),
-                        artist: track_artist,
-                        number: parse_track_number(&track.number),
-                        disc: (medium.position > 0).then_some(medium.position),
-                        length_ms: track.length,
-                    }
-                })
+                medium
+                    .tracks
+                    .iter()
+                    .chain(medium.data_tracks.iter())
+                    .map(move |track| {
+                        let track_artist = if track.artist_credit.is_empty() {
+                            artist.clone()
+                        } else {
+                            format_artist_credit(&track.artist_credit)
+                        };
+                        ProviderTrack {
+                            external_id: track.recording.id.clone(),
+                            release_track_external_id: Some(track.id.clone()),
+                            title: track.title.clone(),
+                            artist: track_artist,
+                            number: track.position.or_else(|| parse_track_number(&track.number)),
+                            printed_position: Some(track.number.clone()),
+                            disc: (medium.position > 0).then_some(medium.position),
+                            length_ms: track.length,
+                            is_hidden: false,
+                            is_data_track: medium
+                                .data_tracks
+                                .iter()
+                                .any(|data| data.id == track.id),
+                            pregap_ms: None,
+                        }
+                    })
             })
             .collect();
+        let edition = EditionEvidence {
+            explicit_id,
+            release_group_external_id: self.group.map(|group| group.id),
+            disambiguation: self.disambiguation,
+            country: self.country,
+            date: self.date.clone(),
+            status: self.status,
+            packaging: self.packaging,
+            barcode: self.barcode,
+            labels_and_catalog_numbers: self
+                .label_info
+                .into_iter()
+                .map(|info| {
+                    (
+                        info.label
+                            .map_or_else(|| "[no label]".into(), |label| label.name),
+                        info.catalog_number,
+                    )
+                })
+                .collect(),
+            media_formats: self
+                .media
+                .iter()
+                .filter_map(|medium| medium.format.clone())
+                .collect(),
+            disc_ids: self
+                .media
+                .iter()
+                .flat_map(|medium| medium.discs.iter().map(|disc| disc.id.clone()))
+                .collect(),
+            source_evidence: self
+                .media
+                .iter()
+                .flat_map(|medium| {
+                    [
+                        medium
+                            .title
+                            .as_ref()
+                            .map(|title| format!("medium title: {title}")),
+                        medium
+                            .track_count
+                            .map(|count| format!("medium track count: {count}")),
+                        medium
+                            .pregap
+                            .as_ref()
+                            .map(|track| format!("pregap: {}", track.number)),
+                    ]
+                    .into_iter()
+                    .flatten()
+                })
+                .collect(),
+        };
         ReleaseCandidate {
             provider: "musicbrainz".into(),
             external_id: self.id,
@@ -255,13 +538,16 @@ impl Release {
             year,
             provider_score: f64::from(self.score.min(100)) / 100.0,
             tracks,
+            edition,
         }
     }
 }
 
 fn format_artist_credit(credits: &[ArtistCredit]) -> String {
     credits.iter().fold(String::new(), |mut output, credit| {
-        let _ = write!(output, "{}{}", credit.artist.name, credit.joinphrase);
+        let name = credit.name.as_ref().unwrap_or(&credit.artist.name);
+        let _ = write!(output, "{name}{}", credit.joinphrase);
+        let _ = (&credit.artist.id, &credit.artist.sort_name);
         output
     })
 }

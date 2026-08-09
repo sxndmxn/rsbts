@@ -1,0 +1,42 @@
+[package]
+name = "rsbts-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+chrono = "0.4"
+libfuzzer-sys = "0.4"
+rsbts = { path = ".." }
+serde_json = "1"
+
+[[bin]]
+name = "query_parser"
+path = "fuzz_targets/query_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "path_rendering"
+path = "fuzz_targets/path_rendering.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "matching"
+path = "fuzz_targets/matching.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "journal_transitions"
+path = "fuzz_targets/journal_transitions.rs"
+test = false
+doc = false
+bench = false
