@@ -45,7 +45,7 @@ jobs:
         run: cargo semver-checks --baseline-rev origin/${{ github.base_ref }}
 
   test:
-    name: Tests (${{ matrix.os }})
+    name: build (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -59,8 +59,12 @@ jobs:
         run: cargo test --locked --all-targets
 
   msrv:
-    name: Minimum Rust 1.89
-    runs-on: ubuntu-latest
+    name: msrv (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 35
     steps:
       - name: Check out reviewed source
