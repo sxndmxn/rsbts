@@ -275,6 +275,7 @@ pub async fn run(
             link,
             in_place,
             dry_run,
+            existing_tags,
             yes,
         } => {
             let action = if copy {
@@ -294,6 +295,7 @@ pub async fn run(
                 &paths,
                 action,
                 dry_run,
+                existing_tags,
                 yes,
                 output,
                 streams,
@@ -603,6 +605,7 @@ async fn import(
     paths: &[PathBuf],
     action: Action,
     dry_run: bool,
+    existing_tags: bool,
     yes: bool,
     output: OutputFormat,
     streams: &mut Streams<'_>,
@@ -663,18 +666,34 @@ async fn import(
         if output == OutputFormat::Text {
             print_album_plan(&album_plan, streams)?;
         }
-        let choice = choose_import(&album_plan, dry_run, yes || output != OutputFormat::Text)?;
-        if choice == ApprovalChoice::Skip {
+        let decision = choose_import(&album_plan, dry_run, existing_tags, yes)?;
+        if decision.choice == ApprovalChoice::Skip {
             if output == OutputFormat::Text {
-                println!("  Skipped");
+                if decision.reason == Some("requires-review") {
+                    println!("  Skipped: requires interactive review or --existing-tags");
+                    for failure in &decision.gate_failures {
+                        println!("    - {}", terminal_safe(failure));
+                    }
+                } else {
+                    println!("  Skipped");
+                }
             }
-            execution
-                .push(serde_json::json!({"album": album_plan.source_album, "state": "skipped"}));
+            let mut result = serde_json::json!({
+                "album": album_plan.source_album,
+                "state": "skipped",
+            });
+            if let Some(reason) = decision.reason {
+                result["reason"] = serde_json::json!(reason);
+            }
+            if !decision.gate_failures.is_empty() {
+                result["gate_failures"] = serde_json::json!(decision.gate_failures);
+            }
+            execution.push(result);
             partial = true;
             continue;
         }
         let approved = ImportPlanner::new(library, &provider, options.clone())
-            .approve(&album_plan, choice)
+            .approve(&album_plan, decision.choice)
             .await;
         let Some(approved) = (match approved {
             Ok(approved) => approved,
@@ -701,8 +720,11 @@ async fn import(
             if output == OutputFormat::Text {
                 println!("  Dry run: no changes made");
             }
-            execution
-                .push(serde_json::json!({"album": album_plan.source_album, "state": "previewed"}));
+            execution.push(serde_json::json!({
+                "album": album_plan.source_album,
+                "state": "previewed",
+                "selection": decision.selection,
+            }));
             continue;
         }
         match ImportExecutor::new(library).execute(approved) {
@@ -747,12 +769,61 @@ async fn import(
     })
 }
 
-fn choose_import(plan: &AlbumPlan, dry_run: bool, yes: bool) -> Result<ApprovalChoice> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImportDecision {
+    choice: ApprovalChoice,
+    selection: &'static str,
+    reason: Option<&'static str>,
+    gate_failures: Vec<String>,
+}
+
+impl ImportDecision {
+    const fn selected(choice: ApprovalChoice, selection: &'static str) -> Self {
+        Self {
+            choice,
+            selection,
+            reason: None,
+            gate_failures: Vec::new(),
+        }
+    }
+
+    fn requires_review(plan: &AlbumPlan) -> Self {
+        Self {
+            choice: ApprovalChoice::Skip,
+            selection: "requires-review",
+            reason: Some("requires-review"),
+            gate_failures: unattended_gate_failures(plan),
+        }
+    }
+}
+
+fn choose_import(
+    plan: &AlbumPlan,
+    dry_run: bool,
+    existing_tags: bool,
+    yes: bool,
+) -> Result<ImportDecision> {
+    if existing_tags {
+        if dry_run || yes || confirm("Import this album with existing tags?")? {
+            return Ok(ImportDecision::selected(
+                ApprovalChoice::AsIs,
+                "existing-tags",
+            ));
+        }
+        return Ok(ImportDecision::selected(ApprovalChoice::Skip, "declined"));
+    }
+
     if dry_run || yes {
-        // Fuzzy provider metadata is review-only until the calibrated hard-negative
-        // release gate is met. Non-interactive and dry-run decisions therefore use
-        // local tags and exercise the same safe acceptance path.
-        return Ok(ApprovalChoice::AsIs);
+        // Fuzzy provider metadata remains review-only until the calibrated
+        // hard-negative attestation is wired into production. A complete direct
+        // lookup by a common embedded release ID has independent uniqueness
+        // evidence, but must still pass every structural confidence gate.
+        return Ok(unattended_exact_candidate(plan).map_or_else(
+            || ImportDecision::requires_review(plan),
+            |index| {
+                ImportDecision::selected(ApprovalChoice::Candidate(index), "embedded-release-id")
+            },
+        ));
     }
 
     let mut choices = plan
@@ -781,11 +852,86 @@ fn choose_import(plan: &AlbumPlan, dry_run: bool, yes: bool) -> Result<ApprovalC
         .default(0)
         .interact()
         .map_err(|error| Error::Import(format!("cannot read selection: {error}")))?;
-    match selected.cmp(&plan.candidates.len()) {
-        std::cmp::Ordering::Less => Ok(ApprovalChoice::Candidate(selected)),
-        std::cmp::Ordering::Equal => Ok(ApprovalChoice::AsIs),
-        std::cmp::Ordering::Greater => Ok(ApprovalChoice::Skip),
+    Ok(match selected.cmp(&plan.candidates.len()) {
+        std::cmp::Ordering::Less => {
+            ImportDecision::selected(ApprovalChoice::Candidate(selected), "candidate")
+        }
+        std::cmp::Ordering::Equal => {
+            ImportDecision::selected(ApprovalChoice::AsIs, "existing-tags")
+        }
+        std::cmp::Ordering::Greater => ImportDecision::selected(ApprovalChoice::Skip, "declined"),
+    })
+}
+
+fn common_embedded_release_id(plan: &AlbumPlan) -> Option<(&str, &str)> {
+    let first = plan.items.first()?.release_external_id.as_ref()?;
+    if first.kind() != "release"
+        || !plan.items.iter().all(|item| {
+            item.release_external_id.as_ref().is_some_and(|id| {
+                id.kind() == "release"
+                    && id.provider() == first.provider()
+                    && id.value() == first.value()
+            })
+        })
+    {
+        return None;
     }
+    Some((first.provider(), first.value()))
+}
+
+fn unattended_exact_candidate(plan: &AlbumPlan) -> Option<usize> {
+    if plan.lookup_error.is_some() || !plan.candidate_set_complete {
+        return None;
+    }
+    let (provider, release_id) = common_embedded_release_id(plan)?;
+    let mut matches = plan.candidates.iter().enumerate().filter(|(_, candidate)| {
+        candidate.release.provider == provider
+            && candidate.release.external_id == release_id
+            && candidate.release.edition.explicit_id
+            && candidate.confidence.candidate_set_complete
+            && candidate.confidence.high_confidence
+            && (candidate.confidence.exact_release_identity - 1.0).abs() < f64::EPSILON
+    });
+    let (index, _) = matches.next()?;
+    matches.next().is_none().then_some(index)
+}
+
+fn unattended_gate_failures(plan: &AlbumPlan) -> Vec<String> {
+    let mut failures = Vec::new();
+    if let Some(error) = &plan.lookup_error {
+        failures.push(format!("provider lookup failed: {error}"));
+    }
+    if !plan.candidate_set_complete {
+        failures.push("provider candidate set is incomplete".into());
+    }
+    let common_id = common_embedded_release_id(plan);
+    if common_id.is_none() {
+        failures.push("no common embedded release ID is present on every source track".into());
+    }
+    if plan.candidates.is_empty() {
+        failures.push("no provider candidate resolved".into());
+    } else {
+        failures.extend(plan.candidates[0].confidence.gate_failures.iter().cloned());
+        if common_id.is_some()
+            && !plan.candidates.iter().any(|candidate| {
+                common_id.is_some_and(|(provider, release_id)| {
+                    candidate.release.provider == provider
+                        && candidate.release.external_id == release_id
+                        && candidate.release.edition.explicit_id
+                })
+            })
+        {
+            failures.push("no provider candidate matches the common embedded release ID".into());
+        }
+    }
+    failures.sort();
+    failures.dedup();
+    if failures.is_empty() {
+        failures.push(
+            "candidate did not satisfy the strict embedded-release-ID acceptance policy".into(),
+        );
+    }
+    failures
 }
 
 fn print_album_plan(plan: &AlbumPlan, streams: &mut Streams<'_>) -> CliResult<()> {
@@ -2341,8 +2487,14 @@ pub fn terminal_safe(value: impl Display) -> String {
 #[cfg(test)]
 mod tests {
     use std::io::{self, Write};
+    use std::path::PathBuf;
 
-    use super::{terminal_safe, CliError, Streams};
+    use chrono::Utc;
+    use rsbts::import::{AlbumPlan, ApprovalChoice, ConfidenceBreakdown, ScoredCandidate};
+    use rsbts::provider::{EditionEvidence, ReleaseCandidate};
+    use rsbts::{AudioFormat, ExtendedMetadata, ExternalId, Item};
+
+    use super::{choose_import, terminal_safe, CliError, Streams};
 
     struct BrokenWriter;
 
@@ -2389,6 +2541,129 @@ mod tests {
         streams.diagnostic(format_args!("warning"))?;
         assert_eq!(stdout, b"record\n");
         assert_eq!(stderr, b"warning\n");
+        Ok(())
+    }
+
+    fn decision_plan() -> Result<AlbumPlan, rsbts::Error> {
+        let release_id = ExternalId::new_typed("test", "release", "release-1")?;
+        let item = Item {
+            id: None,
+            album_id: None,
+            path: PathBuf::from("track.flac"),
+            title: "Track".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            albumartist: Some("Artist".into()),
+            genre: None,
+            year: Some(2026),
+            track: Some(1),
+            disc: Some(1),
+            format: AudioFormat::Flac,
+            bitrate: 1,
+            length: 180.0,
+            file_size: Some(4),
+            track_external_id: None,
+            release_external_id: Some(release_id),
+            added: Utc::now(),
+            mtime: Utc::now(),
+            singleton: false,
+            extended: ExtendedMetadata::default(),
+        };
+        Ok(AlbumPlan {
+            source_artist: "Artist".into(),
+            source_album: "Album".into(),
+            items: vec![item],
+            candidates: vec![ScoredCandidate {
+                release: ReleaseCandidate {
+                    provider: "test".into(),
+                    external_id: "release-1".into(),
+                    title: "Album".into(),
+                    artist: "Artist".into(),
+                    year: Some(2026),
+                    provider_score: 1.0,
+                    tracks: Vec::new(),
+                    edition: EditionEvidence {
+                        explicit_id: true,
+                        ..EditionEvidence::default()
+                    },
+                },
+                confidence: ConfidenceBreakdown {
+                    artist: 1.0,
+                    album: 1.0,
+                    mean_track: 1.0,
+                    provider: 1.0,
+                    composite: 1.0,
+                    recording_identity: 1.0,
+                    release_group_identity: 1.0,
+                    exact_release_identity: 1.0,
+                    runner_up_margin: None,
+                    candidate_set_complete: true,
+                    high_confidence: true,
+                    gate_failures: Vec::new(),
+                },
+                track_matches: Vec::new(),
+            }],
+            candidate_set_complete: true,
+            lookup_error: None,
+            singleton: false,
+        })
+    }
+
+    #[test]
+    fn unattended_import_accepts_only_a_strict_direct_release_id() -> Result<(), rsbts::Error> {
+        let plan = decision_plan()?;
+        let dry_run = choose_import(&plan, true, false, false)?;
+        let confirmed = choose_import(&plan, false, false, true)?;
+
+        assert_eq!(dry_run, confirmed);
+        assert_eq!(confirmed.choice, ApprovalChoice::Candidate(0));
+        assert_eq!(confirmed.selection, "embedded-release-id");
+        Ok(())
+    }
+
+    #[test]
+    fn unattended_fuzzy_and_failed_gate_candidates_require_review() -> Result<(), rsbts::Error> {
+        let mut fuzzy = decision_plan()?;
+        fuzzy.items[0].release_external_id = None;
+        let decision = choose_import(&fuzzy, false, false, true)?;
+        assert_eq!(decision.choice, ApprovalChoice::Skip);
+        assert_eq!(decision.reason, Some("requires-review"));
+
+        let mut failed_gate = decision_plan()?;
+        failed_gate.candidates[0].confidence.high_confidence = false;
+        failed_gate.candidates[0]
+            .confidence
+            .gate_failures
+            .push("track count differs".into());
+        let decision = choose_import(&failed_gate, true, false, false)?;
+        assert_eq!(decision.choice, ApprovalChoice::Skip);
+        assert!(decision
+            .gate_failures
+            .contains(&"track count differs".into()));
+
+        let mut incomplete = decision_plan()?;
+        incomplete.candidate_set_complete = false;
+        let decision = choose_import(&incomplete, false, false, true)?;
+        assert_eq!(decision.choice, ApprovalChoice::Skip);
+        assert!(decision
+            .gate_failures
+            .contains(&"provider candidate set is incomplete".into()));
+        Ok(())
+    }
+
+    #[test]
+    fn existing_tags_is_an_explicit_unattended_selection() -> Result<(), rsbts::Error> {
+        let mut plan = decision_plan()?;
+        plan.candidates[0].confidence.high_confidence = false;
+
+        for decision in [
+            choose_import(&plan, true, true, false)?,
+            choose_import(&plan, false, true, true)?,
+        ] {
+            assert_eq!(decision.choice, ApprovalChoice::AsIs);
+            assert_eq!(decision.selection, "existing-tags");
+            assert_eq!(decision.reason, None);
+        }
         Ok(())
     }
 }

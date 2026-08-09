@@ -6,6 +6,13 @@ breaks.
 
 ## [Unreleased]
 
+### Fixed
+
+- Unattended import now abstains from review-required provider matches instead
+  of silently importing existing tags. `--existing-tags` (alias `--as-is`)
+  provides the explicit non-interactive as-is workflow, and direct embedded
+  release IDs remain eligible only after every structural confidence gate.
+
 ## [0.4.0] - 2026-08-09
 
 ### Added

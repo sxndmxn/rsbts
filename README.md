@@ -51,7 +51,8 @@ loading itself has no side effects.
 ```bash
 rsbts stats
 rsbts import --dry-run ~/Music/Incoming/album
-rsbts import ~/Music/Incoming/album
+rsbts import --existing-tags --dry-run ~/Music/Incoming/album
+rsbts import --existing-tags --yes ~/Music/Incoming/album
 rsbts import --in-place ~/Music/Already-Organized/album
 rsbts ls --limit 100
 rsbts audit
@@ -104,6 +105,13 @@ Unattended fuzzy exact-release acceptance is disabled unless a checked
 evaluation attestation proves zero false accepts in at least 30,000 independent,
 release-stratified hard negatives. Acoustic fingerprints produce recording
 candidates only.
+
+For unattended imports, `--yes` accepts provider metadata only when every
+source track carries the same embedded release ID, the provider resolves that
+exact ID, and all structural confidence gates pass. Everything else is skipped
+with exit status 2 and a `requires-review` reason. Use `--existing-tags`
+(`--as-is`) with `--yes` to explicitly import scanned embedded metadata instead;
+the same selection policy applies during `--dry-run`.
 
 Provider responses are cached as licensed raw snapshots. Canonical values are
 materialized from immutable claims by an explicit resolution policy; manual

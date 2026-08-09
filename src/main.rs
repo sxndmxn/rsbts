@@ -50,7 +50,11 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
 
-        /// Accept only candidates that pass every strict confidence gate
+        /// Import using scanned embedded metadata instead of provider metadata
+        #[arg(long, visible_alias = "as-is")]
+        existing_tags: bool,
+
+        /// Confirm strict direct-ID matches or the --existing-tags selection
         #[arg(short = 'y', long)]
         yes: bool,
     },
@@ -368,5 +372,27 @@ async fn main() -> ExitCode {
             let _ = stderr.flush();
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Cli, Commands};
+
+    #[test]
+    fn import_accepts_existing_tags_and_as_is_alias() -> Result<(), clap::Error> {
+        for flag in ["--existing-tags", "--as-is"] {
+            let arguments = Cli::try_parse_from(["rsbts", "import", flag, "album"])?;
+            assert!(matches!(
+                arguments.command,
+                Commands::Import {
+                    existing_tags: true,
+                    ..
+                }
+            ));
+        }
+        Ok(())
     }
 }

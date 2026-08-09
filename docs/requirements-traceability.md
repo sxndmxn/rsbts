@@ -27,7 +27,7 @@ artifact gates are in `.github/workflows/release.yml`.
 | SAF-012 | Implemented | typed journals across executors and migrations 005–009 | exhaustive failpoint and repeated-recovery tests |
 | SAF-013 | Implemented | `src/remove.rs` quarantine and explicit purge plans | removal, retention, purge, and purge-recovery tests |
 | SAF-014 | Implemented | read-only CLI preflight and shared planners in `src/cli.rs` | CLI dry-run filesystem/database snapshot tests |
-| SAF-015 | Implemented | read-only CLI preflight and shared planners in `src/cli.rs` | CLI dry-run filesystem/database snapshot tests |
+| SAF-015 | Implemented | read-only CLI preflight and shared import selection policy in `src/cli.rs` | CLI dry-run snapshots plus identical dry-run/confirmed decision tests |
 | SAF-016 | Implemented | execution-boundary revalidation in import/remove/projection executors | source/destination replacement and rollback tests |
 | SAF-017 | Implemented | execution-boundary revalidation in import/remove/projection executors | source/destination replacement and rollback tests |
 | SAF-018 | Implemented | execution-boundary revalidation in import/remove/projection executors | source/destination replacement and rollback tests |
@@ -57,9 +57,9 @@ artifact gates are in `.github/workflows/release.yml`.
 | CAT-013 | Implemented | `src/catalog.rs` and migration 006 | entity, claim, snapshot, resolution, lock, and refresh tests |
 | CAT-014 | Implemented | `src/ancillary.rs` and migration 009 | bounded scan/import/recovery tests for related assets |
 | CAT-015 | Implemented | normalized entity/link/segment schema in migration 006 | multidisc, compilation, role, and segment model tests |
-| MAT-001 | Implemented | `src/import.rs`, `src/provider.rs`, `src/provider_policy.rs` | matching gates, direct-ID, structural-track, lock, and abstention tests |
-| MAT-002 | Implemented | `src/import.rs`, `src/provider.rs`, `src/provider_policy.rs` | matching gates, direct-ID, structural-track, lock, and abstention tests |
-| MAT-003 | Implemented | `src/import.rs`, `src/provider.rs`, `src/provider_policy.rs` | matching gates, direct-ID, structural-track, lock, and abstention tests |
+| MAT-001 | Implemented | `src/import.rs`, `src/provider.rs`, `src/provider_policy.rs`, unattended policy in `src/cli.rs` | fuzzy review-required abstention and explicit existing-tag selection tests |
+| MAT-002 | Implemented | `src/import.rs`, `src/provider.rs`, `src/provider_policy.rs`, unattended policy in `src/cli.rs` | incomplete-result gate and unattended skip tests |
+| MAT-003 | Implemented | `src/import.rs`, `src/provider.rs`, `src/provider_policy.rs` | single-search-candidate abstention and direct embedded-ID uniqueness tests |
 | MAT-004 | Implemented | `src/import.rs`, `src/provider.rs`, `src/provider_policy.rs` | matching gates, direct-ID, structural-track, lock, and abstention tests |
 | MAT-005 | Implemented | `src/import.rs`, `src/provider.rs`, `src/provider_policy.rs` | matching gates, direct-ID, structural-track, lock, and abstention tests |
 | MAT-006 | Implemented | `src/import.rs`, `src/provider.rs`, `src/provider_policy.rs` | matching gates, direct-ID, structural-track, lock, and abstention tests |
@@ -124,7 +124,7 @@ artifact gates are in `.github/workflows/release.yml`.
 | OPS-008 | Implemented | measured indexes, WAL, aggregate schema in migrations 006/010 | migration and million-track workload tests |
 | OPS-009 | Implemented | measured indexes, WAL, aggregate schema in migrations 006/010 | migration and million-track workload tests |
 | OPS-010 | Implemented | `docs/performance.md` and `benchmarks/` | published 30-sample p95 methodology and reference result |
-| CLI-001 | Implemented | command orchestration in `src/cli.rs`/`src/main.rs` | plan/approve/run integration workflows |
+| CLI-001 | Implemented | command orchestration and explicit `--existing-tags` selection in `src/cli.rs`/`src/main.rs` | plan/approve/run workflows and unattended selection-policy tests |
 | CLI-002 | Implemented | mutating-query preflight in `src/cli.rs` | empty/malformed query no-database tests |
 | CLI-003 | Implemented | global `--output text|json|jsonl` and bounded emitters | parseable machine-output integration tests |
 | CLI-004 | Implemented | durable fixity/provider plan commands and actionable states | paged fixity plan/approve/run/results CLI test |

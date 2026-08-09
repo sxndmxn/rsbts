@@ -1458,15 +1458,21 @@ fn confidence_gate_failures(
             threshold * 100.0
         ));
     }
+    let direct_release_identity = common_release_id(items).is_some_and(|id| {
+        id.kind() == "release"
+            && id.provider() == candidate.release.provider
+            && id.value() == candidate.release.external_id
+            && candidate.release.edition.explicit_id
+    });
     match candidate.confidence.runner_up_margin {
         Some(margin) if margin + 1e-12 < required_margin => failures.push(format!(
             "runner-up margin {:.1} points is below {:.1}",
             margin * 100.0,
             required_margin * 100.0
         )),
-        None => failures
+        None if !direct_release_identity => failures
             .push("runner-up margin is unknown because fewer than two candidates resolved".into()),
-        Some(_) => {}
+        _ => {}
     }
     failures
 }
@@ -2046,6 +2052,35 @@ mod tests {
             .gate_failures
             .iter()
             .any(|failure| failure.contains("unknown")));
+    }
+
+    #[test]
+    fn a_direct_embedded_release_id_supplies_real_uniqueness_evidence() -> Result<()> {
+        let release_id = ExternalId::new_typed("test", "release", "direct")?;
+        let mut items = vec![
+            item("/tmp/one.flac".into(), "War Pigs", 1),
+            item("/tmp/two.flac".into(), "Paranoid", 2),
+        ];
+        for item in &mut items {
+            item.release_external_id = Some(release_id.clone());
+        }
+        let mut direct = release("direct", "Paranoid");
+        direct.edition.explicit_id = true;
+
+        let candidates = score_candidates(&items, vec![direct], true, 0.92, 0.05);
+
+        assert_eq!(candidates[0].confidence.runner_up_margin, None);
+        assert!(
+            candidates[0].confidence.high_confidence,
+            "{:?}",
+            candidates[0].confidence.gate_failures
+        );
+        assert!(candidates[0]
+            .confidence
+            .gate_failures
+            .iter()
+            .all(|failure| !failure.contains("runner-up")));
+        Ok(())
     }
 
     #[test]
