@@ -6,8 +6,14 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+#[cfg(not(unix))]
+use std::fs::OpenOptions;
+#[cfg(unix)]
+use std::io::{Seek, SeekFrom};
+
 use chrono::Utc;
 use indicatif::{ProgressBar, ProgressStyle};
+use num_traits::ToPrimitive;
 use pathfinding::matrix::Matrix;
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
@@ -52,6 +58,8 @@ pub enum Action {
     Copy,
     Move,
     Link,
+    #[serde(rename = "in_place", alias = "inplace")]
+    InPlace,
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +84,7 @@ pub struct ScanIssue {
 pub struct ImportPlan {
     pub albums: Vec<AlbumPlan>,
     pub scan_issues: Vec<ScanIssue>,
+    pub provider_warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,6 +95,7 @@ pub struct AlbumPlan {
     pub candidates: Vec<ScoredCandidate>,
     pub candidate_set_complete: bool,
     pub lookup_error: Option<String>,
+    pub singleton: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,7 +180,7 @@ pub struct PlannedArtwork {
 
 #[derive(Debug, Clone)]
 pub struct ApprovedAlbumPlan {
-    pub album: Album,
+    pub album: Option<Album>,
     pub tracks: Vec<PlannedTrack>,
     pub artwork: Option<PlannedArtwork>,
     pub action: Action,
@@ -215,6 +225,43 @@ impl<'a> ImportPlanner<'a> {
         let mut albums = Vec::with_capacity(groups.len());
 
         for group in groups {
+            if group.singleton {
+                let query = TrackQuery {
+                    artist: group.artist.clone(),
+                    title: group
+                        .items
+                        .first()
+                        .map_or_else(String::new, |item| item.title.clone()),
+                };
+                match self
+                    .provider
+                    .search_tracks(&query, self.options.search_limit)
+                    .await
+                {
+                    Ok(tracks) => albums.push(AlbumPlan {
+                        source_artist: group.artist,
+                        source_album: group.album,
+                        candidates: score_track_candidates(
+                            &group.items,
+                            tracks,
+                            self.options.auto_accept_threshold,
+                            self.options.runner_up_margin,
+                        ),
+                        items: group.items,
+                        lookup_error: None,
+                        singleton: true,
+                    }),
+                    Err(error) => albums.push(AlbumPlan {
+                        source_artist: group.artist,
+                        source_album: group.album,
+                        items: group.items,
+                        candidates: Vec::new(),
+                        lookup_error: Some(error.to_string()),
+                        singleton: true,
+                    }),
+                }
+                continue;
+            }
             let query = ReleaseQuery {
                 artist: group.artist.clone(),
                 album: group.album.clone(),
@@ -266,6 +313,7 @@ impl<'a> ImportPlanner<'a> {
                     candidates: Vec::new(),
                     candidate_set_complete: false,
                     lookup_error: Some(error.to_string()),
+                    singleton: false,
                 }),
             }
         }
@@ -273,6 +321,7 @@ impl<'a> ImportPlanner<'a> {
         ImportPlan {
             albums,
             scan_issues,
+            provider_warnings: self.provider.take_warnings(),
         }
     }
 
@@ -292,7 +341,7 @@ impl<'a> ImportPlanner<'a> {
         let tracks = self.plan_tracks(items)?;
         let mut warnings = Vec::new();
         let artwork = self
-            .plan_artwork(selected, &tracks, &mut album, &mut warnings)
+            .plan_artwork(selected, &tracks, album.as_mut(), &mut warnings)
             .await?;
 
         Ok(Some(ApprovedAlbumPlan {
@@ -320,21 +369,28 @@ impl<'a> ImportPlanner<'a> {
                     source.display()
                 )));
             }
-            let relative = format_relative_path(&self.options.path_format, &item)?;
-            let extension = source
-                .extension()
-                .ok_or_else(|| Error::Import(format!("missing extension: {}", source.display())))?;
-            let destination = append_extension(&self.options.library_dir.join(relative), extension);
-            validate_destination(&self.options.library_dir, &destination)?;
+            let destination = if self.options.action == Action::InPlace {
+                source.clone()
+            } else {
+                let relative = format_relative_path(&self.options.path_format, &item)?;
+                let extension = source.extension().ok_or_else(|| {
+                    Error::Import(format!("missing extension: {}", source.display()))
+                })?;
+                let destination =
+                    append_extension(&self.options.library_dir.join(relative), extension);
+                validate_destination(&self.options.library_dir, &destination)?;
+                destination
+            };
             reject_duplicate_destination(&mut destinations, &source, &destination)?;
 
             let digests = digest_file(&source)?;
             let content_hash = digests.blake3().to_string();
             let destination_exists = destination.exists() || destination.is_symlink();
             let managed = self.library.item_exists(&destination)?;
+            let destination_exists = destination.exists() || destination.is_symlink();
             let already_managed =
                 destination_exists && managed && hash_path(&destination)? == content_hash;
-            if destination_exists && !already_managed {
+            if self.options.action != Action::InPlace && destination_exists && !already_managed {
                 return Err(Error::Import(format!(
                     "album destination already exists: {}",
                     destination.display()
@@ -371,10 +427,12 @@ impl<'a> ImportPlanner<'a> {
         &self,
         selected: Option<&ScoredCandidate>,
         tracks: &[PlannedTrack],
-        album: &mut Album,
+        album: Option<&mut Album>,
         warnings: &mut Vec<String>,
     ) -> Result<Option<PlannedArtwork>> {
-        let Some(candidate) = selected.filter(|_| self.options.fetch_art) else {
+        let Some(candidate) = selected.filter(|_| {
+            self.options.fetch_art && album.is_some() && self.options.action != Action::InPlace
+        }) else {
             return Ok(None);
         };
         let Some(artwork_parent) =
@@ -489,6 +547,10 @@ impl<'a> ImportExecutor<'a> {
             });
         }
 
+        if plan.action == Action::InPlace {
+            return self.execute_in_place(&plan, &active_tracks, already_managed_tracks);
+        }
+
         let transfer_id = uuid::Uuid::new_v4();
         let mut journal_files = Vec::with_capacity(
             active_tracks.len()
@@ -540,6 +602,7 @@ impl<'a> ImportExecutor<'a> {
             Action::Copy => OperationKind::ImportCopy,
             Action::Move => OperationKind::ImportMove,
             Action::Link => OperationKind::ImportLink,
+            Action::InPlace => OperationKind::ImportInPlace,
         };
         let operation_id = self.library.create_operation(kind, &journal_files)?;
         let root = match AnchoredRoot::open_or_create(&plan.library_dir) {
@@ -586,13 +649,50 @@ impl<'a> ImportExecutor<'a> {
         })
     }
 
+    fn execute_in_place(
+        &mut self,
+        plan: &ApprovedAlbumPlan,
+        active_tracks: &[&PlannedTrack],
+        already_managed_tracks: usize,
+    ) -> Result<ImportReport> {
+        for track in active_tracks {
+            validate_source(track)?;
+        }
+        let operation_id = self
+            .library
+            .create_operation(OperationKind::ImportInPlace, &[])?;
+        let items = active_tracks
+            .iter()
+            .map(|track| track.item.clone())
+            .collect::<Vec<_>>();
+        self.library
+            .commit_import(&operation_id, plan.album.as_ref(), &items)?;
+        self.library.complete_operation(&operation_id)?;
+        Ok(ImportReport {
+            imported_tracks: active_tracks.len(),
+            already_managed_tracks,
+            warnings: plan.warnings.clone(),
+            ..ImportReport::default()
+        })
+    }
+
     fn validate_plan_shape(&self, plan: &ApprovedAlbumPlan) -> Result<()> {
-        validate_album_metadata(&plan.album)?;
+        if let Some(album) = &plan.album {
+            validate_album_metadata(album)?;
+        }
         let mut sources = HashSet::new();
         let mut destinations = HashSet::new();
         for track in &plan.tracks {
             validate_item_metadata(&track.item)?;
-            validate_destination(&plan.library_dir, &track.destination)?;
+            if plan.action == Action::InPlace {
+                if track.source != track.destination {
+                    return Err(Error::Import(
+                        "in-place imports must preserve the source path".into(),
+                    ));
+                }
+            } else {
+                validate_destination(&plan.library_dir, &track.destination)?;
+            }
             if track.item.path != track.destination {
                 return Err(Error::Import(format!(
                     "planned database path does not match destination: {}",
@@ -667,6 +767,8 @@ impl<'a> ImportExecutor<'a> {
         tracks: &[&PlannedTrack],
         files: &[JournalFile],
     ) -> Result<()> {
+        let destination_root = DestinationRoot::open(&plan.library_dir)?;
+        let mut prepared = Vec::with_capacity(files.len());
         self.library
             .set_operation_state(operation_id, "staging", None)?;
         for (ordinal, track) in tracks.iter().enumerate() {
@@ -707,6 +809,10 @@ impl<'a> ImportExecutor<'a> {
             let staged_identity = file_identity(&root.entry_metadata(&files[ordinal].staged)?);
             self.library
                 .set_staged_file_identity(operation_id, ordinal, &staged_identity)?;
+            prepared.push(PreparedDestination {
+                destination,
+                identity: staged_identity,
+            });
         }
 
         if let Some(artwork) = &plan.artwork {
@@ -770,6 +876,7 @@ struct AlbumGroup {
     items: Vec<Item>,
     artist: String,
     album: String,
+    singleton: bool,
 }
 
 fn selected_candidate(
@@ -786,10 +893,19 @@ fn selected_candidate(
     }
 }
 
-fn album_and_items(plan: &AlbumPlan, selected: Option<&ScoredCandidate>) -> (Album, Vec<Item>) {
+fn album_and_items(
+    plan: &AlbumPlan,
+    selected: Option<&ScoredCandidate>,
+) -> (Option<Album>, Vec<Item>) {
     let mut items = plan.items.clone();
     if let Some(candidate) = selected {
         apply_release_metadata(&mut items, candidate);
+    }
+    if plan.singleton {
+        for item in &mut items {
+            item.singleton = true;
+        }
+        return (None, items);
     }
     let album = Album {
         id: None,
@@ -807,11 +923,13 @@ fn album_and_items(plan: &AlbumPlan, selected: Option<&ScoredCandidate>) -> (Alb
         artpath: None,
         external_id: selected.map(|candidate| ExternalId {
             provider: candidate.release.provider.clone(),
+            kind: "release".into(),
             value: candidate.release.external_id.clone(),
         }),
         added: Utc::now(),
+        extended: crate::ExtendedMetadata::default(),
     };
-    (album, items)
+    (Some(album), items)
 }
 
 fn reject_duplicate_destination(
@@ -895,6 +1013,11 @@ fn scan_paths<P: ScanProgress>(
     let mut files = Vec::new();
     let mut issues = Vec::new();
     let mut seen = HashSet::new();
+    let direct_files = paths
+        .iter()
+        .filter(|path| path.is_file())
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .collect::<HashSet<_>>();
     for path in paths {
         for entry in WalkDir::new(path).follow_links(follow_symlinks) {
             match entry {
@@ -933,7 +1056,12 @@ fn scan_paths<P: ScanProgress>(
     for path in files {
         progress.tick();
         match read_tags(&path) {
-            Ok(item) => items.push(item),
+            Ok(mut item) => {
+                item.singleton = direct_files.contains(&path)
+                    || is_placeholder(&item.album)
+                    || is_placeholder(item.effective_albumartist());
+                items.push(item);
+            }
             Err(error) => issues.push(ScanIssue {
                 path,
                 message: error.to_string(),
@@ -948,16 +1076,17 @@ fn group_into_albums(items: Vec<Item>) -> Vec<AlbumGroup> {
     let mut groups: HashMap<String, Vec<Item>> = HashMap::new();
     for item in items {
         let artist = item.effective_albumartist();
-        let known = !is_placeholder(artist) && !is_placeholder(&item.album);
+        let known = !item.singleton && !is_placeholder(artist) && !is_placeholder(&item.album);
         let key = if known {
-            format!("tag:{}\0{}", normalize(artist), normalize(&item.album))
-        } else {
+            let scope = album_scope(&item.path);
             format!(
-                "dir:{}",
-                item.path
-                    .parent()
-                    .map_or_else(String::new, |path| path.to_string_lossy().into_owned())
+                "tag:{}\0{}\0{}",
+                scope.to_string_lossy(),
+                normalize(artist),
+                normalize(&item.album)
             )
+        } else {
+            format!("singleton:{}", item.path.to_string_lossy())
         };
         groups.entry(key).or_default().push(item);
     }
@@ -971,11 +1100,158 @@ fn group_into_albums(items: Vec<Item>) -> Vec<AlbumGroup> {
             album: items
                 .first()
                 .map_or_else(|| "Unknown Album".into(), |item| item.album.clone()),
+            singleton: items.iter().all(|item| item.singleton),
             items,
         })
         .collect::<Vec<_>>();
     output.sort_by(|left, right| (&left.artist, &left.album).cmp(&(&right.artist, &right.album)));
     output
+}
+
+fn album_scope(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    let looks_like_disc = parent
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(normalize)
+        .is_some_and(|name| {
+            ["disc", "disk", "cd"].iter().any(|prefix| {
+                name.strip_prefix(prefix).is_some_and(|rest| {
+                    !rest.trim().is_empty()
+                        && rest
+                            .trim()
+                            .chars()
+                            .all(|character| character.is_ascii_digit())
+                })
+            })
+        });
+    if looks_like_disc {
+        parent.parent().unwrap_or(parent).to_path_buf()
+    } else {
+        parent.to_path_buf()
+    }
+}
+
+fn score_track_candidates(
+    items: &[Item],
+    tracks: Vec<TrackCandidate>,
+    threshold: f64,
+    required_margin: f64,
+) -> Vec<ScoredCandidate> {
+    let Some(item) = items.first() else {
+        return Vec::new();
+    };
+    let mut candidates = tracks
+        .into_iter()
+        .map(|track| {
+            let artist = similarity(&item.artist, &track.artist);
+            let title = similarity(&item.title, &track.title);
+            let duration_delta_seconds = track
+                .length_ms
+                .and_then(|length| length.to_f64())
+                .map(|length| (item.length - length / 1_000.0).abs());
+            let duration_ok =
+                duration_delta_seconds.is_none_or(|delta| delta <= DURATION_GATE_SECONDS);
+            let provider = if track.provider_score.is_finite() {
+                track.provider_score.clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let composite = artist.mul_add(0.35, title.mul_add(0.55, provider * 0.10));
+            let mut failures = Vec::new();
+            if artist < ARTIST_GATE {
+                failures.push("artist similarity is below 95%".into());
+            }
+            if title < TRACK_TITLE_GATE {
+                failures.push("title similarity is below 90%".into());
+            }
+            if !duration_ok {
+                failures.push("duration differs by more than three seconds".into());
+            }
+            let release = ReleaseCandidate {
+                provider: track.provider.clone(),
+                external_id: track.release_external_id.clone().unwrap_or_default(),
+                title: item.album.clone(),
+                artist: track.artist.clone(),
+                year: item.year,
+                provider_score: provider,
+                tracks: vec![ProviderTrack {
+                    external_id: track.external_id,
+                    title: track.title,
+                    artist: track.artist,
+                    number: item.track,
+                    disc: item.disc,
+                    length_ms: track.length_ms,
+                }],
+            };
+            ScoredCandidate {
+                release,
+                confidence: ConfidenceBreakdown {
+                    artist,
+                    album: 1.0,
+                    mean_track: title,
+                    provider,
+                    composite,
+                    runner_up_margin: 0.0,
+                    high_confidence: false,
+                    gate_failures: failures,
+                },
+                track_matches: vec![TrackMatch {
+                    item_index: 0,
+                    track_index: 0,
+                    title_similarity: title,
+                    duration_delta_seconds,
+                    number_and_disc_match: true,
+                    score: title,
+                }],
+            }
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        right
+            .confidence
+            .composite
+            .partial_cmp(&left.confidence.composite)
+            .unwrap_or(Ordering::Equal)
+    });
+    let runner_up = candidates
+        .get(1)
+        .map_or(0.0, |candidate| candidate.confidence.composite);
+    if let Some(best) = candidates.first_mut() {
+        apply_singleton_confidence_gates(best, runner_up, threshold, required_margin);
+    }
+    candidates
+}
+
+fn apply_singleton_confidence_gates(
+    best: &mut ScoredCandidate,
+    runner_up: f64,
+    threshold: f64,
+    required_margin: f64,
+) {
+    best.confidence.runner_up_margin = best.confidence.composite - runner_up;
+    let thresholds_valid =
+        (0.0..=1.0).contains(&threshold) && (0.0..=1.0).contains(&required_margin);
+    if !thresholds_valid {
+        best.confidence
+            .gate_failures
+            .push("matching thresholds are invalid".into());
+    }
+    if thresholds_valid && best.confidence.composite < threshold {
+        best.confidence.gate_failures.push(format!(
+            "composite score {:.1}% is below {:.1}%",
+            best.confidence.composite * 100.0,
+            threshold * 100.0
+        ));
+    }
+    if thresholds_valid && best.confidence.runner_up_margin < required_margin {
+        best.confidence.gate_failures.push(format!(
+            "runner-up margin {:.1}% is below {:.1}%",
+            best.confidence.runner_up_margin * 100.0,
+            required_margin * 100.0
+        ));
+    }
+    best.confidence.high_confidence = best.confidence.gate_failures.is_empty();
 }
 
 fn score_candidates(
@@ -1004,7 +1280,7 @@ fn score_candidates(
                     .iter()
                     .map(|matched| matched.score)
                     .sum::<f64>()
-                    / track_matches.len() as f64
+                    / track_matches.len().to_f64().unwrap_or(f64::MAX)
             };
             let provider = if release.provider_score.is_finite() {
                 release.provider_score.clamp(0.0, 1.0)
@@ -1228,7 +1504,8 @@ fn match_tracks(items: &[Item], tracks: &[ProviderTrack]) -> Vec<TrackMatch> {
             let duration_delta_seconds = if item.length.is_finite() {
                 provider_track
                     .length_ms
-                    .map(|milliseconds| (item.length - milliseconds as f64 / 1000.0).abs())
+                    .and_then(|milliseconds| milliseconds.to_f64())
+                    .map(|milliseconds| (item.length - milliseconds / 1000.0).abs())
             } else {
                 None
             };
@@ -1310,15 +1587,21 @@ fn match_tracks(items: &[Item], tracks: &[ProviderTrack]) -> Vec<TrackMatch> {
 }
 
 fn apply_release_metadata(items: &mut [Item], candidate: &ScoredCandidate) {
-    let release_id = ExternalId {
+    let release_id = (!candidate.release.external_id.is_empty()).then(|| ExternalId {
         provider: candidate.release.provider.clone(),
+        kind: "release".into(),
         value: candidate.release.external_id.clone(),
-    };
+    });
     for item in &mut *items {
         item.album.clone_from(&candidate.release.title);
         item.albumartist = Some(candidate.release.artist.clone());
         item.year = candidate.release.year;
-        item.release_external_id = Some(release_id.clone());
+        item.release_external_id.clone_from(&release_id);
+        if let Some(release_id) = &release_id {
+            if !item.extended.external_ids.contains(release_id) {
+                item.extended.external_ids.push(release_id.clone());
+            }
+        }
     }
     for matched in &candidate.track_matches {
         let Some(item) = items.get_mut(matched.item_index) else {
@@ -1331,10 +1614,15 @@ fn apply_release_metadata(items: &mut [Item], candidate: &ScoredCandidate) {
         item.artist.clone_from(&track.artist);
         item.track = track.number;
         item.disc = track.disc;
-        item.track_external_id = Some(ExternalId {
+        let track_id = ExternalId {
             provider: candidate.release.provider.clone(),
+            kind: "recording".into(),
             value: track.external_id.clone(),
-        });
+        };
+        item.track_external_id = Some(track_id.clone());
+        if !item.extended.external_ids.contains(&track_id) {
+            item.extended.external_ids.push(track_id);
+        }
     }
 }
 
@@ -1584,6 +1872,8 @@ mod tests {
             release_external_id: None,
             added: Utc::now(),
             mtime: Utc::now(),
+            singleton: false,
+            extended: crate::ExtendedMetadata::default(),
         }
     }
 
@@ -1838,7 +2128,10 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    // Darwin rejects this byte sequence at directory creation time, so the
+    // scanner-level fixture is only representable on Unix filesystems that
+    // permit arbitrary non-NUL path bytes.
+    #[cfg(target_os = "linux")]
     #[test]
     fn scanner_rejects_non_utf8_paths_before_reading_tags() -> Result<()> {
         use std::os::unix::ffi::OsStringExt;
@@ -1875,6 +2168,7 @@ mod tests {
             candidates: Vec::new(),
             candidate_set_complete: true,
             lookup_error: None,
+            singleton: false,
         };
         std::fs::write(&source, b"changed audio")?;
         let library = Library::open_in_memory()?;
@@ -1901,14 +2195,92 @@ mod tests {
     #[test]
     fn regular_file_finalization_never_overwrites() -> Result<()> {
         let temporary = tempfile::tempdir()?;
-        let staged = temporary.path().join("stage");
-        let destination = temporary.path().join("destination");
+        let temporary_path = temporary.path().canonicalize()?;
+        let staged = temporary_path.join("stage");
+        let destination = temporary_path.join("destination");
         std::fs::write(&staged, b"new")?;
         std::fs::write(&destination, b"old")?;
-        assert!(finalize_regular_file(&staged, &destination).is_err());
+        let root = DestinationRoot::open(&temporary_path)?;
+        let destination_file = root.resolve(&staged, &destination)?;
+        let identity = file_identity(&std::fs::symlink_metadata(&staged)?);
+        assert!(destination_file.finalize(&identity).is_err());
         let mut value = String::new();
         std::fs::File::open(destination)?.read_to_string(&mut value)?;
         assert_eq!(value, "old");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn library_creation_rejects_a_symlinked_ancestor() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let outside = temporary.path().join("outside");
+        let redirected = temporary.path().join("redirected");
+        std::fs::create_dir(&outside)?;
+        std::os::unix::fs::symlink(&outside, &redirected)?;
+
+        assert!(DestinationRoot::open(&redirected.join("library")).is_err());
+        assert!(!outside.join("library").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_rejects_a_parent_replaced_by_a_symlink() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let temporary_path = temporary.path().canonicalize()?;
+        let source = temporary_path.join("source.flac");
+        let library_dir = temporary_path.join("library");
+        let parent = library_dir.join("Artist/Album");
+        let detached = temporary_path.join("detached-album");
+        let outside = temporary_path.join("outside");
+        let staged = parent.join(".track.stage");
+        let destination = parent.join("track.flac");
+        std::fs::write(&source, b"audio")?;
+        std::fs::create_dir_all(&parent)?;
+        std::fs::create_dir(&outside)?;
+
+        let root = DestinationRoot::open(&library_dir)?;
+        let destination_file = root.resolve(&staged, &destination)?;
+        std::fs::rename(&parent, &detached)?;
+        std::os::unix::fs::symlink(&outside, &parent)?;
+
+        assert!(destination_file
+            .stage_regular(&source, &hash_path(&source)?)
+            .is_err());
+        assert!(!outside.join(".track.stage").exists());
+        assert!(!outside.join("track.flac").exists());
+        assert!(!detached.join(".track.stage").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finalization_rejects_a_parent_replaced_by_a_symlink() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let temporary_path = temporary.path().canonicalize()?;
+        let source = temporary_path.join("source.flac");
+        let library_dir = temporary_path.join("library");
+        let parent = library_dir.join("Artist/Album");
+        let detached = temporary_path.join("detached-album");
+        let outside = temporary_path.join("outside");
+        let staged = parent.join(".track.stage");
+        let destination = parent.join("track.flac");
+        std::fs::write(&source, b"audio")?;
+        std::fs::create_dir_all(&parent)?;
+        std::fs::create_dir(&outside)?;
+
+        let root = DestinationRoot::open(&library_dir)?;
+        let destination_file = root.resolve(&staged, &destination)?;
+        let identity = destination_file.stage_regular(&source, &hash_path(&source)?)?;
+        std::fs::rename(&parent, &detached)?;
+        std::os::unix::fs::symlink(&outside, &parent)?;
+
+        assert!(destination_file.finalize(&identity).is_err());
+        assert!(!outside.join(".track.stage").exists());
+        assert!(!outside.join("track.flac").exists());
+        assert!(detached.join(".track.stage").exists());
+        assert!(!detached.join("track.flac").exists());
         Ok(())
     }
 
@@ -1917,6 +2289,18 @@ mod tests {
         library_dir: &Path,
         action: Action,
     ) -> Result<ApprovedAlbumPlan> {
+        // tempfile paths are rooted at `/var` on macOS, which is itself a
+        // symlink. Runtime safety correctly rejects that alias; tests use the
+        // stable physical parent so they exercise the intended operation.
+        let library_dir = library_dir
+            .parent()
+            .ok_or_else(|| Error::Import("test library has no parent".into()))?
+            .canonicalize()?
+            .join(
+                library_dir
+                    .file_name()
+                    .ok_or_else(|| Error::Import("test library has no name".into()))?,
+            );
         let destination = library_dir.join("Artist/Album/01 - Track.flac");
         let metadata = std::fs::metadata(source)?;
         let digests = digest_file(source)?;
@@ -1924,7 +2308,7 @@ mod tests {
         planned_item.file_size = Some(metadata.len());
         planned_item.mtime = metadata.modified()?.into();
         Ok(ApprovedAlbumPlan {
-            album: Album {
+            album: Some(Album {
                 id: None,
                 album: "Album".into(),
                 albumartist: "Artist".into(),
@@ -1932,7 +2316,8 @@ mod tests {
                 artpath: None,
                 external_id: None,
                 added: Utc::now(),
-            },
+                extended: crate::ExtendedMetadata::default(),
+            }),
             tracks: vec![PlannedTrack {
                 source: source.to_path_buf(),
                 destination,
@@ -1948,7 +2333,7 @@ mod tests {
             }],
             artwork: None,
             action,
-            library_dir: library_dir.to_path_buf(),
+            library_dir,
             warnings: Vec::new(),
         })
     }
@@ -2079,7 +2464,11 @@ mod tests {
         std::fs::write(&source, b"audio")?;
         let plan = approved_plan(&source, &library_dir, Action::Copy)?;
         let destination = plan.tracks[0].destination.clone();
-        create_parent(&destination)?;
+        std::fs::create_dir_all(
+            destination.parent().ok_or_else(|| {
+                Error::Import("test destination unexpectedly has no parent".into())
+            })?,
+        )?;
         std::fs::write(&destination, b"collision")?;
         let mut library = Library::open_in_memory()?;
         assert!(ImportExecutor::new(&mut library).execute(plan).is_err());

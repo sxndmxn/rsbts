@@ -1355,6 +1355,8 @@ pub fn read_tags(path: &Path) -> Result<Item> {
         release_external_id,
         added: Utc::now(),
         mtime,
+        singleton: false,
+        extended: crate::ExtendedMetadata::default(),
     })
 }
 
@@ -1542,7 +1544,7 @@ mod tests {
         assert_eq!(item.artist, "Unknown Artist");
         assert_eq!(item.album, "Unknown Album");
         assert_eq!(item.format, AudioFormat::Wav);
-        assert_eq!(item.file_size, Some(bytes.len() as u64));
+        assert_eq!(item.file_size, u64::try_from(bytes.len()).ok());
         Ok(())
     }
 

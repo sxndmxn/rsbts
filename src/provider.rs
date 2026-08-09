@@ -76,6 +76,12 @@ pub struct ReleaseQuery {
     pub track_count: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrackQuery {
+    pub artist: String,
+    pub title: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderTrack {
     /// Recording identifier; never a release-track identifier.
@@ -224,6 +230,17 @@ impl SearchPage {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrackCandidate {
+    pub provider: String,
+    pub external_id: String,
+    pub title: String,
+    pub artist: String,
+    pub length_ms: Option<u64>,
+    pub provider_score: f64,
+    pub release_external_id: Option<String>,
+}
+
 #[async_trait]
 pub trait MetadataProvider: Send + Sync {
     fn name(&self) -> &'static str;
@@ -236,6 +253,24 @@ pub trait MetadataProvider: Send + Sync {
             "{} does not support direct {:?} lookup",
             self.name(),
             id.kind()
+        )))
+    }
+
+    async fn search_tracks(&self, _query: &TrackQuery, _limit: u32) -> Result<Vec<TrackCandidate>> {
+        Ok(Vec::new())
+    }
+
+    async fn lookup_release(&self, _release_id: &str) -> Result<ReleaseCandidate> {
+        Err(crate::Error::Provider(format!(
+            "{} does not support release lookup",
+            self.name()
+        )))
+    }
+
+    async fn lookup_track(&self, _track_id: &str) -> Result<TrackCandidate> {
+        Err(crate::Error::Provider(format!(
+            "{} does not support track lookup",
+            self.name()
         )))
     }
 

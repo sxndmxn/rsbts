@@ -339,6 +339,8 @@ mod tests {
             release_external_id: None,
             added: Utc::now(),
             mtime: Utc::now(),
+            singleton: false,
+            extended: crate::ExtendedMetadata::default(),
         }
     }
 

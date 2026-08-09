@@ -37,6 +37,29 @@ struct ReleaseSearchResult {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct RecordingSearchResult {
+    recordings: Vec<RecordingSearchEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RecordingSearchEntry {
+    id: String,
+    title: String,
+    length: Option<u64>,
+    #[serde(rename = "artist-credit", default)]
+    artist_credit: Vec<ArtistCredit>,
+    #[serde(default)]
+    releases: Vec<RecordingRelease>,
+    #[serde(default)]
+    score: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RecordingRelease {
+    id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct Release {
     id: String,
     title: String,
@@ -328,6 +351,40 @@ impl MetadataProvider for MusicBrainzProvider {
         self.lookup_release_detail(id.value(), 0, true).await
     }
 
+    async fn search_tracks(&self, query: &TrackQuery, limit: u32) -> Result<Vec<TrackCandidate>> {
+        let expression = format!(
+            "artist:\"{}\" AND recording:\"{}\"",
+            escape_lucene_phrase(&query.artist),
+            escape_lucene_phrase(&query.title)
+        );
+        let url = format!(
+            "{API_BASE}/recording?query={}&limit={limit}&fmt=json",
+            urlencoding::encode(&expression)
+        );
+        let response = self.get_with_retry(&url).await?;
+        ensure_success(&response, "recording search")?;
+        let result: RecordingSearchResult =
+            decode_json_limited(response, "recording search").await?;
+        Ok(result
+            .recordings
+            .into_iter()
+            .map(recording_candidate)
+            .collect())
+    }
+
+    async fn lookup_release(&self, release_id: &str) -> Result<ReleaseCandidate> {
+        self.lookup_release_scored(release_id, 100).await
+    }
+
+    async fn lookup_track(&self, track_id: &str) -> Result<TrackCandidate> {
+        let track_id = urlencoding::encode(track_id);
+        let url = format!("{API_BASE}/recording/{track_id}?inc=artist-credits+releases&fmt=json");
+        let response = self.get_with_retry(&url).await?;
+        ensure_success(&response, "recording lookup")?;
+        let entry: RecordingSearchEntry = decode_json_limited(response, "recording lookup").await?;
+        Ok(recording_candidate(entry))
+    }
+
     async fn fetch_cover_art(&self, release_id: &str) -> Result<Option<Vec<u8>>> {
         let artwork = self.fetch_artwork(release_id).await?;
         Ok(artwork
@@ -426,6 +483,18 @@ fn cover_art_role(image: &CoverArtImage) -> ArtworkRole {
                 .cloned()
                 .unwrap_or_else(|| "other".into()),
         )
+    }
+}
+
+fn recording_candidate(entry: RecordingSearchEntry) -> TrackCandidate {
+    TrackCandidate {
+        provider: "musicbrainz".into(),
+        external_id: entry.id,
+        title: entry.title,
+        artist: format_artist_credit(&entry.artist_credit),
+        length_ms: entry.length,
+        provider_score: f64::from(entry.score.min(100)) / 100.0,
+        release_external_id: entry.releases.first().map(|release| release.id.clone()),
     }
 }
 
@@ -580,7 +649,7 @@ async fn decode_json_limited<T: DeserializeOwned>(
 ) -> Result<T> {
     if response
         .content_length()
-        .is_some_and(|length| length > MAX_METADATA_BYTES as u64)
+        .is_some_and(|length| length > MAX_METADATA_BYTES_U64)
     {
         return Err(Error::Provider(format!(
             "{operation} response exceeds the {MAX_METADATA_BYTES}-byte limit"

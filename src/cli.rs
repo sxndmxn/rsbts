@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use chrono::Utc;
 use dialoguer::{Confirm, Select};
+use num_traits::ToPrimitive;
 
 use rsbts::catalog::{EntityId, EntityKind};
 use rsbts::config::Config;
@@ -94,6 +95,10 @@ pub async fn run(
         }
         _ => {}
     }
+    let command = match command {
+        Commands::Migrate { source } => return migrate(source, &config, streams),
+        command => command,
+    };
     let dry_run = matches!(
         &command,
         Commands::Import { dry_run: true, .. }
@@ -137,6 +142,7 @@ pub async fn run(
             copy,
             r#move,
             link,
+            in_place,
             dry_run,
             yes,
         } => {
@@ -146,6 +152,8 @@ pub async fn run(
                 Action::Move
             } else if link {
                 Action::Link
+            } else if in_place {
+                Action::InPlace
             } else {
                 config.import.action
             };
@@ -354,16 +362,18 @@ fn preflight_fixity(action: &FixityCommand) -> Result<()> {
     Ok(())
 }
 
-fn report_migration(library: &Library) {
+fn report_migration(library: &Library, streams: &mut Streams<'_>) -> CliResult<()> {
     let report = library.migration_report();
     if let Some(path) = &report.backup_path {
-        println!(
+        outln!(
+            streams,
             "Migrated database from schema {} to {}; verified backup: {}",
             report.from_version,
             report.to_version,
             terminal_safe(path.display())
         );
     }
+    Ok(())
 }
 
 fn recover(library: &mut Library, output: OutputFormat) -> Result<()> {
@@ -377,7 +387,7 @@ fn recover(library: &mut Library, output: OutputFormat) -> Result<()> {
     if report.unresolved.is_empty() {
         Ok(())
     } else {
-        Err(Error::Recovery(report.unresolved.join("; ")))
+        Err(Error::Recovery(report.unresolved.join("; ")).into())
     }
 }
 
@@ -401,11 +411,11 @@ async fn import(
         follow_symlinks: config.import.follow_symlinks,
         path_format: config.paths.format.clone(),
         library_dir: config.library.directory.clone(),
-        search_limit: config.musicbrainz.search_limit,
+        search_limit,
         auto_accept_threshold: config.matching.auto_accept_threshold,
         runner_up_margin: config.matching.runner_up_margin,
     };
-    let provider = MusicBrainzProvider::new(&config.musicbrainz)?;
+    let provider = ProviderSet::from_config(config)?;
     let plan = ImportPlanner::new(library, &provider, options.clone())
         .plan(paths)
         .await;
@@ -566,22 +576,30 @@ fn choose_import(plan: &AlbumPlan, dry_run: bool, yes: bool) -> Result<ApprovalC
     }
 }
 
-fn print_album_plan(plan: &AlbumPlan) {
-    println!(
+fn print_album_plan(plan: &AlbumPlan, streams: &mut Streams<'_>) -> CliResult<()> {
+    outln!(
+        streams,
         "\n{} — {} ({} track(s))",
         terminal_safe(&plan.source_artist),
         terminal_safe(&plan.source_album),
         plan.items.len()
     );
     if let Some(error) = &plan.lookup_error {
-        eprintln!("  Metadata lookup failed: {}", terminal_safe(error));
+        errln!(
+            streams,
+            "  Metadata lookup failed: {}",
+            terminal_safe(error)
+        );
     }
     if !plan.candidate_set_complete {
         eprintln!("  Provider candidate set is incomplete; fuzzy acceptance is disabled");
     }
     if plan.candidates.is_empty() {
-        println!("  No provider candidates; existing tags are available as an explicit choice");
-        return;
+        outln!(
+            streams,
+            "  No provider candidates; existing tags are available as an explicit choice"
+        );
+        return Ok(());
     }
     for (index, candidate) in plan.candidates.iter().enumerate() {
         let confidence = &candidate.confidence;
@@ -605,16 +623,18 @@ fn print_album_plan(plan: &AlbumPlan) {
         );
         if index == 0 {
             for failure in &confidence.gate_failures {
-                println!("      gate: {}", terminal_safe(failure));
+                outln!(streams, "      gate: {}", terminal_safe(failure));
             }
         }
     }
+    Ok(())
 }
 
-fn print_approved(plan: &ApprovedAlbumPlan) {
-    println!("  Planned destinations:");
+fn print_approved(plan: &ApprovedAlbumPlan, streams: &mut Streams<'_>) -> CliResult<()> {
+    outln!(streams, "  Planned destinations:");
     for track in &plan.tracks {
-        println!(
+        outln!(
+            streams,
             "    {} -> {}{}",
             terminal_safe(track.source.display()),
             terminal_safe(track.destination.display()),
@@ -626,11 +646,13 @@ fn print_approved(plan: &ApprovedAlbumPlan) {
         );
     }
     if let Some(artwork) = &plan.artwork {
-        println!(
+        outln!(
+            streams,
             "    cover art -> {}",
             terminal_safe(artwork.destination.display())
         );
     }
+    Ok(())
 }
 
 fn list(
@@ -732,7 +754,7 @@ fn stats(library: &Library, output: OutputFormat) -> Result<Outcome> {
     println!("Total time: {}", format_duration(stats.total_length));
     println!("Total size: {}", format_size(stats.total_size));
     if stats.unknown_sizes > 0 {
-        println!("Unknown file sizes: {}", stats.unknown_sizes);
+        outln!(streams, "Unknown file sizes: {}", stats.unknown_sizes);
     }
     Ok(Outcome::Success)
 }
@@ -796,23 +818,42 @@ fn audit(library: &Library, deep: bool, output: OutputFormat) -> Result<Outcome>
     }
     for issue in report.issues() {
         match issue {
+            AuditIssue::DatabaseIntegrity { detail } => {
+                outln!(
+                    streams,
+                    "Database integrity check failed: {}",
+                    terminal_safe(detail)
+                );
+            }
+            AuditIssue::ForeignKeyViolations { count } => {
+                outln!(streams, "Database has {count} foreign-key violation(s)");
+            }
             AuditIssue::MissingFile { item_id, path } => {
-                println!(
+                outln!(
+                    streams,
                     "Missing file: item {item_id}: {}",
                     terminal_safe(path.display())
                 );
             }
             AuditIssue::UnknownFileSize { item_id, path } => {
-                println!(
+                outln!(
+                    streams,
                     "Unknown file size: item {item_id}: {}",
                     terminal_safe(path.display())
                 );
             }
             AuditIssue::OrphanedItem { item_id, album_id } => {
-                println!("Orphaned item: item {item_id}, missing album {album_id}");
+                outln!(
+                    streams,
+                    "Orphaned item: item {item_id}, missing album {album_id}"
+                );
             }
             AuditIssue::SearchIndexInconsistent { detail } => {
-                println!("Search index is inconsistent: {}", terminal_safe(detail));
+                outln!(
+                    streams,
+                    "Search index is inconsistent: {}",
+                    terminal_safe(detail)
+                );
             }
             AuditIssue::InvalidTimestamp {
                 table,
@@ -820,7 +861,8 @@ fn audit(library: &Library, deep: bool, output: OutputFormat) -> Result<Outcome>
                 field,
                 value,
             } => {
-                println!(
+                outln!(
+                    streams,
                     "Invalid timestamp: {table} row {row_id}, {field}: {}",
                     terminal_safe(value)
                 );
@@ -969,7 +1011,8 @@ fn update(library: &Library, query: Option<&str>) -> Result<Outcome> {
         match rsbts::tags::read_tags(&item.path) {
             Ok(value) => tag_updates.push((id, value)),
             Err(error) => {
-                eprintln!(
+                errln!(
+                    streams,
                     "Could not update {}: {}",
                     terminal_safe(item.path.display()),
                     terminal_safe(error)
@@ -979,7 +1022,7 @@ fn update(library: &Library, query: Option<&str>) -> Result<Outcome> {
         }
     }
     let updated_count = library.update_items(&tag_updates)?;
-    println!("Updated {updated_count} item(s); {failed} failed");
+    outln!(streams, "Updated {updated_count} item(s); {failed} failed");
     Ok(if failed == 0 {
         Outcome::Success
     } else {
@@ -1049,7 +1092,7 @@ fn remove(
             .interact()
             .map_err(|error| Error::Import(format!("cannot read confirmation: {error}")))?;
         if !confirmed {
-            println!("Cancelled; no changes made");
+            outln!(streams, "Cancelled; no changes made");
             return Ok(Outcome::Partial);
         }
     }
@@ -1129,7 +1172,7 @@ fn modify(library: &Library, raw_query: &str, fields: &[String]) -> Result<Outco
         })
         .collect::<Result<Vec<_>>>()?;
     let count = library.modify_items(&ids, fields)?;
-    println!("Modified {count} item(s)");
+    outln!(streams, "Modified {count} item(s)");
     Ok(Outcome::Success)
 }
 
@@ -1682,7 +1725,7 @@ fn require_confirmation_channel(dry_run: bool, yes: bool, operation: &str) -> Re
 }
 
 fn format_duration(seconds: f64) -> String {
-    let total_seconds = seconds.max(0.0) as u64;
+    let total_seconds = seconds.max(0.0).to_u64().unwrap_or(u64::MAX);
     let hours = total_seconds / 3600;
     let minutes = (total_seconds % 3600) / 60;
     let seconds = total_seconds % 60;
@@ -1698,11 +1741,17 @@ fn format_size(bytes: u64) -> String {
     const MIB: u64 = KIB * 1024;
     const GIB: u64 = MIB * 1024;
     if bytes >= GIB {
-        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+        format!(
+            "{:.1} GiB",
+            bytes.to_f64().unwrap_or(f64::MAX) / 1_073_741_824.0
+        )
     } else if bytes >= MIB {
-        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+        format!(
+            "{:.1} MiB",
+            bytes.to_f64().unwrap_or(f64::MAX) / 1_048_576.0
+        )
     } else if bytes >= KIB {
-        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+        format!("{:.1} KiB", bytes.to_f64().unwrap_or(f64::MAX) / 1_024.0)
     } else {
         format!("{bytes} B")
     }
@@ -1722,10 +1771,55 @@ pub fn terminal_safe(value: impl Display) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::terminal_safe;
+    use std::io::{self, Write};
+
+    use super::{terminal_safe, CliError, Streams};
+
+    struct BrokenWriter;
+
+    impl Write for BrokenWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "reader closed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn terminal_output_escapes_control_characters() {
         assert_eq!(terminal_safe("title\n\u{1b}[2J"), "title\\n\\u{1b}[2J");
+    }
+
+    #[test]
+    fn stdout_broken_pipe_is_distinct_from_other_io_errors(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut stdout = BrokenWriter;
+        let mut stderr = Vec::new();
+        let error = match Streams::new(&mut stdout, &mut stderr).output(format_args!("record")) {
+            Ok(()) => return Err("the synthetic writer unexpectedly accepted output".into()),
+            Err(error) => error,
+        };
+        assert!(error.is_stdout_broken_pipe());
+
+        let application = CliError::Application(rsbts::Error::Io(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "application pipe",
+        )));
+        assert!(!application.is_stdout_broken_pipe());
+        Ok(())
+    }
+
+    #[test]
+    fn output_and_diagnostics_use_separate_streams() -> Result<(), CliError> {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut streams = Streams::new(&mut stdout, &mut stderr);
+        streams.output(format_args!("record"))?;
+        streams.diagnostic(format_args!("warning"))?;
+        assert_eq!(stdout, b"record\n");
+        assert_eq!(stderr, b"warning\n");
+        Ok(())
     }
 }

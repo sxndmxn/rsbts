@@ -46,6 +46,12 @@ pub struct Stats {
 #[serde(tag = "issue", rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum AuditIssue {
+    DatabaseIntegrity {
+        detail: String,
+    },
+    ForeignKeyViolations {
+        count: u64,
+    },
     MissingFile {
         item_id: i64,
         path: PathBuf,
@@ -220,6 +226,8 @@ pub(crate) enum OperationKind {
     ImportCopy,
     ImportMove,
     ImportLink,
+    ImportInPlace,
+    TagWrite,
     RemoveDelete,
     TagWrite,
     ManifestWrite,
@@ -236,6 +244,8 @@ impl OperationKind {
             Self::ImportCopy => "import-copy",
             Self::ImportMove => "import-move",
             Self::ImportLink => "import-link",
+            Self::ImportInPlace => "import-in-place",
+            Self::TagWrite => "tag-write",
             Self::RemoveDelete => "remove-delete",
             Self::TagWrite => "tag-write",
             Self::ManifestWrite => "manifest-write",
@@ -252,6 +262,8 @@ impl OperationKind {
             "import-copy" => Ok(Self::ImportCopy),
             "import-move" => Ok(Self::ImportMove),
             "import-link" => Ok(Self::ImportLink),
+            "import-in-place" => Ok(Self::ImportInPlace),
+            "tag-write" => Ok(Self::TagWrite),
             "remove-delete" => Ok(Self::RemoveDelete),
             "tag-write" => Ok(Self::TagWrite),
             "manifest-write" => Ok(Self::ManifestWrite),
@@ -777,9 +789,15 @@ impl Library {
     pub fn query_items(&self, query: &Query) -> Result<Vec<Item>> {
         let compiled = query.compile();
         let mut stmt = self.conn.prepare(&compiled.sql)?;
-        let items = stmt
+        let mut items = stmt
             .query_map(params_from_iter(compiled.parameters.iter()), row_to_item)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+        for item in &mut items {
+            if let Some(id) = item.id {
+                item.extended = load_extended_metadata(&self.conn, "item", id)?;
+            }
+        }
         Ok(items)
     }
 
@@ -843,11 +861,12 @@ impl Library {
                 let mut stmt = self
                     .conn
                     .prepare("SELECT * FROM albums ORDER BY albumartist, year, album")?;
-                let albums = stmt
+                let mut albums = stmt
                     .query_map([], row_to_album)?
-                    .collect::<std::result::Result<Vec<_>, _>>()
-                    .map_err(Into::into);
-                albums
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                drop(stmt);
+                hydrate_albums(&self.conn, &mut albums)?;
+                Ok(albums)
             }
             Some(search) => {
                 let pattern = format!("%{}%", escape_like(search));
@@ -856,11 +875,12 @@ impl Library {
                      WHERE album LIKE ?1 ESCAPE '!' OR albumartist LIKE ?1 ESCAPE '!'
                      ORDER BY albumartist, year, album",
                 )?;
-                let albums = stmt
+                let mut albums = stmt
                     .query_map([pattern], row_to_album)?
-                    .collect::<std::result::Result<Vec<_>, _>>()
-                    .map_err(Into::into);
-                albums
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                drop(stmt);
+                hydrate_albums(&self.conn, &mut albums)?;
+                Ok(albums)
             }
         }
     }
@@ -1005,6 +1025,32 @@ impl Library {
         }
         let transaction = self.conn.unchecked_transaction()?;
         for (id, item) in items {
+            let (track_identity_changed, release_identity_changed): (bool, bool) = transaction
+                .query_row(
+                    "SELECT
+                        NOT (title IS ?1 AND artist IS ?2 AND track IS ?7 AND disc IS ?8),
+                        NOT (album IS ?3
+                             AND COALESCE(albumartist, artist) IS COALESCE(?4, ?2)
+                             AND year IS ?6)
+                     FROM items WHERE id = ?14",
+                    params![
+                        item.title,
+                        item.artist,
+                        item.album,
+                        item.albumartist,
+                        item.genre,
+                        item.year,
+                        item.track,
+                        item.disc,
+                        item.format.as_str(),
+                        item.bitrate,
+                        item.length,
+                        item.file_size,
+                        item.mtime.to_rfc3339(),
+                        id,
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
             if transaction.execute(
                 "UPDATE items SET title=?1, artist=?2, album=?3, albumartist=?4, genre=?5,
                  year=?6, track=?7, disc=?8, format=?9, bitrate=?10, length=?11,
@@ -1052,6 +1098,12 @@ impl Library {
                 "UPDATE items SET metadata_provider = NULL
                  WHERE id = ?1 AND external_track_id IS NULL AND external_release_id IS NULL",
                 [id],
+            )?;
+            invalidate_external_ids(
+                &transaction,
+                *id,
+                track_identity_changed,
+                release_identity_changed,
             )?;
         }
         reconcile_album_membership(&transaction, &ids)?;
@@ -1128,6 +1180,19 @@ impl Library {
                     [id],
                 )?;
             }
+            let invalidate_release_ids = invalidates_release_identity
+                || (modifies_artist
+                    && transaction.query_row(
+                        "SELECT albumartist IS NULL FROM items WHERE id = ?1",
+                        [id],
+                        |row| row.get(0),
+                    )?);
+            invalidate_external_ids(
+                &transaction,
+                *id,
+                invalidates_track_identity,
+                invalidate_release_ids,
+            )?;
         }
         if modifications.iter().any(|modification| {
             matches!(
@@ -1505,7 +1570,7 @@ impl Library {
     pub(crate) fn commit_import(
         &mut self,
         operation_id: &str,
-        album: &Album,
+        album: Option<&Album>,
         items: &[Item],
     ) -> Result<i64> {
         self.commit_import_at_root_with_artwork(operation_id, album, items, None, None)
@@ -1638,6 +1703,7 @@ impl Library {
             )",
             [],
         )?;
+        cleanup_orphan_metadata(&transaction)?;
         if let Some(operation_id) = operation_id {
             let changed = transaction.execute(
                 "UPDATE operation_journal SET state = 'db-committed', updated_at = ?1
@@ -1648,6 +1714,66 @@ impl Library {
         }
         transaction.commit()?;
         failpoints::hit("db.removal-commit")?;
+        Ok(())
+    }
+
+    pub(crate) fn commit_tag_write(
+        &mut self,
+        operation_id: &str,
+        item_id: i64,
+        path: &Path,
+        file_size: u64,
+        modified: DateTime<Utc>,
+    ) -> Result<()> {
+        let stored_path = path_to_storage(path)?;
+        let transaction = self.conn.transaction()?;
+        if transaction.execute(
+            "UPDATE items SET file_size = ?1, mtime = ?2
+             WHERE id = ?3 AND path = ?4",
+            params![file_size, modified.to_rfc3339(), item_id, stored_path],
+        )? != 1
+        {
+            return Err(Error::Import(format!(
+                "tag-write plan is stale for {}; no row was updated",
+                path.display()
+            )));
+        }
+        let changed = transaction.execute(
+            "UPDATE operation_journal SET state = 'db-committed', updated_at = ?1
+             WHERE id = ?2",
+            params![Utc::now().to_rfc3339(), operation_id],
+        )?;
+        require_journal_row(changed, "tag-write commit")?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn commit_path_move(
+        &mut self,
+        operation_id: &str,
+        item_id: i64,
+        source: &Path,
+        destination: &Path,
+    ) -> Result<()> {
+        let source = path_to_storage(source)?;
+        let destination = path_to_storage(destination)?;
+        let transaction = self.conn.transaction()?;
+        if transaction.execute(
+            "UPDATE items SET path = ?1 WHERE id = ?2 AND path = ?3",
+            params![destination, item_id, source],
+        )? != 1
+        {
+            return Err(Error::Import(
+                "move plan is stale; no database row was updated".into(),
+            ));
+        }
+        let changed = transaction.execute(
+            "UPDATE operation_journal SET state = 'db-committed', updated_at = ?1
+             WHERE id = ?2",
+            params![Utc::now().to_rfc3339(), operation_id],
+        )?;
+        require_journal_row(changed, "move commit")?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -1847,14 +1973,15 @@ where
 
 fn reconcile_album_membership(transaction: &Transaction<'_>, ids: &[i64]) -> Result<()> {
     for id in ids {
-        let (current_album_id, album_name, albumartist, year, added): (
+        let (current_album_id, album_name, albumartist, year, added, singleton): (
             Option<i64>,
             String,
             String,
             Option<i32>,
             String,
+            bool,
         ) = transaction.query_row(
-            "SELECT album_id, album, COALESCE(albumartist, artist), year, added
+            "SELECT album_id, album, COALESCE(albumartist, artist), year, added, singleton
              FROM items WHERE id = ?1",
             [id],
             |row| {
@@ -1864,9 +1991,16 @@ fn reconcile_album_membership(transaction: &Transaction<'_>, ids: &[i64]) -> Res
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
+                    row.get(5)?,
                 ))
             },
         )?;
+        if singleton {
+            if current_album_id.is_some() {
+                transaction.execute("UPDATE items SET album_id = NULL WHERE id = ?1", [id])?;
+            }
+            continue;
+        }
         let current_matches = if let Some(album_id) = current_album_id {
             transaction.query_row(
                 "SELECT EXISTS(
@@ -1883,16 +2017,30 @@ fn reconcile_album_membership(transaction: &Transaction<'_>, ids: &[i64]) -> Res
             continue;
         }
 
-        let album = Album {
-            id: None,
-            album: album_name,
-            albumartist,
-            year,
-            artpath: None,
-            external_id: None,
-            added: parse_datetime(&added)?,
-        };
-        let album_id = find_or_insert_album(transaction, &album)?;
+        let album_id = transaction
+            .query_row(
+                "SELECT id FROM albums
+                 WHERE album = ?1 AND albumartist = ?2 AND year IS ?3 LIMIT 1",
+                params![album_name, albumartist, year],
+                |row| row.get(0),
+            )
+            .optional()?
+            .map_or_else(
+                || {
+                    let album = Album {
+                        id: None,
+                        album: album_name,
+                        albumartist,
+                        year,
+                        artpath: None,
+                        external_id: None,
+                        added: parse_datetime(&added)?,
+                        extended: crate::ExtendedMetadata::default(),
+                    };
+                    find_or_insert_album(transaction, &album)
+                },
+                Ok,
+            )?;
         transaction.execute(
             "UPDATE items SET album_id = ?1 WHERE id = ?2",
             params![album_id, id],
@@ -1904,12 +2052,67 @@ fn reconcile_album_membership(transaction: &Transaction<'_>, ids: &[i64]) -> Res
         )",
         [],
     )?;
+    cleanup_orphan_metadata(transaction)?;
+    Ok(())
+}
+
+fn invalidate_external_ids(
+    transaction: &Transaction<'_>,
+    item_id: i64,
+    track_identity: bool,
+    release_identity: bool,
+) -> Result<()> {
+    if track_identity {
+        transaction.execute(
+            "DELETE FROM external_ids
+             WHERE entity_type = 'item' AND entity_id = ?1
+               AND kind IN ('recording', 'release_track')",
+            [item_id],
+        )?;
+    }
+    if release_identity {
+        transaction.execute(
+            "DELETE FROM external_ids
+             WHERE entity_type = 'item' AND entity_id = ?1 AND kind = 'release'",
+            [item_id],
+        )?;
+    }
+    Ok(())
+}
+
+fn cleanup_orphan_metadata(transaction: &Transaction<'_>) -> Result<()> {
+    for (table, entity_type, entity_table) in [
+        ("entity_metadata", "item", "items"),
+        ("entity_metadata", "album", "albums"),
+        ("external_ids", "item", "items"),
+        ("external_ids", "album", "albums"),
+    ] {
+        let sql = format!(
+            "DELETE FROM {table}
+             WHERE entity_type = ?1
+               AND NOT EXISTS (SELECT 1 FROM {entity_table}
+                               WHERE {entity_table}.id = {table}.entity_id)"
+        );
+        transaction.execute(&sql, [entity_type])?;
+    }
     Ok(())
 }
 
 fn configure_connection(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.busy_timeout(Duration::from_secs(5))?;
+    conn.create_scalar_function(
+        "regexp",
+        2,
+        rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        |context| {
+            let pattern = context.get::<String>(0)?;
+            let value = context.get::<Option<String>>(1)?;
+            regex::Regex::new(&pattern)
+                .map(|expression| value.is_some_and(|value| expression.is_match(&value)))
+                .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))
+        },
+    )?;
     Ok(())
 }
 
@@ -1940,6 +2143,17 @@ fn find_or_insert_album(transaction: &Transaction<'_>, album: &Album) -> Result<
              artpath = COALESCE(?4, artpath) WHERE id = ?5",
             params![album.album, album.albumartist, album.year, artpath, id,],
         )?;
+        save_extended_metadata(transaction, "album", id, &album.extended)?;
+        save_external_ids(
+            transaction,
+            "album",
+            id,
+            album
+                .extended
+                .external_ids
+                .iter()
+                .chain(album.external_id.iter()),
+        )?;
         return Ok(id);
     }
 
@@ -1960,10 +2174,22 @@ fn find_or_insert_album(transaction: &Transaction<'_>, album: &Album) -> Result<
             external_id,
         ],
     )?;
-    Ok(transaction.last_insert_rowid())
+    let id = transaction.last_insert_rowid();
+    save_extended_metadata(transaction, "album", id, &album.extended)?;
+    save_external_ids(
+        transaction,
+        "album",
+        id,
+        album
+            .extended
+            .external_ids
+            .iter()
+            .chain(album.external_id.iter()),
+    )?;
+    Ok(id)
 }
 
-fn insert_item(transaction: &Transaction<'_>, item: &Item, album_id: i64) -> Result<i64> {
+fn insert_item(transaction: &Transaction<'_>, item: &Item, album_id: Option<i64>) -> Result<i64> {
     let path = path_to_storage(&item.path)?;
     let provider = item
         .release_external_id
@@ -1974,9 +2200,9 @@ fn insert_item(transaction: &Transaction<'_>, item: &Item, album_id: i64) -> Res
         "INSERT INTO items
          (album_id, path, title, artist, album, albumartist, genre, year, track, disc,
           format, bitrate, length, mb_trackid, mb_albumid, added, mtime, file_size,
-          metadata_provider, external_track_id, external_release_id)
+          metadata_provider, external_track_id, external_release_id, singleton)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                 ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                 ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
         params![
             album_id,
             path,
@@ -2001,9 +2227,181 @@ fn insert_item(transaction: &Transaction<'_>, item: &Item, album_id: i64) -> Res
             item.release_external_id
                 .as_ref()
                 .map(|id| id.value.as_str()),
+            item.singleton,
         ],
     )?;
-    Ok(transaction.last_insert_rowid())
+    let id = transaction.last_insert_rowid();
+    save_extended_metadata(transaction, "item", id, &item.extended)?;
+    save_external_ids(
+        transaction,
+        "item",
+        id,
+        item.extended.external_ids.iter().chain(
+            item.track_external_id
+                .iter()
+                .chain(item.release_external_id.iter()),
+        ),
+    )?;
+    Ok(id)
+}
+
+fn hydrate_albums(conn: &Connection, albums: &mut [Album]) -> Result<()> {
+    for album in albums {
+        if let Some(id) = album.id {
+            album.extended = load_extended_metadata(conn, "album", id)?;
+        }
+    }
+    Ok(())
+}
+
+fn save_extended_metadata(
+    transaction: &Transaction<'_>,
+    entity_type: &str,
+    entity_id: i64,
+    metadata: &ExtendedMetadata,
+) -> Result<()> {
+    transaction.execute(
+        "DELETE FROM entity_metadata WHERE entity_type = ?1 AND entity_id = ?2",
+        params![entity_type, entity_id],
+    )?;
+    let core = serde_json::to_string(metadata).map_err(|error| {
+        Error::Database(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+    })?;
+    transaction.execute(
+        "INSERT INTO entity_metadata
+         (entity_type, entity_id, field, ordinal, value_type, value_json)
+         VALUES (?1, ?2, '__core', 0, 'string', ?3)",
+        params![entity_type, entity_id, core],
+    )?;
+    for (field, value) in &metadata.flexible_fields {
+        validate_flexible_field_name(field)?;
+        let json = serde_json::to_string(value).map_err(|error| {
+            Error::Database(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+        })?;
+        transaction.execute(
+            "INSERT INTO entity_metadata
+             (entity_type, entity_id, field, ordinal, value_type, value_json)
+             VALUES (?1, ?2, ?3, 0, ?4, ?5)",
+            params![
+                entity_type,
+                entity_id,
+                field,
+                flexible_value_type(value),
+                json
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn save_external_ids<'a>(
+    transaction: &Transaction<'_>,
+    entity_type: &str,
+    entity_id: i64,
+    ids: impl Iterator<Item = &'a ExternalId>,
+) -> Result<()> {
+    transaction.execute(
+        "DELETE FROM external_ids WHERE entity_type = ?1 AND entity_id = ?2",
+        params![entity_type, entity_id],
+    )?;
+    let mut seen = HashSet::new();
+    for id in ids {
+        if id.provider.trim().is_empty() || id.value.trim().is_empty() {
+            return Err(Error::Import(
+                "external ID provider and value cannot be empty".into(),
+            ));
+        }
+        let kind = if id.kind.is_empty() {
+            "unknown"
+        } else {
+            &id.kind
+        };
+        if seen.insert((id.provider.as_str(), kind, id.value.as_str())) {
+            transaction.execute(
+                "INSERT INTO external_ids
+                 (entity_type, entity_id, provider, kind, value)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![entity_type, entity_id, id.provider, kind, id.value],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn load_extended_metadata(
+    conn: &Connection,
+    entity_type: &str,
+    entity_id: i64,
+) -> Result<ExtendedMetadata> {
+    let core = conn
+        .query_row(
+            "SELECT value_json FROM entity_metadata
+             WHERE entity_type = ?1 AND entity_id = ?2 AND field = '__core'",
+            params![entity_type, entity_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let mut metadata = core.map_or_else(
+        || Ok(ExtendedMetadata::default()),
+        |json| {
+            serde_json::from_str(&json)
+                .map_err(|error| Error::Recovery(format!("invalid stored metadata: {error}")))
+        },
+    )?;
+    let mut statement = conn.prepare(
+        "SELECT field, value_json FROM entity_metadata
+         WHERE entity_type = ?1 AND entity_id = ?2 AND field != '__core'
+         ORDER BY field, ordinal",
+    )?;
+    let rows = statement.query_map(params![entity_type, entity_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (field, json) = row?;
+        let value = serde_json::from_str::<FlexibleValue>(&json)
+            .map_err(|error| Error::Recovery(format!("invalid flexible field {field}: {error}")))?;
+        metadata.flexible_fields.insert(field, value);
+    }
+    let mut statement = conn.prepare(
+        "SELECT provider, kind, value FROM external_ids
+         WHERE entity_type = ?1 AND entity_id = ?2 ORDER BY provider, kind, value",
+    )?;
+    metadata.external_ids = statement
+        .query_map(params![entity_type, entity_id], |row| {
+            Ok(ExternalId {
+                provider: row.get(0)?,
+                kind: row.get(1)?,
+                value: row.get(2)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(metadata)
+}
+
+const fn flexible_value_type(value: &FlexibleValue) -> &'static str {
+    match value {
+        FlexibleValue::String(_) => "string",
+        FlexibleValue::Integer(_) => "integer",
+        FlexibleValue::Float(_) => "float",
+        FlexibleValue::Boolean(_) => "boolean",
+        FlexibleValue::Date(_) => "date",
+        FlexibleValue::StringList(_) => "string_list",
+    }
+}
+
+fn validate_flexible_field_name(field: &str) -> Result<()> {
+    if field.is_empty()
+        || field == "__core"
+        || !field
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        Err(Error::Query(format!(
+            "invalid flexible field name: {field}"
+        )))
+    } else {
+        Ok(())
+    }
 }
 
 fn ensure_normalized_album(
@@ -2671,6 +3069,8 @@ fn row_to_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
         ),
         added: parse_datetime(&row.get::<_, String>("added")?)?,
         mtime: parse_datetime(&row.get::<_, String>("mtime")?)?,
+        singleton: row.get::<_, bool>("singleton")?,
+        extended: crate::ExtendedMetadata::default(),
     })
 }
 
@@ -2687,12 +3087,14 @@ fn row_to_album(row: &rusqlite::Row<'_>) -> rusqlite::Result<Album> {
             row.get::<_, Option<String>>("external_release_id")?,
         ),
         added: parse_datetime(&row.get::<_, String>("added")?)?,
+        extended: crate::ExtendedMetadata::default(),
     })
 }
 
 fn external_id(provider: Option<&str>, value: Option<String>) -> Option<ExternalId> {
     provider.zip(value).map(|(provider, value)| ExternalId {
         provider: provider.to_string(),
+        kind: String::new(),
         value,
     })
 }
@@ -3202,7 +3604,8 @@ pub(crate) fn sync_directory(path: &Path) -> Result<()> {
 
 #[cfg(all(test, not(unix)))]
 #[allow(clippy::unnecessary_wraps)]
-pub(crate) const fn sync_directory(_path: &Path) -> Result<()> {
+#[doc(hidden)]
+pub const fn sync_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -3224,7 +3627,53 @@ fn hash_os_string(value: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
+
+    thread_local! {
+        static TRACED_SQL: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    fn trace_sql(sql: &str) {
+        TRACED_SQL.with(|statements| statements.borrow_mut().push(sql.to_string()));
+    }
+
+    fn take_traced_sql() -> Vec<String> {
+        TRACED_SQL.with(|statements| std::mem::take(&mut *statements.borrow_mut()))
+    }
+
+    #[test]
+    fn a_small_exact_query_has_a_bounded_statement_count() -> Result<()> {
+        let mut library = Library::open_in_memory()?;
+        library.conn.execute_batch(
+            "WITH RECURSIVE records(id) AS (
+                 SELECT 1 UNION ALL SELECT id + 1 FROM records WHERE id < 10
+             )
+             INSERT INTO items
+                 (path, title, artist, album, format, bitrate, length, added, mtime)
+             SELECT printf('/missing/%d.flac', id),
+                    CASE id WHEN 7 THEN 'Target' ELSE printf('Other %d', id) END,
+                    'Artist', 'Album', 'FLAC', 1, 1.0,
+                    '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z'
+             FROM records;",
+        )?;
+        library.conn.trace(Some(trace_sql));
+        let items = library.query_items(&Query::parse("title:=Target")?)?;
+        library.conn.trace(None);
+
+        assert_eq!(items.len(), 1);
+        let statements = take_traced_sql();
+        assert!(
+            statements.len() <= 4,
+            "small exact query executed {} statements: {statements:#?}",
+            statements.len()
+        );
+        assert!(statements
+            .iter()
+            .all(|statement| !statement.to_ascii_lowercase().contains("integrity_check")));
+        Ok(())
+    }
 
     #[test]
     fn current_schema_dry_run_uses_a_read_only_connection_without_copying() -> Result<()> {
@@ -3262,6 +3711,7 @@ mod tests {
             artpath: None,
             external_id: None,
             added: Utc::now(),
+            extended: crate::ExtendedMetadata::default(),
         };
         let item = Item {
             id: None,
@@ -3283,8 +3733,10 @@ mod tests {
             release_external_id: None,
             added: Utc::now(),
             mtime: Utc::now(),
+            singleton: false,
+            extended: crate::ExtendedMetadata::default(),
         };
-        library.commit_import(&operation, &album, &[item])?;
+        library.commit_import(&operation, Some(&album), &[item])?;
         library.complete_operation(&operation)?;
         let audit = library.audit()?;
         assert!(matches!(
@@ -3408,6 +3860,7 @@ mod tests {
             artpath: None,
             external_id: None,
             added: Utc::now(),
+            extended: crate::ExtendedMetadata::default(),
         };
         let item = Item {
             id: None,
@@ -3429,8 +3882,10 @@ mod tests {
             release_external_id: None,
             added: Utc::now(),
             mtime: Utc::now(),
+            singleton: false,
+            extended: crate::ExtendedMetadata::default(),
         };
-        library.commit_import(&operation, &album, &[item])?;
+        library.commit_import(&operation, Some(&album), &[item])?;
         library.complete_operation(&operation)?;
         library.conn.execute(
             "INSERT INTO items_fts(items_fts, rowid, title, artist, album, albumartist, genre)
@@ -3893,9 +4348,11 @@ mod tests {
             artpath: None,
             external_id: Some(ExternalId {
                 provider: "musicbrainz".into(),
+                kind: "release".into(),
                 value: "release".into(),
             }),
             added: Utc::now(),
+            extended: crate::ExtendedMetadata::default(),
         };
         let item = Item {
             id: None,
@@ -3915,16 +4372,20 @@ mod tests {
             file_size: Some(5),
             track_external_id: Some(ExternalId {
                 provider: "musicbrainz".into(),
+                kind: "recording".into(),
                 value: "track".into(),
             }),
             release_external_id: Some(ExternalId {
                 provider: "musicbrainz".into(),
+                kind: "release".into(),
                 value: "release".into(),
             }),
             added: Utc::now(),
             mtime: Utc::now(),
+            singleton: false,
+            extended: crate::ExtendedMetadata::default(),
         };
-        library.commit_import(&operation, &album, &[item])?;
+        library.commit_import(&operation, Some(&album), &[item])?;
         library.complete_operation(&operation)?;
         let id = library.query_items(&Query::all())?[0]
             .id

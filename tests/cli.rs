@@ -1,5 +1,6 @@
+use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use rsbts::catalog::{Confidence, DataLicense, EntityId, EntityKind, MetadataClaim, ValueState};
 use rusqlite::Connection;
@@ -462,5 +463,63 @@ fn disposable_cli_workflow_is_atomic_and_confirmation_safe(
     let connection = Connection::open(&database_path)?;
     let count: u64 = connection.query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))?;
     assert_eq!(count, 0);
+    Ok(())
+}
+
+#[test]
+fn a_closed_stdout_pipe_is_successful_and_never_panics() -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = tempfile::tempdir()?;
+    let config_path = temporary.path().join("config.toml");
+    let database_path = temporary.path().join("library.db");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[library]\ndirectory = 'organized'\ndatabase = '{}'\n",
+            database_path.display()
+        ),
+    )?;
+    assert_success(&run(&config_path, &["stats"])?);
+
+    let connection = Connection::open(&database_path)?;
+    connection.execute_batch(
+        "WITH RECURSIVE records(id) AS (
+             SELECT 1 UNION ALL SELECT id + 1 FROM records WHERE id < 4096
+         )
+         INSERT INTO items
+             (path, title, artist, album, format, bitrate, length, added, mtime)
+         SELECT printf('/missing/%d.flac', id), printf('Track %d', id),
+                'Pipe Artist', 'Pipe Album', 'FLAC', 1, 1.0,
+                '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z'
+         FROM records;",
+    )?;
+    drop(connection);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rsbts"))
+        .arg("--config")
+        .arg(&config_path)
+        .arg("ls")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("child process did not expose its piped stdout"))?;
+    let mut reader = BufReader::new(stdout);
+    let mut first_line = String::new();
+    assert!(reader.read_line(&mut first_line)? > 0);
+    drop(reader);
+
+    let output = child.wait_with_output()?;
+    assert_eq!(output.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("panicked"),
+        "unexpected panic output: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Broken pipe"),
+        "unexpected pipe diagnostic: {stderr}"
+    );
     Ok(())
 }

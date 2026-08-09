@@ -196,6 +196,10 @@ Release artifacts include checksums, CycloneDX SBOM, and GitHub provenance
 attestations. See [RELEASING.md](RELEASING.md) and
 [performance.md](docs/performance.md).
 
+The first stable target is macOS and Linux. The deliberately excluded scope is
+plugins, archive extraction, artwork embedding, transcoding, web/player
+integrations, and Windows support.
+
 ## License
 
 MIT

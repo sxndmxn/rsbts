@@ -24,6 +24,8 @@ Rust 1.89 or newer is required; keep dependency resolution locked.
 ## Safety invariants
 
 - Never silently overwrite a destination or weaken collision checks.
+- On Unix, keep library creation, staging, and finalization descriptor-relative
+  and no-follow; reject a changed library root or destination parent.
 - Keep preview, approval, and execution separate. Revalidate source identity
   and destination state at the execution boundary.
 - Journal file-creating, file-moving, and file-deleting operations so an

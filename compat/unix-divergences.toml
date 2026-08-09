@@ -1,0 +1,28 @@
+schema_version = 1
+
+# Intentional improvements over pinned Beets behavior. A divergence is approved
+# only when its acceptance test is present and passing.
+[divergences.broken_pipe]
+status = "divergence"
+rule = "A closed stdout pipe terminates successfully without panic output."
+evidence = ["tests/cli.rs"]
+
+[divergences.native_paths]
+status = "missing"
+rule = "Native Unix filenames are preserved losslessly through catalog and file operations."
+evidence = ["ARCHITECTURE_ROADMAP.md"]
+
+[divergences.stream_separation]
+status = "partial"
+rule = "Primary data is written to stdout; diagnostics and progress are written to stderr."
+evidence = ["src/cli.rs"]
+
+[divergences.machine_streams]
+status = "missing"
+rule = "Record-producing commands provide incremental machine-readable output."
+evidence = ["ARCHITECTURE_ROADMAP.md"]
+
+[divergences.noninteractive]
+status = "partial"
+rule = "A command without an interactive terminal never waits for input."
+evidence = ["tests/cli.rs"]
