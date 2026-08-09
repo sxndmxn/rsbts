@@ -1046,8 +1046,7 @@ fn inspect_asset(asset: &AssetEvidence, mode: FixityMode) -> (FixityResult, Obse
     }
     let legacy_root = asset
         .absolute_path
-        .ancestors()
-        .last()
+        .parent()
         .unwrap_or(asset.absolute_path.as_path());
     let (anchored_root, anchored_relative) = if asset.root_state == "legacy" {
         (
