@@ -27,6 +27,7 @@ enum QueryTerm {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum QueryField {
     Path,
     Title,
@@ -46,6 +47,7 @@ pub enum QueryField {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SortField {
     Path,
     Title,
@@ -510,7 +512,23 @@ fn parse_relative_date(value: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
+
+    proptest! {
+        #[test]
+        fn arbitrary_query_text_never_panics_or_interpolates_a_successful_parse(
+            input in ".{0,2048}"
+        ) {
+            if let Ok(query) = Query::parse(&input) {
+                let compiled = query.compile();
+                prop_assert!(compiled.sql.starts_with("SELECT * FROM items"));
+                prop_assert!(compiled.sql.contains(" ORDER BY "));
+                prop_assert!(compiled.sql.len() <= 65_536);
+            }
+        }
+    }
 
     #[test]
     fn compiles_values_as_parameters() -> Result<()> {

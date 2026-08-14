@@ -2,7 +2,7 @@ use std::io::{self, Write as _};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 mod cli;
 
@@ -13,6 +13,10 @@ struct Cli {
     /// Path to config file
     #[arg(short, long, global = true)]
     config: Option<PathBuf>,
+
+    /// Output contract for automation
+    #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Text)]
+    output: OutputFormat,
 
     #[command(subcommand)]
     command: Commands,
@@ -46,7 +50,11 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
 
-        /// Accept only candidates that pass every strict confidence gate
+        /// Import using scanned embedded metadata instead of provider metadata
+        #[arg(long, visible_alias = "as-is")]
+        existing_tags: bool,
+
+        /// Confirm strict direct-ID matches or the --existing-tags selection
         #[arg(short = 'y', long)]
         yes: bool,
     },
@@ -60,13 +68,36 @@ enum Commands {
         /// Show albums instead of tracks
         #[arg(short, long)]
         album: bool,
+
+        /// Maximum rows to emit
+        #[arg(long)]
+        limit: Option<u32>,
     },
 
     /// Show library statistics
     Stats,
 
     /// Check database and file consistency
-    Audit,
+    Audit {
+        /// Read and compare full BLAKE3 and SHA-256 fixity for every managed asset
+        #[arg(long)]
+        deep: bool,
+    },
+
+    /// Run an explicit full `SQLite` integrity and foreign-key check
+    Integrity,
+
+    /// Plan, schedule, execute, and inspect bounded fixity work
+    Fixity {
+        #[command(subcommand)]
+        action: FixityCommand,
+    },
+
+    /// Calculate and store persistent fixity for selected catalog items
+    Verify {
+        /// Query to filter items; omit to verify the complete catalog
+        query: Option<String>,
+    },
 
     /// Re-read tags for matching library items
     Update {
@@ -131,6 +162,21 @@ enum Commands {
         yes: bool,
     },
 
+    /// Permanently purge retained removal quarantines
+    Purge {
+        /// Purge quarantines at least this many days old
+        #[arg(long, default_value_t = 30)]
+        older_than_days: u64,
+
+        /// Preview the complete purge set without changing anything
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Confirm the complete purge set non-interactively
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+
     /// Modify metadata stored in the library database
     Modify {
         /// Query to match items
@@ -139,6 +185,55 @@ enum Commands {
         /// Field=value pairs
         #[arg(required = true)]
         fields: Vec<String>,
+    },
+
+    /// Preview and apply a canonical provider-refresh diff
+    ProviderRefresh {
+        /// Entity family (release, release-group, recording, work, artist)
+        entity_kind: String,
+        /// Internal entity UUID
+        entity_id: String,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+
+    /// Preview and apply a journaled tag projection
+    TagProject {
+        item_id: i64,
+        #[arg(long)]
+        title: String,
+        #[arg(long = "artist", required = true)]
+        artists: Vec<String>,
+        #[arg(long)]
+        album: String,
+        #[arg(long = "album-artist", required = true)]
+        album_artists: Vec<String>,
+        #[arg(long, default_value = "archival-native-rich")]
+        profile: String,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+
+    /// Preview and apply a journaled managed-asset rename
+    PathProject {
+        asset_id: String,
+        destination_relative: PathBuf,
+        #[arg(long, default_value = "portable")]
+        profile: String,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+
+    /// Inspect or control a durable plan
+    Plan {
+        #[command(subcommand)]
+        action: PlanCommand,
     },
 
     /// Migrate an external music library into a new rsbts database
@@ -152,33 +247,96 @@ enum Commands {
 enum MigrateSource {
     /// Read a Beets library database and optional YAML configuration
     Beets {
-        /// Source Beets library database
         #[arg(long)]
         beets_library: PathBuf,
-
-        /// Source Beets config.yaml
         #[arg(long)]
         beets_config: Option<PathBuf>,
-
-        /// Beets music directory, required when relative paths cannot be derived from config
         #[arg(long)]
         music_directory: Option<PathBuf>,
-
-        /// New rsbts database; defaults to library.database in the rsbts config
         #[arg(long)]
         output_database: Option<PathBuf>,
-
-        /// Optional new rsbts TOML config to create
         #[arg(long)]
         output_config: Option<PathBuf>,
-
-        /// Validate and report without creating output files
         #[arg(long)]
         dry_run: bool,
-
-        /// Confirm migration non-interactively
         #[arg(short = 'y', long)]
         yes: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum OutputFormat {
+    Text,
+    Json,
+    Jsonl,
+}
+
+#[derive(Subcommand)]
+enum PlanCommand {
+    Status { id: String },
+    Events { id: String },
+    Cancel { id: String },
+    Resume { id: String },
+}
+
+#[derive(Subcommand)]
+enum FixityCommand {
+    /// Persist a reviewable fixity preview
+    Plan {
+        /// Use the quick metadata/identity policy instead of full content hashing
+        #[arg(long)]
+        quick: bool,
+    },
+    /// Approve a planned fixity run without executing it
+    Approve { id: String },
+    /// Execute one bounded page; repeat until complete
+    Run {
+        id: String,
+        #[arg(long, default_value_t = 512)]
+        page_size: u32,
+    },
+    /// Stream one keyset page of retained results
+    Results {
+        id: String,
+        #[arg(long)]
+        after_asset_id: Option<String>,
+        #[arg(long, default_value_t = 512)]
+        limit: u32,
+    },
+    /// Create a persistent schedule whose occurrences receive standing approval
+    Schedule {
+        #[arg(long)]
+        interval_seconds: u64,
+        #[arg(long)]
+        quick: bool,
+    },
+    /// Materialize due schedule occurrences as approved plans
+    Due {
+        #[arg(long, default_value_t = 32)]
+        limit: u32,
+    },
+    /// List schedules in keyset order
+    Schedules {
+        #[arg(long)]
+        after: Option<String>,
+        #[arg(long, default_value_t = 256)]
+        limit: u32,
+    },
+    /// Enable or disable a schedule
+    Enable {
+        id: String,
+        #[arg(long, conflicts_with = "enable")]
+        disable: bool,
+        #[arg(long, conflicts_with = "disable")]
+        enable: bool,
+    },
+    /// List retained run history for a schedule
+    History {
+        schedule_id: String,
+        #[arg(long)]
+        after_plan_id: Option<String>,
+        #[arg(long, default_value_t = 256)]
+        limit: u32,
     },
 }
 
@@ -191,7 +349,13 @@ async fn main() -> ExitCode {
     let mut stderr = io::BufWriter::new(stderr.lock());
     let (result, flush_result) = {
         let mut streams = cli::Streams::new(&mut stdout, &mut stderr);
-        let result = cli::run(arguments.command, arguments.config, &mut streams).await;
+        let result = cli::run(
+            arguments.command,
+            arguments.config,
+            arguments.output,
+            &mut streams,
+        )
+        .await;
         let flush_result = streams.finish();
         (result, flush_result)
     };
@@ -208,5 +372,27 @@ async fn main() -> ExitCode {
             let _ = stderr.flush();
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Cli, Commands};
+
+    #[test]
+    fn import_accepts_existing_tags_and_as_is_alias() -> Result<(), clap::Error> {
+        for flag in ["--existing-tags", "--as-is"] {
+            let arguments = Cli::try_parse_from(["rsbts", "import", flag, "album"])?;
+            assert!(matches!(
+                arguments.command,
+                Commands::Import {
+                    existing_tags: true,
+                    ..
+                }
+            ));
+        }
+        Ok(())
     }
 }

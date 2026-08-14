@@ -1,4 +1,6 @@
 /target
+**/target/
+mutants.out*/
 *.db
 *.db-journal
 *.db-wal

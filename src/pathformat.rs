@@ -9,6 +9,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
+use crate::naming::{sanitize_relative_path, NamingProfile};
 use crate::{Error, Item, Result};
 
 /// Format a path template with item metadata.
@@ -113,7 +114,7 @@ pub fn format_relative_path(template: &str, item: &Item) -> Result<PathBuf> {
             "path template produced an empty path".into(),
         ));
     }
-    Ok(safe)
+    sanitize_relative_path(&safe, NamingProfile::Portable)
 }
 
 fn collect_identifier(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
@@ -315,6 +316,7 @@ fn sanitize_substitution(s: &str) -> String {
 mod tests {
     use super::*;
     use chrono::Utc;
+    use proptest::prelude::*;
 
     fn test_item() -> Item {
         Item {
@@ -339,6 +341,28 @@ mod tests {
             mtime: Utc::now(),
             singleton: false,
             extended: crate::ExtendedMetadata::default(),
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_templates_can_only_render_safe_relative_paths(
+            template in ".{0,512}",
+            title in ".{0,128}",
+            artist in ".{0,128}",
+        ) {
+            let mut item = test_item();
+            item.title = title;
+            item.artist = artist;
+            if let Ok(path) = format_relative_path(&template, &item) {
+                prop_assert!(!path.is_absolute());
+                prop_assert!(!path.as_os_str().is_empty());
+                prop_assert!(!path.to_string_lossy().chars().any(char::is_control));
+                let components_safe = path.components().all(|component| {
+                    matches!(component, Component::Normal(value) if value != "." && value != "..")
+                });
+                prop_assert!(components_safe);
+            }
         }
     }
 

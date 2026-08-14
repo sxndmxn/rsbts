@@ -8,17 +8,26 @@ use chrono::{DateTime, Utc};
 use rusqlite::types::{Type, Value};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Transaction};
 
+use crate::artwork::ArtworkAssetMetadata;
+use crate::asset::digest_file;
+use crate::failpoints;
+use crate::fsops::AnchoredRoot;
+use crate::lease::CollectionLease;
+use crate::media::{decoded_audio_essence_hash, probe_media};
 use crate::migrations::{self, MigrationReport};
+use crate::operations::{append_plan_event, PlanId};
 use crate::query::Query;
+use crate::roots::RootCapabilities;
 use crate::{
-    validate_item_metadata, Album, AudioFormat, Error, ExtendedMetadata, ExternalId, FlexibleValue,
-    Item, Result,
+    validate_album_metadata, validate_item_metadata, Album, AudioFormat, Error, ExtendedMetadata,
+    ExternalId, FlexibleValue, Item, Result,
 };
 
 pub struct Library {
-    conn: Connection,
+    pub(crate) conn: Connection,
     path: Option<PathBuf>,
     migration_report: MigrationReport,
+    _lease: Option<CollectionLease>,
 }
 
 /// Validate `field=value` modifications without opening a library or changing any rows.
@@ -26,7 +35,7 @@ pub fn validate_modification_fields(fields: &[String]) -> Result<()> {
     parse_modifications(fields).map(|_modifications| ())
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct Stats {
     pub tracks: u64,
     pub albums: u64,
@@ -36,7 +45,9 @@ pub struct Stats {
     pub unknown_sizes: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "issue", rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum AuditIssue {
     DatabaseIntegrity {
         detail: String,
@@ -65,17 +76,152 @@ pub enum AuditIssue {
         field: &'static str,
         value: String,
     },
+    MissingManagedAsset {
+        asset_id: String,
+        path: PathBuf,
+        role: String,
+    },
+    MissingAssetRecord {
+        item_id: i64,
+        path: PathBuf,
+    },
+    UnverifiedAsset {
+        asset_id: String,
+        path: PathBuf,
+    },
+    AssetSizeMismatch {
+        asset_id: String,
+        path: PathBuf,
+        expected: u64,
+        actual: u64,
+    },
+    AssetMtimeMismatch {
+        asset_id: String,
+        path: PathBuf,
+        expected: String,
+        actual: String,
+    },
+    AssetEntryIdentityMismatch {
+        asset_id: String,
+        path: PathBuf,
+    },
+    AssetDigestMismatch {
+        asset_id: String,
+        path: PathBuf,
+        algorithm: &'static str,
+    },
+    AssetUnreadable {
+        asset_id: String,
+        path: PathBuf,
+        detail: String,
+    },
+    OrphanedManagedAsset {
+        asset_id: String,
+        path: PathBuf,
+    },
+    ProjectionDiverged {
+        asset_id: String,
+        path: PathBuf,
+        state: String,
+    },
+    MediaPropertiesMismatch {
+        asset_id: String,
+        path: PathBuf,
+    },
+    AudioEssenceMismatch {
+        asset_id: String,
+        path: PathBuf,
+    },
+}
+
+/// Cost and depth of a library audit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum AuditMode {
+    /// Compare catalog state, paths, sizes, mtimes, ownership, and projections.
+    #[default]
+    Quick,
+    /// Also read every managed asset and compare BLAKE3 and SHA-256 fixity.
+    Deep,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct AuditReport {
-    pub issues: Vec<AuditIssue>,
+    issues: Vec<AuditIssue>,
+    omitted: u64,
+}
+
+impl AuditReport {
+    /// Issues retained in this bounded report.
+    #[must_use]
+    pub fn issues(&self) -> &[AuditIssue] {
+        &self.issues
+    }
+
+    /// Number of additional issues omitted after the report limit was reached.
+    #[must_use]
+    pub const fn omitted(&self) -> u64 {
+        self.omitted
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.issues.is_empty() && self.omitted == 0
+    }
+}
+
+const AUDIT_ISSUE_LIMIT: usize = 4_096;
+
+#[derive(Default)]
+struct AuditIssues {
+    values: Vec<AuditIssue>,
+    omitted: u64,
+}
+
+impl AuditIssues {
+    fn push(&mut self, issue: AuditIssue) {
+        if self.values.len() < AUDIT_ISSUE_LIMIT {
+            self.values.push(issue);
+        } else {
+            self.omitted = self.omitted.saturating_add(1);
+        }
+    }
+}
+
+/// Result of an explicit full `SQLite` integrity and foreign-key check.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct IntegrityReport {
+    messages: Vec<String>,
+    truncated: bool,
+}
+
+impl IntegrityReport {
+    #[must_use]
+    pub const fn is_ok(&self) -> bool {
+        self.messages.is_empty() && !self.truncated
+    }
+
+    #[must_use]
+    pub fn messages(&self) -> &[String] {
+        &self.messages
+    }
+
+    #[must_use]
+    pub const fn truncated(&self) -> bool {
+        self.truncated
+    }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct RecoveryReport {
     pub recovered_operations: Vec<String>,
     pub unresolved: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct VerificationReport {
+    pub verified: usize,
+    pub skipped: Vec<(i64, PathBuf, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +232,12 @@ pub(crate) enum OperationKind {
     ImportInPlace,
     TagWrite,
     RemoveDelete,
+    ManifestWrite,
+    RestoreCopy,
+    PurgeDelete,
+    PathWrite,
+    AncillaryCopy,
+    ArtworkWrite,
 }
 
 impl OperationKind {
@@ -97,6 +249,12 @@ impl OperationKind {
             Self::ImportInPlace => "import-in-place",
             Self::TagWrite => "tag-write",
             Self::RemoveDelete => "remove-delete",
+            Self::ManifestWrite => "manifest-write",
+            Self::RestoreCopy => "restore-copy",
+            Self::PurgeDelete => "purge-delete",
+            Self::PathWrite => "path-write",
+            Self::AncillaryCopy => "ancillary-copy",
+            Self::ArtworkWrite => "artwork-write",
         }
     }
 
@@ -108,6 +266,12 @@ impl OperationKind {
             "import-in-place" => Ok(Self::ImportInPlace),
             "tag-write" => Ok(Self::TagWrite),
             "remove-delete" => Ok(Self::RemoveDelete),
+            "manifest-write" => Ok(Self::ManifestWrite),
+            "restore-copy" => Ok(Self::RestoreCopy),
+            "purge-delete" => Ok(Self::PurgeDelete),
+            "path-write" => Ok(Self::PathWrite),
+            "ancillary-copy" => Ok(Self::AncillaryCopy),
+            "artwork-write" => Ok(Self::ArtworkWrite),
             _ => Err(Error::Recovery(format!(
                 "unknown journal operation kind: {value}"
             ))),
@@ -121,10 +285,22 @@ pub(crate) struct JournalFile {
     pub staged: PathBuf,
     pub destination: PathBuf,
     pub content_hash: Option<String>,
+    pub sha256: Option<String>,
     pub source_identity: Option<String>,
     pub owned_identity: Option<String>,
     pub role: String,
     pub state: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StoredAssetIdentity {
+    pub asset_id: String,
+    pub path: PathBuf,
+    pub role: String,
+    pub byte_size: u64,
+    pub blake3: String,
+    pub sha256: String,
+    pub entry_identity: String,
 }
 
 #[derive(Debug)]
@@ -132,7 +308,30 @@ struct PendingOperation {
     id: String,
     kind: OperationKind,
     state: String,
+    plan_id: Option<String>,
     files: Vec<JournalFile>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RetainedJournalFile {
+    pub operation_id: String,
+    pub ordinal: usize,
+    pub file: JournalFile,
+}
+
+#[derive(Debug)]
+struct PreparedAsset {
+    id: String,
+    path: PathBuf,
+    role: &'static str,
+    verification_state: &'static str,
+    byte_size: Option<u64>,
+    blake3: Option<String>,
+    sha256: Option<String>,
+    mtime: Option<DateTime<Utc>>,
+    entry_identity: Option<String>,
+    media_json: Option<String>,
+    audio_essence_hash: Option<String>,
 }
 
 impl Library {
@@ -140,6 +339,7 @@ impl Library {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let lease = CollectionLease::acquire_exclusive(path)?;
         let mut conn = Connection::open(path)?;
         configure_connection(&conn)?;
         let migration_report = migrations::run_migrations(&mut conn, Some(path))?;
@@ -148,6 +348,7 @@ impl Library {
             conn,
             path: Some(path.to_path_buf()),
             migration_report,
+            _lease: Some(lease),
         };
         if needs_size_backfill {
             library.backfill_file_sizes()?;
@@ -159,29 +360,64 @@ impl Library {
     ///
     /// A missing source is represented by an empty, migrated in-memory database. Existing legacy
     /// schemas are migrated only inside the snapshot, which makes this suitable for dry runs.
+    /// A current schema is opened read-only without copying the database.
     pub fn open_snapshot(path: &Path) -> Result<Self> {
-        let mut conn = Connection::open_in_memory()?;
         if path.exists() || path.is_symlink() {
             let source =
                 Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
             configure_connection(&source)?;
+            if migrations::current_version(&source)? == migrations::LATEST_VERSION {
+                let migration_report = migrations::validate_current_schema(&source)?;
+                return Ok(Self {
+                    conn: source,
+                    path: Some(path.to_path_buf()),
+                    migration_report,
+                    _lease: None,
+                });
+            }
+            let mut conn = Connection::open_in_memory()?;
             {
                 let backup = rusqlite::backup::Backup::new(&source, &mut conn)?;
                 backup.run_to_completion(100, Duration::from_millis(5), None)?;
             }
+            configure_connection(&conn)?;
+            let migration_report = migrations::run_migrations(&mut conn, None)?;
+            let needs_size_backfill = migration_report.from_version < 2;
+            let mut library = Self {
+                conn,
+                path: None,
+                migration_report,
+                _lease: None,
+            };
+            if needs_size_backfill {
+                library.backfill_file_sizes()?;
+            }
+            return Ok(library);
         }
+
+        let mut conn = Connection::open_in_memory()?;
         configure_connection(&conn)?;
         let migration_report = migrations::run_migrations(&mut conn, None)?;
-        let needs_size_backfill = migration_report.from_version < 2;
-        let mut library = Self {
+        Ok(Self {
             conn,
             path: None,
             migration_report,
-        };
-        if needs_size_backfill {
-            library.backfill_file_sizes()?;
-        }
-        Ok(library)
+            _lease: None,
+        })
+    }
+
+    /// Open a current-schema catalog for ordinary reads without taking the writer lease.
+    /// This never migrates, recovers, or copies the database.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        configure_connection(&conn)?;
+        let migration_report = migrations::validate_current_schema(&conn)?;
+        Ok(Self {
+            conn,
+            path: Some(path.to_path_buf()),
+            migration_report,
+            _lease: None,
+        })
     }
 
     pub fn open_in_memory() -> Result<Self> {
@@ -192,6 +428,7 @@ impl Library {
             conn,
             path: None,
             migration_report,
+            _lease: None,
         })
     }
 
@@ -206,16 +443,16 @@ impl Library {
     }
 
     pub fn audit(&self) -> Result<AuditReport> {
-        let mut issues = Vec::new();
-        for detail in migrations::integrity_issues(&self.conn)? {
-            issues.push(AuditIssue::DatabaseIntegrity { detail });
+        self.audit_with_mode(AuditMode::Quick)
+    }
+
+    pub fn audit_with_mode(&self, mode: AuditMode) -> Result<AuditReport> {
+        if mode == AuditMode::Deep {
+            return Err(Error::Operation(
+                "deep audit must use the durable, paged fixity workflow".into(),
+            ));
         }
-        let foreign_key_violations = migrations::foreign_key_violation_count(&self.conn)?;
-        if foreign_key_violations > 0 {
-            issues.push(AuditIssue::ForeignKeyViolations {
-                count: foreign_key_violations,
-            });
-        }
+        let mut issues = AuditIssues::default();
         let mut stmt = self
             .conn
             .prepare("SELECT id, path, file_size, added, mtime FROM items ORDER BY id")?;
@@ -245,6 +482,24 @@ impl Library {
                     });
                 }
             }
+        }
+
+        let mut statement = self.conn.prepare(
+            "SELECT i.id, i.path FROM items i
+             WHERE NOT EXISTS(
+                 SELECT 1 FROM item_assets ia
+                 WHERE ia.item_id = i.id AND ia.relationship = 'audio'
+             ) ORDER BY i.id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                PathBuf::from(row.get::<_, String>(1)?),
+            ))
+        })?;
+        for row in rows {
+            let (item_id, path) = row?;
+            issues.push(AuditIssue::MissingAssetRecord { item_id, path });
         }
 
         let mut stmt = self
@@ -287,16 +542,237 @@ impl Library {
                 detail: error.to_string(),
             });
         }
-        Ok(AuditReport { issues })
+        self.audit_assets(&mut issues)?;
+        Ok(AuditReport {
+            issues: issues.values,
+            omitted: issues.omitted,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn audit_assets(&self, issues: &mut AuditIssues) -> Result<()> {
+        let mut statement = self.conn.prepare(
+            "SELECT a.id, a.absolute_path, a.role, a.verification_state,
+                    a.byte_size, a.mtime, a.entry_identity,
+                    a.projection_state, a.managed, a.media_json,
+                    EXISTS(SELECT 1 FROM item_assets ia WHERE ia.asset_id = a.id)
+                    OR EXISTS(SELECT 1 FROM album_assets aa WHERE aa.asset_id = a.id)
+                    OR EXISTS(SELECT 1 FROM asset_relationships ar
+                              WHERE ar.parent_asset_id = a.id OR ar.child_asset_id = a.id)
+             FROM assets a ORDER BY a.id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                PathBuf::from(row.get::<_, String>(1)?),
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<u64>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, bool>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, bool>(10)?,
+            ))
+        })?;
+        for row in rows {
+            let (
+                asset_id,
+                path,
+                role,
+                verification_state,
+                expected_size,
+                expected_mtime,
+                expected_entry_identity,
+                projection_state,
+                managed,
+                expected_media,
+                has_owner,
+            ) = row?;
+            if !managed {
+                continue;
+            }
+            if !has_owner {
+                issues.push(AuditIssue::OrphanedManagedAsset {
+                    asset_id: asset_id.clone(),
+                    path: path.clone(),
+                });
+            }
+            if projection_state != "current" {
+                issues.push(AuditIssue::ProjectionDiverged {
+                    asset_id: asset_id.clone(),
+                    path: path.clone(),
+                    state: projection_state,
+                });
+            }
+            if !path.exists() {
+                issues.push(AuditIssue::MissingManagedAsset {
+                    asset_id,
+                    path,
+                    role,
+                });
+                continue;
+            }
+            if verification_state != "verified" {
+                issues.push(AuditIssue::UnverifiedAsset {
+                    asset_id: asset_id.clone(),
+                    path: path.clone(),
+                });
+            }
+            let entry_metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    issues.push(AuditIssue::AssetUnreadable {
+                        asset_id,
+                        path,
+                        detail: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            let content_metadata = match std::fs::metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    issues.push(AuditIssue::AssetUnreadable {
+                        asset_id,
+                        path,
+                        detail: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            if expected_entry_identity
+                .as_deref()
+                .is_some_and(|expected| expected != file_identity(&entry_metadata))
+            {
+                issues.push(AuditIssue::AssetEntryIdentityMismatch {
+                    asset_id: asset_id.clone(),
+                    path: path.clone(),
+                });
+            }
+            if let Some(expected) =
+                expected_size.filter(|expected| *expected != content_metadata.len())
+            {
+                issues.push(AuditIssue::AssetSizeMismatch {
+                    asset_id: asset_id.clone(),
+                    path: path.clone(),
+                    expected,
+                    actual: content_metadata.len(),
+                });
+            }
+            if let Some(expected) = expected_mtime {
+                let actual = DateTime::<Utc>::from(entry_metadata.modified()?).to_rfc3339();
+                if actual != expected {
+                    issues.push(AuditIssue::AssetMtimeMismatch {
+                        asset_id: asset_id.clone(),
+                        path: path.clone(),
+                        expected,
+                        actual,
+                    });
+                }
+            }
+            if let Some(expected) = expected_media {
+                match probe_media(&path)
+                    .and_then(|media| serde_json::to_string(&media).map_err(Into::into))
+                {
+                    Ok(actual) if actual != expected => {
+                        issues.push(AuditIssue::MediaPropertiesMismatch {
+                            asset_id: asset_id.clone(),
+                            path: path.clone(),
+                        });
+                    }
+                    Err(error) => issues.push(AuditIssue::AssetUnreadable {
+                        asset_id: asset_id.clone(),
+                        path: path.clone(),
+                        detail: error.to_string(),
+                    }),
+                    Ok(_) => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Run `SQLite`'s full integrity check and foreign-key validation explicitly.
+    /// Ordinary opens deliberately do not pay this cost.
+    pub fn integrity_check(&self) -> Result<IntegrityReport> {
+        const LIMIT: usize = 100;
+        let mut messages = Vec::new();
+        let mut truncated = false;
+        let mut statement = self.conn.prepare("PRAGMA integrity_check(100)")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            let message = row?;
+            if message != "ok" {
+                if messages.len() < LIMIT {
+                    messages.push(message);
+                } else {
+                    truncated = true;
+                }
+            }
+        }
+
+        let mut statement = self.conn.prepare("PRAGMA foreign_key_check")?;
+        let rows = statement.query_map([], |row| {
+            Ok(format!(
+                "foreign key violation: table={}, rowid={}, parent={}, constraint={}",
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?
+                    .map_or_else(|| "unknown".into(), |value| value.to_string()),
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?
+            ))
+        })?;
+        for row in rows {
+            if messages.len() < LIMIT {
+                messages.push(row?);
+            } else {
+                let _discarded = row?;
+                truncated = true;
+            }
+        }
+        Ok(IntegrityReport {
+            messages,
+            truncated,
+        })
     }
 
     /// Reconcile journaled filesystem operations. This method is explicit for library callers.
     pub fn recover_pending(&mut self) -> Result<RecoveryReport> {
+        self.recover_interrupted_provider_jobs()?;
         let operations = self.pending_operations()?;
         let mut report = RecoveryReport::default();
         for operation in operations {
             match recover_operation(&operation) {
                 Ok(()) => {
+                    if operation.kind == OperationKind::PurgeDelete {
+                        if matches!(operation.state.as_str(), "db-committed" | "cleanup-pending") {
+                            self.finalize_purge_history(&operation)?;
+                        } else if let Some(plan_id) = &operation.plan_id {
+                            let plan_id = PlanId::parse(plan_id.clone())?;
+                            let transaction = self.conn.unchecked_transaction()?;
+                            let changed = transaction.execute(
+                                "UPDATE durable_plans
+                                 SET state = 'failed', error = 'purge rolled back during recovery',
+                                     updated_at = ?2, completed_at = ?2
+                                 WHERE id = ?1 AND state IN ('approved', 'running', 'paused')",
+                                params![plan_id.as_str(), Utc::now().to_rfc3339()],
+                            )?;
+                            if changed == 1 {
+                                append_plan_event(
+                                    &transaction,
+                                    &plan_id,
+                                    "failed",
+                                    &serde_json::json!({
+                                        "error": "purge rolled back during recovery",
+                                        "recovered_operation": operation.id,
+                                    }),
+                                )?;
+                            }
+                            transaction.commit()?;
+                        }
+                    }
                     self.complete_operation(&operation.id)?;
                     report.recovered_operations.push(operation.id);
                 }
@@ -322,6 +798,60 @@ impl Library {
                 item.extended = load_extended_metadata(&self.conn, "item", id)?;
             }
         }
+        Ok(items)
+    }
+
+    /// Collect a deliberately bounded selection for an atomic mutating command.
+    ///
+    /// The extra row distinguishes an exact-limit selection from a truncated
+    /// one without materializing the remainder of the catalog.
+    pub fn query_items_bounded(&self, query: &Query, maximum: u32) -> Result<Vec<Item>> {
+        if maximum == 0 || maximum >= 10_000 {
+            return Err(Error::Query(
+                "bounded selection maximum must be between 1 and 9999".into(),
+            ));
+        }
+        let items = self.query_items_page(query, None, maximum + 1)?;
+        if items.len() > maximum as usize {
+            return Err(Error::Query(format!(
+                "selection exceeds the atomic command limit of {maximum} items; narrow the query"
+            )));
+        }
+        Ok(items)
+    }
+
+    /// Read a stable keyset page ordered by item ID.
+    pub fn query_items_page(
+        &self,
+        query: &Query,
+        after_id: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<Item>> {
+        if limit == 0 || limit > 10_000 {
+            return Err(Error::Query(
+                "page limit must be between 1 and 10000".into(),
+            ));
+        }
+        let mut compiled = query.compile();
+        let (selection, _ordering) = compiled
+            .sql
+            .rsplit_once(" ORDER BY ")
+            .ok_or_else(|| Error::Query("compiled query has no stable ordering".into()))?;
+        let conjunction = if selection.contains(" WHERE ") {
+            " AND"
+        } else {
+            " WHERE"
+        };
+        compiled.sql = format!("{selection}{conjunction} id > ? ORDER BY id ASC LIMIT ?");
+        compiled
+            .parameters
+            .push(Value::Integer(after_id.unwrap_or(0)));
+        compiled.parameters.push(Value::Integer(i64::from(limit)));
+        let mut statement = self.conn.prepare(&compiled.sql)?;
+        let items = statement
+            .query_map(params_from_iter(compiled.parameters.iter()), row_to_item)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Error::from)?;
         Ok(items)
     }
 
@@ -355,17 +885,113 @@ impl Library {
         }
     }
 
+    /// Read a stable keyset page of albums ordered by catalog identity.
+    pub fn query_albums_page(
+        &self,
+        search: Option<&str>,
+        after_id: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<Album>> {
+        if limit == 0 || limit > 10_000 {
+            return Err(Error::Query(
+                "page limit must be between 1 and 10000".into(),
+            ));
+        }
+        let after_id = after_id.unwrap_or(0);
+        let albums = if let Some(search) = search {
+            let pattern = format!("%{}%", escape_like(search));
+            let mut statement = self.conn.prepare(
+                "SELECT * FROM albums
+                 WHERE id > ?1
+                   AND (album LIKE ?2 ESCAPE '!' OR albumartist LIKE ?2 ESCAPE '!')
+                 ORDER BY id ASC LIMIT ?3",
+            )?;
+            let page = statement
+                .query_map(params![after_id, pattern, limit], row_to_album)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            page
+        } else {
+            let mut statement = self
+                .conn
+                .prepare("SELECT * FROM albums WHERE id > ?1 ORDER BY id ASC LIMIT ?2")?;
+            let page = statement
+                .query_map(params![after_id, limit], row_to_album)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            page
+        };
+        Ok(albums)
+    }
+
+    /// Establish or refresh persistent ownership evidence for selected files.
+    pub fn verify_items(
+        &mut self,
+        query: &Query,
+        configured_root: &Path,
+    ) -> Result<VerificationReport> {
+        let items = self.query_items_bounded(query, 9_999)?;
+        let mut prepared = Vec::new();
+        let mut report = VerificationReport::default();
+        for item in items {
+            let Some(item_id) = item.id else {
+                continue;
+            };
+            match prepare_asset(&item.path, "audio") {
+                Ok(asset) if asset.verification_state == "verified" => {
+                    let root = item
+                        .path
+                        .starts_with(configured_root)
+                        .then(|| configured_root.to_path_buf());
+                    prepared.push((item_id, asset, root));
+                }
+                Ok(_) => report.skipped.push((
+                    item_id,
+                    item.path,
+                    "file is missing and cannot be verified".into(),
+                )),
+                Err(error) => report.skipped.push((item_id, item.path, error.to_string())),
+            }
+        }
+
+        let transaction = self.conn.transaction()?;
+        for (item_id, asset, root) in prepared {
+            let root_id = find_or_insert_root(&transaction, root.as_deref())?;
+            let existing = transaction
+                .query_row(
+                    "SELECT asset_id FROM item_assets
+                     WHERE item_id = ?1 AND relationship = 'audio'",
+                    [item_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if let Some(asset_id) = existing {
+                update_asset(&transaction, &asset_id, &root_id, root.as_deref(), &asset)?;
+            } else {
+                let asset_id = insert_asset(&transaction, &root_id, root.as_deref(), &asset)?;
+                transaction.execute(
+                    "INSERT INTO item_assets (item_id, asset_id, relationship)
+                     VALUES (?1, ?2, 'audio')",
+                    params![item_id, asset_id],
+                )?;
+            }
+            transaction.execute(
+                "UPDATE items SET file_size = ?1, mtime = ?2 WHERE id = ?3",
+                params![
+                    asset.byte_size,
+                    asset.mtime.map(|mtime| mtime.to_rfc3339()),
+                    item_id,
+                ],
+            )?;
+            report.verified += 1;
+        }
+        transaction.commit()?;
+        Ok(report)
+    }
+
     pub fn stats(&self) -> Result<Stats> {
         self.conn
             .query_row(
-                "SELECT
-                    COUNT(*),
-                    COUNT(DISTINCT album_id),
-                    COUNT(DISTINCT artist),
-                    COALESCE(SUM(length), 0),
-                    COALESCE(SUM(file_size), 0),
-                    COALESCE(SUM(CASE WHEN file_size IS NULL THEN 1 ELSE 0 END), 0)
-                 FROM items",
+                "SELECT tracks, albums, artists, total_length, total_size, unknown_sizes
+                 FROM library_statistics WHERE singleton = 1",
                 [],
                 |row| {
                     Ok(Stats {
@@ -591,7 +1217,7 @@ impl Library {
             .map_err(Into::into)
     }
 
-    /// Import a complete, already validated external-library snapshot atomically.
+    /// Import a validated external-library snapshot in one database transaction.
     pub fn import_migrated_groups(&mut self, groups: &[(Option<Album>, Vec<Item>)]) -> Result<()> {
         let existing: u64 = self
             .conn
@@ -601,26 +1227,238 @@ impl Library {
                 "Beets migration requires an empty destination library".into(),
             ));
         }
+        let mut prepared_groups = Vec::with_capacity(groups.len());
         for (album, items) in groups {
             if let Some(album) = album {
-                crate::validate_album_metadata(album)?;
+                validate_album_metadata(album)?;
             }
             for item in items {
                 validate_item_metadata(item)?;
             }
+            prepared_groups.push(prepare_import_assets(album.as_ref(), items)?);
         }
+
         let transaction = self.conn.transaction()?;
-        for (album, items) in groups {
+        let root_id = find_or_insert_root(&transaction, None)?;
+        for ((album, items), prepared_assets) in groups.iter().zip(&prepared_groups) {
             let album_id = album
                 .as_ref()
                 .map(|album| find_or_insert_album(&transaction, album))
                 .transpose()?;
-            for item in items {
-                insert_item(&transaction, item, album_id)?;
+            let release_id = match (album_id, album.as_ref()) {
+                (Some(album_id), Some(album)) => {
+                    Some(ensure_normalized_album(&transaction, album_id, album)?)
+                }
+                _ => None,
+            };
+            for (item, asset) in items.iter().zip(&prepared_assets[..items.len()]) {
+                let item_id = insert_item(&transaction, item, album_id)?;
+                let (release_track_id, recording_id) = if let Some(release_id) = &release_id {
+                    let (release_track_id, recording_id) =
+                        ensure_normalized_item(&transaction, item_id, release_id, item)?;
+                    (Some(release_track_id), recording_id)
+                } else {
+                    (
+                        None,
+                        ensure_normalized_singleton(&transaction, item_id, item)?,
+                    )
+                };
+                let asset_id = insert_asset(&transaction, &root_id, None, asset)?;
+                transaction.execute(
+                    "INSERT INTO item_assets (item_id, asset_id, relationship)
+                     VALUES (?1, ?2, 'audio')",
+                    params![item_id, asset_id],
+                )?;
+                transaction.execute(
+                    "INSERT INTO recording_assets
+                     (recording_id, release_track_id, asset_id, relationship)
+                     VALUES (?1, ?2, ?3, 'audio')",
+                    params![recording_id, release_track_id, asset_id],
+                )?;
+            }
+            if let (Some(album_id), Some(artwork)) = (album_id, prepared_assets.get(items.len())) {
+                let asset_id = insert_asset(&transaction, &root_id, None, artwork)?;
+                transaction.execute(
+                    "INSERT INTO album_assets (album_id, asset_id, relationship)
+                     VALUES (?1, ?2, 'front')",
+                    params![album_id, asset_id],
+                )?;
             }
         }
         transaction.commit()?;
         Ok(())
+    }
+
+    pub(crate) fn verified_asset_for_item(
+        &self,
+        item_id: i64,
+        expected_path: &Path,
+    ) -> Result<StoredAssetIdentity> {
+        let asset = self
+            .conn
+            .query_row(
+                "SELECT a.id, a.absolute_path, a.role, a.byte_size, a.blake3, a.sha256,
+                        a.entry_identity, a.verification_state, a.managed
+                 FROM assets a
+                 JOIN item_assets ia ON ia.asset_id = a.id
+                 WHERE ia.item_id = ?1 AND ia.relationship = 'audio'",
+                [item_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        PathBuf::from(row.get::<_, String>(1)?),
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<u64>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, bool>(8)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                Error::Import(format!(
+                    "item {item_id} has no persistent audio asset; verify it before deletion"
+                ))
+            })?;
+        let (asset_id, path, role, byte_size, blake3, sha256, entry_identity, state, managed) =
+            asset;
+        if path != expected_path {
+            return Err(Error::Import(format!(
+                "item {item_id} path does not match its persistent asset; preserving both"
+            )));
+        }
+        if !managed || state != "verified" {
+            return Err(Error::Import(format!(
+                "asset {asset_id} is {state} and cannot be deleted until verified"
+            )));
+        }
+        Ok(StoredAssetIdentity {
+            asset_id,
+            path,
+            role,
+            byte_size: byte_size
+                .ok_or_else(|| Error::Import("verified asset has no stored byte size".into()))?,
+            blake3: blake3
+                .ok_or_else(|| Error::Import("verified asset has no BLAKE3 digest".into()))?,
+            sha256: sha256
+                .ok_or_else(|| Error::Import("verified asset has no SHA-256 digest".into()))?,
+            entry_identity: entry_identity.ok_or_else(|| {
+                Error::Import("verified asset has no stored filesystem identity".into())
+            })?,
+        })
+    }
+
+    pub(crate) fn album_item_count(&self, album_id: i64) -> Result<usize> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM items WHERE album_id = ?1",
+                [album_id],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn verified_assets_for_album(
+        &self,
+        album_id: i64,
+    ) -> Result<Vec<StoredAssetIdentity>> {
+        let mut statement = self.conn.prepare(
+            "SELECT a.id, a.absolute_path, a.role, a.byte_size, a.blake3,
+                    a.sha256, a.entry_identity, a.verification_state, a.managed
+             FROM assets a
+             JOIN album_assets aa ON aa.asset_id = a.id
+             WHERE aa.album_id = ?1 ORDER BY a.id",
+        )?;
+        let rows = statement.query_map([album_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                PathBuf::from(row.get::<_, String>(1)?),
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<u64>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, bool>(8)?,
+            ))
+        })?;
+        let mut assets = Vec::new();
+        for row in rows {
+            let (asset_id, path, role, byte_size, blake3, sha256, entry_identity, state, managed) =
+                row?;
+            if !managed || state != "verified" {
+                return Err(Error::Import(format!(
+                    "album asset {asset_id} is {state} and cannot be removed until verified"
+                )));
+            }
+            assets.push(StoredAssetIdentity {
+                asset_id,
+                path,
+                role,
+                byte_size: byte_size.ok_or_else(|| {
+                    Error::Import("verified album asset has no stored byte size".into())
+                })?,
+                blake3: blake3.ok_or_else(|| {
+                    Error::Import("verified album asset has no BLAKE3 digest".into())
+                })?,
+                sha256: sha256.ok_or_else(|| {
+                    Error::Import("verified album asset has no SHA-256 digest".into())
+                })?,
+                entry_identity: entry_identity.ok_or_else(|| {
+                    Error::Import("verified album asset has no filesystem identity".into())
+                })?,
+            });
+        }
+        Ok(assets)
+    }
+
+    pub(crate) fn retained_removals_before(
+        &self,
+        completed_before: DateTime<Utc>,
+    ) -> Result<Vec<RetainedJournalFile>> {
+        let mut statement = self.conn.prepare(
+            "SELECT oj.id, of.ordinal, of.source_path, of.staged_path,
+                    of.destination_path, of.content_hash, of.sha256, of.source_identity,
+                    of.owned_identity, of.role, of.state
+             FROM operation_journal oj
+             JOIN operation_files of ON of.operation_id = oj.id
+             WHERE oj.state = 'complete' AND of.state = 'quarantined'
+               AND (
+                   oj.kind = 'remove-delete'
+                   OR (oj.kind = 'tag-write' AND of.role = 'tag-original')
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM operation_journal purge
+                   JOIN operation_files purge_file ON purge_file.operation_id = purge.id
+                   WHERE purge.kind = 'purge-delete'
+                     AND purge_file.source_path = of.staged_path
+               )
+               AND oj.completed_at <= ?1
+             ORDER BY oj.completed_at, oj.id, of.ordinal",
+        )?;
+        let files = statement
+            .query_map([completed_before.to_rfc3339()], |row| {
+                Ok(RetainedJournalFile {
+                    operation_id: row.get(0)?,
+                    ordinal: row.get(1)?,
+                    file: JournalFile {
+                        source: PathBuf::from(row.get::<_, String>(2)?),
+                        staged: PathBuf::from(row.get::<_, String>(3)?),
+                        destination: PathBuf::from(row.get::<_, String>(4)?),
+                        content_hash: row.get(5)?,
+                        sha256: row.get(6)?,
+                        source_identity: row.get(7)?,
+                        owned_identity: row.get(8)?,
+                        role: row.get(9)?,
+                        state: row.get(10)?,
+                    },
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(files)
     }
 
     pub(crate) fn create_operation(
@@ -628,13 +1466,30 @@ impl Library {
         kind: OperationKind,
         files: &[JournalFile],
     ) -> Result<String> {
+        self.create_operation_for_plan(kind, files, None, None)
+    }
+
+    pub(crate) fn create_operation_for_plan(
+        &self,
+        kind: OperationKind,
+        files: &[JournalFile],
+        plan_id: Option<&str>,
+        decision: Option<&serde_json::Value>,
+    ) -> Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         let transaction = self.conn.unchecked_transaction()?;
         transaction.execute(
-            "INSERT INTO operation_journal (id, kind, state, created_at, updated_at)
-             VALUES (?1, ?2, 'prepared', ?3, ?3)",
-            params![id, kind.as_str(), now],
+            "INSERT INTO operation_journal
+             (id, kind, state, plan_id, decision_json, created_at, updated_at)
+             VALUES (?1, ?2, 'prepared', ?3, ?4, ?5, ?5)",
+            params![
+                id,
+                kind.as_str(),
+                plan_id,
+                decision.map(serde_json::to_string).transpose()?,
+                now
+            ],
         )?;
         for (ordinal, file) in files.iter().enumerate() {
             let source = path_to_storage(&file.source)?;
@@ -643,8 +1498,8 @@ impl Library {
             transaction.execute(
                 "INSERT INTO operation_files
                  (operation_id, ordinal, source_path, staged_path, destination_path,
-                  content_hash, source_identity, owned_identity, role, state)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'prepared')",
+                  content_hash, sha256, source_identity, owned_identity, role, state)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'prepared')",
                 params![
                     id,
                     ordinal,
@@ -652,6 +1507,7 @@ impl Library {
                     staged,
                     destination,
                     file.content_hash,
+                    file.sha256,
                     file.source_identity,
                     file.owned_identity,
                     file.role,
@@ -659,7 +1515,39 @@ impl Library {
             )?;
         }
         transaction.commit()?;
+        failpoints::hit("db.create-operation-commit")?;
         Ok(id)
+    }
+
+    /// Add one bounded unit of work to an existing typed operation.
+    pub(crate) fn append_operation_file(&self, id: &str, file: &JournalFile) -> Result<usize> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let ordinal = transaction.query_row(
+            "SELECT COALESCE(MAX(ordinal) + 1, 0) FROM operation_files WHERE operation_id = ?1",
+            [id],
+            |row| row.get::<_, usize>(0),
+        )?;
+        transaction.execute(
+            "INSERT INTO operation_files
+             (operation_id, ordinal, source_path, staged_path, destination_path,
+              content_hash, sha256, source_identity, owned_identity, role, state)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'prepared')",
+            params![
+                id,
+                ordinal,
+                path_to_storage(&file.source)?,
+                path_to_storage(&file.staged)?,
+                path_to_storage(&file.destination)?,
+                file.content_hash,
+                file.sha256,
+                file.source_identity,
+                file.owned_identity,
+                file.role,
+            ],
+        )?;
+        transaction.commit()?;
+        failpoints::hit("db.append-operation-file")?;
+        Ok(ordinal)
     }
 
     pub(crate) fn set_operation_state(
@@ -673,7 +1561,23 @@ impl Library {
              SET state = ?1, updated_at = ?2, error = ?3 WHERE id = ?4",
             params![state, Utc::now().to_rfc3339(), error, id],
         )?;
-        require_journal_row(changed, "operation state")
+        require_journal_row(changed, "operation state")?;
+        failpoints::hit("db.operation-state")
+    }
+
+    pub(crate) fn record_operation_failure(&self, id: &str, error: &str) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE operation_journal
+             SET state = CASE
+                   WHEN state IN ('db-committed', 'cleanup-pending', 'complete') THEN state
+                   ELSE 'failed'
+                 END,
+                 error = ?2, updated_at = ?3
+             WHERE id = ?1",
+            params![id, error, Utc::now().to_rfc3339()],
+        )?;
+        require_journal_row(changed, "operation failure")?;
+        failpoints::hit("db.operation-failure")
     }
 
     pub(crate) fn set_file_state(&self, id: &str, ordinal: usize, state: &str) -> Result<()> {
@@ -682,7 +1586,8 @@ impl Library {
              WHERE operation_id = ?2 AND ordinal = ?3",
             params![state, id, ordinal],
         )?;
-        require_journal_row(changed, "operation file state")
+        require_journal_row(changed, "operation file state")?;
+        failpoints::hit("db.operation-file-state")
     }
 
     pub(crate) fn set_staged_file_identity(
@@ -696,7 +1601,41 @@ impl Library {
              WHERE operation_id = ?2 AND ordinal = ?3",
             params![identity, id, ordinal],
         )?;
-        require_journal_row(changed, "staged file identity")
+        require_journal_row(changed, "staged file identity")?;
+        failpoints::hit("db.staged-file-identity")
+    }
+
+    pub(crate) fn set_acquired_file_identity(
+        &self,
+        id: &str,
+        ordinal: usize,
+        identity: &str,
+    ) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE operation_files SET state = 'acquired', owned_identity = ?1
+             WHERE operation_id = ?2 AND ordinal = ?3 AND state = 'prepared'",
+            params![identity, id, ordinal],
+        )?;
+        require_journal_row(changed, "acquired file identity")?;
+        failpoints::hit("db.acquired-file-identity")
+    }
+
+    pub(crate) fn set_staged_file_full_evidence(
+        &self,
+        id: &str,
+        ordinal: usize,
+        identity: &str,
+        blake3: &str,
+        sha256: &str,
+    ) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE operation_files
+             SET state = 'staged', owned_identity = ?1, content_hash = ?2, sha256 = ?3
+             WHERE operation_id = ?4 AND ordinal = ?5",
+            params![identity, blake3, sha256, id, ordinal],
+        )?;
+        require_journal_row(changed, "staged file full evidence")?;
+        failpoints::hit("db.staged-file-full-evidence")
     }
 
     pub(crate) fn commit_import(
@@ -704,13 +1643,100 @@ impl Library {
         operation_id: &str,
         album: Option<&Album>,
         items: &[Item],
-    ) -> Result<i64> {
+    ) -> Result<Option<i64>> {
+        self.commit_import_at_root_with_artwork(operation_id, album, items, None, None)
+    }
+
+    pub(crate) fn commit_import_at_root_with_artwork(
+        &mut self,
+        operation_id: &str,
+        album: Option<&Album>,
+        items: &[Item],
+        library_root: Option<&Path>,
+        original_artwork: Option<&ArtworkAssetMetadata>,
+    ) -> Result<Option<i64>> {
+        let prepared_assets = prepare_import_assets(album, items)?;
+        let prepared_original = original_artwork
+            .map(|metadata| prepare_asset(metadata.path(), "artwork-original"))
+            .transpose()?;
         let transaction = self.conn.transaction()?;
+        let root_id = find_or_insert_root(&transaction, library_root)?;
         let album_id = album
             .map(|album| find_or_insert_album(&transaction, album))
             .transpose()?;
-        for item in items {
-            insert_item(&transaction, item, album_id)?;
+        let release_id = match (album_id, album) {
+            (Some(album_id), Some(album)) => {
+                Some(ensure_normalized_album(&transaction, album_id, album)?)
+            }
+            _ => None,
+        };
+        for (item, asset) in items.iter().zip(&prepared_assets[..items.len()]) {
+            let item_id = insert_item(&transaction, item, album_id)?;
+            let (release_track_id, recording_id) = if let Some(release_id) = &release_id {
+                let (release_track_id, recording_id) =
+                    ensure_normalized_item(&transaction, item_id, release_id, item)?;
+                (Some(release_track_id), recording_id)
+            } else {
+                (
+                    None,
+                    ensure_normalized_singleton(&transaction, item_id, item)?,
+                )
+            };
+            let asset_id = insert_asset(&transaction, &root_id, library_root, asset)?;
+            transaction.execute(
+                "INSERT INTO item_assets (item_id, asset_id, relationship)
+                 VALUES (?1, ?2, 'audio')",
+                params![item_id, asset_id],
+            )?;
+            transaction.execute(
+                "INSERT INTO recording_assets
+                 (recording_id, release_track_id, asset_id, relationship)
+                 VALUES (?1, ?2, ?3, 'audio')",
+                params![recording_id, release_track_id, asset_id],
+            )?;
+        }
+        let projection_asset_id =
+            if let (Some(album_id), Some(artwork)) = (album_id, prepared_assets.get(items.len())) {
+                let asset_id = insert_asset(&transaction, &root_id, library_root, artwork)?;
+                transaction.execute(
+                    "INSERT INTO album_assets (album_id, asset_id, relationship)
+                 VALUES (?1, ?2, 'front')",
+                    params![album_id, asset_id],
+                )?;
+                Some(asset_id)
+            } else {
+                None
+            };
+        if let (Some(metadata), Some(original), Some(album_id), Some(release_id)) = (
+            original_artwork,
+            prepared_original.as_ref(),
+            album_id,
+            release_id.as_deref(),
+        ) {
+            let original_asset_id =
+                find_or_reuse_asset(&transaction, &root_id, library_root, original)?;
+            let relationship = format!("original-{}", metadata.provenance().role.as_str());
+            transaction.execute(
+                "INSERT OR IGNORE INTO album_assets (album_id, asset_id, relationship)
+                 VALUES (?1, ?2, ?3)",
+                params![album_id, original_asset_id, relationship],
+            )?;
+            store_artwork_metadata(
+                &transaction,
+                &original_asset_id,
+                &original_asset_id,
+                release_id,
+                metadata,
+            )?;
+            if let Some(projection_asset_id) = projection_asset_id.as_deref() {
+                store_artwork_metadata(
+                    &transaction,
+                    projection_asset_id,
+                    &original_asset_id,
+                    release_id,
+                    metadata,
+                )?;
+            }
         }
         let changed = transaction.execute(
             "UPDATE operation_journal SET state = 'db-committed', updated_at = ?1
@@ -719,7 +1745,8 @@ impl Library {
         )?;
         require_journal_row(changed, "import commit")?;
         transaction.commit()?;
-        Ok(album_id.unwrap_or(0))
+        failpoints::hit("db.import-commit")?;
+        Ok(album_id)
     }
 
     pub(crate) fn commit_removal(
@@ -730,6 +1757,14 @@ impl Library {
         let transaction = self.conn.transaction()?;
         for (id, path) in items {
             let stored_path = path_to_storage(path)?;
+            transaction.execute(
+                "UPDATE assets
+                 SET managed = 0,
+                     verification_state = CASE WHEN ?1 IS NULL THEN verification_state ELSE 'missing' END,
+                     last_verified_at = ?2
+                 WHERE id IN (SELECT asset_id FROM item_assets WHERE item_id = ?3)",
+                params![operation_id, Utc::now().to_rfc3339(), id],
+            )?;
             if transaction.execute(
                 "DELETE FROM items WHERE id = ?1 AND path = ?2",
                 params![id, stored_path],
@@ -741,6 +1776,19 @@ impl Library {
                 )));
             }
         }
+        transaction.execute(
+            "UPDATE assets
+             SET managed = 0,
+                 verification_state = CASE WHEN ?1 IS NULL THEN verification_state ELSE 'missing' END,
+                 last_verified_at = ?2
+             WHERE id IN (
+                 SELECT aa.asset_id FROM album_assets aa
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM items i WHERE i.album_id = aa.album_id
+                 )
+             )",
+            params![operation_id, Utc::now().to_rfc3339()],
+        )?;
         transaction.execute(
             "DELETE FROM albums WHERE NOT EXISTS(
                 SELECT 1 FROM items WHERE items.album_id = albums.id
@@ -757,37 +1805,7 @@ impl Library {
             require_journal_row(changed, "removal commit")?;
         }
         transaction.commit()?;
-        Ok(())
-    }
-
-    pub(crate) fn commit_tag_write(
-        &mut self,
-        operation_id: &str,
-        item_id: i64,
-        path: &Path,
-        file_size: u64,
-        modified: DateTime<Utc>,
-    ) -> Result<()> {
-        let stored_path = path_to_storage(path)?;
-        let transaction = self.conn.transaction()?;
-        if transaction.execute(
-            "UPDATE items SET file_size = ?1, mtime = ?2
-             WHERE id = ?3 AND path = ?4",
-            params![file_size, modified.to_rfc3339(), item_id, stored_path],
-        )? != 1
-        {
-            return Err(Error::Import(format!(
-                "tag-write plan is stale for {}; no row was updated",
-                path.display()
-            )));
-        }
-        let changed = transaction.execute(
-            "UPDATE operation_journal SET state = 'db-committed', updated_at = ?1
-             WHERE id = ?2",
-            params![Utc::now().to_rfc3339(), operation_id],
-        )?;
-        require_journal_row(changed, "tag-write commit")?;
-        transaction.commit()?;
+        failpoints::hit("db.removal-commit")?;
         Ok(())
     }
 
@@ -797,13 +1815,52 @@ impl Library {
         item_id: i64,
         source: &Path,
         destination: &Path,
+        library_root: &Path,
     ) -> Result<()> {
-        let source = path_to_storage(source)?;
-        let destination = path_to_storage(destination)?;
+        let source = path_to_storage(source)?.to_owned();
+        let destination_storage = path_to_storage(destination)?.to_owned();
+        let prepared = prepare_asset(destination, "audio")?;
         let transaction = self.conn.transaction()?;
+        let root_id = find_or_insert_root(&transaction, Some(library_root))?;
+        let relative =
+            path_to_storage(destination.strip_prefix(library_root).map_err(|_error| {
+                Error::Import(format!(
+                    "move destination escapes its library root: {}",
+                    destination.display()
+                ))
+            })?)?;
+        let changed_asset = transaction.execute(
+            "UPDATE assets
+             SET root_id = ?1, relative_path = ?2, absolute_path = ?3,
+                 byte_size = ?4, blake3 = ?5, sha256 = ?6, mtime = ?7,
+                 entry_identity = ?8, verification_state = ?9,
+                 last_verified_at = ?10, managed = 1
+             WHERE absolute_path = ?11
+               AND id IN (SELECT asset_id FROM item_assets
+                          WHERE item_id = ?12 AND relationship = 'audio')",
+            params![
+                root_id,
+                relative,
+                destination_storage,
+                prepared.byte_size,
+                prepared.blake3,
+                prepared.sha256,
+                prepared.mtime.map(|mtime| mtime.to_rfc3339()),
+                prepared.entry_identity,
+                prepared.verification_state,
+                Utc::now().to_rfc3339(),
+                source,
+                item_id,
+            ],
+        )?;
+        if changed_asset != 1 {
+            return Err(Error::Import(
+                "move plan is stale; its managed asset row was not updated".into(),
+            ));
+        }
         if transaction.execute(
             "UPDATE items SET path = ?1 WHERE id = ?2 AND path = ?3",
-            params![destination, item_id, source],
+            params![destination_storage, item_id, source],
         )? != 1
         {
             return Err(Error::Import(
@@ -821,15 +1878,20 @@ impl Library {
     }
 
     pub(crate) fn complete_operation(&self, id: &str) -> Result<()> {
-        let changed = self
-            .conn
-            .execute("DELETE FROM operation_journal WHERE id = ?1", [id])?;
-        require_journal_row(changed, "operation completion")
+        let now = Utc::now().to_rfc3339();
+        let changed = self.conn.execute(
+            "UPDATE operation_journal
+             SET state = 'complete', updated_at = ?1, completed_at = ?1, error = NULL
+             WHERE id = ?2 AND state != 'complete'",
+            params![now, id],
+        )?;
+        require_journal_row(changed, "operation completion")?;
+        failpoints::hit("db.operation-complete")
     }
 
     fn pending_operations(&self) -> Result<Vec<PendingOperation>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, kind, state FROM operation_journal
+            "SELECT id, kind, state, plan_id FROM operation_journal
              WHERE state != 'complete' ORDER BY created_at, id",
         )?;
         let headers = stmt
@@ -838,14 +1900,15 @@ impl Library {
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let mut operations = Vec::with_capacity(headers.len());
-        for (id, kind, state) in headers {
+        for (id, kind, state, plan_id) in headers {
             let mut file_stmt = self.conn.prepare(
                 "SELECT source_path, staged_path, destination_path, content_hash,
-                        source_identity, owned_identity, role, state
+                        sha256, source_identity, owned_identity, role, state
                  FROM operation_files WHERE operation_id = ?1 ORDER BY ordinal",
             )?;
             let files = file_stmt
@@ -855,10 +1918,11 @@ impl Library {
                         staged: PathBuf::from(row.get::<_, String>(1)?),
                         destination: PathBuf::from(row.get::<_, String>(2)?),
                         content_hash: row.get(3)?,
-                        source_identity: row.get(4)?,
-                        owned_identity: row.get(5)?,
-                        role: row.get(6)?,
-                        state: row.get(7)?,
+                        sha256: row.get(4)?,
+                        source_identity: row.get(5)?,
+                        owned_identity: row.get(6)?,
+                        role: row.get(7)?,
+                        state: row.get(8)?,
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -866,10 +1930,42 @@ impl Library {
                 id,
                 kind: OperationKind::parse(&kind)?,
                 state,
+                plan_id,
                 files,
             });
         }
         Ok(operations)
+    }
+
+    fn finalize_purge_history(&self, operation: &PendingOperation) -> Result<()> {
+        let transaction = self.conn.unchecked_transaction()?;
+        for file in &operation.files {
+            transaction.execute(
+                "UPDATE operation_files SET state = 'purged'
+                 WHERE staged_path = ?1 AND operation_id != ?2 AND state = 'quarantined'",
+                params![path_to_storage(&file.source)?, operation.id],
+            )?;
+        }
+        if let Some(plan_id) = &operation.plan_id {
+            let plan_id = PlanId::parse(plan_id.clone())?;
+            let changed = transaction.execute(
+                "UPDATE durable_plans
+                 SET state = 'complete', progress_current = progress_total,
+                     updated_at = ?2, completed_at = ?2
+                 WHERE id = ?1 AND state IN ('approved', 'running', 'paused')",
+                params![plan_id.as_str(), Utc::now().to_rfc3339()],
+            )?;
+            if changed == 1 {
+                append_plan_event(
+                    &transaction,
+                    &plan_id,
+                    "complete",
+                    &serde_json::json!({"recovered_operation": operation.id}),
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     fn backfill_file_sizes(&mut self) -> Result<()> {
@@ -1068,7 +2164,7 @@ fn invalidate_external_ids(
 ) -> Result<()> {
     if track_identity {
         transaction.execute(
-            "DELETE FROM external_ids
+            "DELETE FROM library_external_ids
              WHERE entity_type = 'item' AND entity_id = ?1
                AND kind IN ('recording', 'release_track')",
             [item_id],
@@ -1076,7 +2172,7 @@ fn invalidate_external_ids(
     }
     if release_identity {
         transaction.execute(
-            "DELETE FROM external_ids
+            "DELETE FROM library_external_ids
              WHERE entity_type = 'item' AND entity_id = ?1 AND kind = 'release'",
             [item_id],
         )?;
@@ -1088,8 +2184,8 @@ fn cleanup_orphan_metadata(transaction: &Transaction<'_>) -> Result<()> {
     for (table, entity_type, entity_table) in [
         ("entity_metadata", "item", "items"),
         ("entity_metadata", "album", "albums"),
-        ("external_ids", "item", "items"),
-        ("external_ids", "album", "albums"),
+        ("library_external_ids", "item", "items"),
+        ("library_external_ids", "album", "albums"),
     ] {
         let sql = format!(
             "DELETE FROM {table}
@@ -1268,9 +2364,8 @@ fn save_extended_metadata(
         "DELETE FROM entity_metadata WHERE entity_type = ?1 AND entity_id = ?2",
         params![entity_type, entity_id],
     )?;
-    let core = serde_json::to_string(metadata).map_err(|error| {
-        Error::Database(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
-    })?;
+    let core = serde_json::to_string(metadata)
+        .map_err(|error| Error::Database(format!("cannot serialize extended metadata: {error}")))?;
     transaction.execute(
         "INSERT INTO entity_metadata
          (entity_type, entity_id, field, ordinal, value_type, value_json)
@@ -1280,7 +2375,9 @@ fn save_extended_metadata(
     for (field, value) in &metadata.flexible_fields {
         validate_flexible_field_name(field)?;
         let json = serde_json::to_string(value).map_err(|error| {
-            Error::Database(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+            Error::Database(format!(
+                "cannot serialize flexible metadata field {field}: {error}"
+            ))
         })?;
         transaction.execute(
             "INSERT INTO entity_metadata
@@ -1305,7 +2402,7 @@ fn save_external_ids<'a>(
     ids: impl Iterator<Item = &'a ExternalId>,
 ) -> Result<()> {
     transaction.execute(
-        "DELETE FROM external_ids WHERE entity_type = ?1 AND entity_id = ?2",
+        "DELETE FROM library_external_ids WHERE entity_type = ?1 AND entity_id = ?2",
         params![entity_type, entity_id],
     )?;
     let mut seen = HashSet::new();
@@ -1322,7 +2419,7 @@ fn save_external_ids<'a>(
         };
         if seen.insert((id.provider.as_str(), kind, id.value.as_str())) {
             transaction.execute(
-                "INSERT INTO external_ids
+                "INSERT INTO library_external_ids
                  (entity_type, entity_id, provider, kind, value)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![entity_type, entity_id, id.provider, kind, id.value],
@@ -1367,7 +2464,7 @@ fn load_extended_metadata(
         metadata.flexible_fields.insert(field, value);
     }
     let mut statement = conn.prepare(
-        "SELECT provider, kind, value FROM external_ids
+        "SELECT provider, kind, value FROM library_external_ids
          WHERE entity_type = ?1 AND entity_id = ?2 ORDER BY provider, kind, value",
     )?;
     metadata.external_ids = statement
@@ -1405,6 +2502,688 @@ fn validate_flexible_field_name(field: &str) -> Result<()> {
         )))
     } else {
         Ok(())
+    }
+}
+
+fn ensure_normalized_album(
+    transaction: &Transaction<'_>,
+    album_id: i64,
+    album: &Album,
+) -> Result<String> {
+    if let Some(existing) = transaction.query_row(
+        "SELECT canonical_release_id FROM albums WHERE id = ?1",
+        [album_id],
+        |row| row.get::<_, Option<String>>(0),
+    )? {
+        return Ok(existing);
+    }
+
+    let release_id = if let Some(external) = &album.external_id {
+        transaction
+            .query_row(
+                "SELECT entity_id FROM external_ids
+                 WHERE provider = ?1 AND entity_type = 'release' AND external_id = ?2",
+                params![external.provider, external.value],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+    } else {
+        None
+    };
+    if let Some(release_id) = release_id {
+        transaction.execute(
+            "UPDATE albums SET canonical_release_id = ?1 WHERE id = ?2",
+            params![release_id, album_id],
+        )?;
+        return Ok(release_id);
+    }
+
+    let now = Utc::now().to_rfc3339();
+    let release_group_id = uuid::Uuid::new_v4().to_string();
+    let release_id = uuid::Uuid::new_v4().to_string();
+    let release_date = album.year.map(|year| format!("{year:04}"));
+    transaction.execute(
+        "INSERT INTO release_groups (id, title, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?3)",
+        params![release_group_id, album.album, now],
+    )?;
+    transaction.execute(
+        "INSERT INTO releases
+         (id, release_group_id, title, release_date, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+        params![release_id, release_group_id, album.album, release_date, now],
+    )?;
+    attach_single_artist_credit(
+        transaction,
+        "release-group",
+        &release_group_id,
+        "primary",
+        &album.albumartist,
+    )?;
+    attach_single_artist_credit(
+        transaction,
+        "release",
+        &release_id,
+        "primary",
+        &album.albumartist,
+    )?;
+    if let Some(external) = &album.external_id {
+        transaction.execute(
+            "INSERT INTO external_ids
+             (entity_type, entity_id, provider, external_id, data_license)
+             VALUES ('release', ?1, ?2, ?3, ?4)",
+            params![
+                release_id,
+                external.provider,
+                external.value,
+                provider_license(&external.provider)
+            ],
+        )?;
+    }
+    insert_local_claim(
+        transaction,
+        "release-group",
+        &release_group_id,
+        "title",
+        &album.album,
+    )?;
+    insert_local_claim(transaction, "release", &release_id, "title", &album.album)?;
+    if let Some(date) = &release_date {
+        insert_local_claim(transaction, "release", &release_id, "release-date", date)?;
+    }
+    transaction.execute(
+        "UPDATE albums SET canonical_release_id = ?1 WHERE id = ?2",
+        params![release_id, album_id],
+    )?;
+    Ok(release_id)
+}
+
+#[allow(clippy::too_many_lines)]
+fn ensure_normalized_item(
+    transaction: &Transaction<'_>,
+    item_id: i64,
+    release_id: &str,
+    item: &Item,
+) -> Result<(String, String)> {
+    let disc = item.disc.unwrap_or(1).max(1);
+    let medium_id = transaction
+        .query_row(
+            "SELECT id FROM media WHERE release_id = ?1 AND position = ?2",
+            params![release_id, disc],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    transaction.execute(
+        "INSERT OR IGNORE INTO media (id, release_id, position, track_count)
+         VALUES (?1, ?2, ?3, 0)",
+        params![medium_id, release_id, disc],
+    )?;
+
+    let recording_id = if let Some(external) = &item.track_external_id {
+        transaction
+            .query_row(
+                "SELECT entity_id FROM external_ids
+                 WHERE provider = ?1 AND entity_type = 'recording' AND external_id = ?2",
+                params![external.provider, external.value],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+    } else {
+        None
+    }
+    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let now = Utc::now().to_rfc3339();
+    transaction.execute(
+        "INSERT OR IGNORE INTO recordings
+         (id, title, duration_ms, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?4)",
+        params![
+            recording_id,
+            item.title,
+            (item.length * 1000.0).round() as u64,
+            now
+        ],
+    )?;
+    attach_single_artist_credit(
+        transaction,
+        "recording",
+        &recording_id,
+        "performance",
+        &item.artist,
+    )?;
+    if let Some(external) = &item.track_external_id {
+        transaction.execute(
+            "INSERT OR IGNORE INTO external_ids
+             (entity_type, entity_id, provider, external_id, data_license)
+             VALUES ('recording', ?1, ?2, ?3, ?4)",
+            params![
+                recording_id,
+                external.provider,
+                external.value,
+                provider_license(&external.provider)
+            ],
+        )?;
+    }
+
+    let next_position: u32 = transaction.query_row(
+        "SELECT COALESCE(MAX(position), 0) + 1 FROM release_tracks WHERE medium_id = ?1",
+        [&medium_id],
+        |row| row.get(0),
+    )?;
+    let preferred = item.track.unwrap_or(next_position).max(1);
+    let occupied: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM release_tracks WHERE medium_id = ?1 AND position = ?2)",
+        params![medium_id, preferred],
+        |row| row.get(0),
+    )?;
+    let position = if occupied { next_position } else { preferred };
+    let release_track_id = uuid::Uuid::new_v4().to_string();
+    transaction.execute(
+        "INSERT INTO release_tracks
+         (id, medium_id, recording_id, position, printed_position, title, length_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            release_track_id,
+            medium_id,
+            recording_id,
+            position,
+            item.track.map(|track| track.to_string()),
+            item.title,
+            (item.length * 1000.0).round() as u64
+        ],
+    )?;
+    attach_single_artist_credit(
+        transaction,
+        "release-track",
+        &release_track_id,
+        "credited",
+        &item.artist,
+    )?;
+    transaction.execute(
+        "UPDATE media SET track_count = (
+             SELECT COUNT(*) FROM release_tracks WHERE medium_id = ?1
+         ) WHERE id = ?1",
+        [&medium_id],
+    )?;
+    transaction.execute(
+        "UPDATE items SET release_track_id = ?1, recording_id = ?2 WHERE id = ?3",
+        params![release_track_id, recording_id, item_id],
+    )?;
+    insert_local_claim(
+        transaction,
+        "recording",
+        &recording_id,
+        "title",
+        &item.title,
+    )?;
+    insert_local_claim(
+        transaction,
+        "release-track",
+        &release_track_id,
+        "title",
+        &item.title,
+    )?;
+    Ok((release_track_id, recording_id))
+}
+
+fn ensure_normalized_singleton(
+    transaction: &Transaction<'_>,
+    item_id: i64,
+    item: &Item,
+) -> Result<String> {
+    let recording_id = if let Some(external) = &item.track_external_id {
+        transaction
+            .query_row(
+                "SELECT entity_id FROM external_ids
+                 WHERE provider = ?1 AND entity_type = 'recording' AND external_id = ?2",
+                params![external.provider, external.value],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+    } else {
+        None
+    }
+    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let now = Utc::now().to_rfc3339();
+    transaction.execute(
+        "INSERT OR IGNORE INTO recordings
+         (id, title, duration_ms, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?4)",
+        params![
+            recording_id,
+            item.title,
+            (item.length * 1000.0).round() as u64,
+            now
+        ],
+    )?;
+    attach_single_artist_credit(
+        transaction,
+        "recording",
+        &recording_id,
+        "performance",
+        &item.artist,
+    )?;
+    if let Some(external) = &item.track_external_id {
+        transaction.execute(
+            "INSERT OR IGNORE INTO external_ids
+             (entity_type, entity_id, provider, external_id, data_license)
+             VALUES ('recording', ?1, ?2, ?3, ?4)",
+            params![
+                recording_id,
+                external.provider,
+                external.value,
+                provider_license(&external.provider)
+            ],
+        )?;
+    }
+    transaction.execute(
+        "UPDATE items SET release_track_id = NULL, recording_id = ?1 WHERE id = ?2",
+        params![recording_id, item_id],
+    )?;
+    insert_local_claim(
+        transaction,
+        "recording",
+        &recording_id,
+        "title",
+        &item.title,
+    )?;
+    Ok(recording_id)
+}
+
+fn attach_single_artist_credit(
+    transaction: &Transaction<'_>,
+    entity_type: &str,
+    entity_id: &str,
+    relationship: &str,
+    display_name: &str,
+) -> Result<()> {
+    let exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM entity_artist_credits
+         WHERE entity_type = ?1 AND entity_id = ?2 AND relationship = ?3)",
+        params![entity_type, entity_id, relationship],
+        |row| row.get(0),
+    )?;
+    if exists {
+        return Ok(());
+    }
+    let artist_id = transaction
+        .query_row(
+            "SELECT id FROM artists WHERE name = ?1 ORDER BY id LIMIT 1",
+            [display_name],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let now = Utc::now().to_rfc3339();
+    transaction.execute(
+        "INSERT OR IGNORE INTO artists (id, name, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?3)",
+        params![artist_id, display_name, now],
+    )?;
+    let credit_id = uuid::Uuid::new_v4().to_string();
+    transaction.execute(
+        "INSERT INTO artist_credits (id, display_name) VALUES (?1, ?2)",
+        params![credit_id, display_name],
+    )?;
+    transaction.execute(
+        "INSERT INTO artist_credit_names
+         (credit_id, position, artist_id, credited_name, join_phrase)
+         VALUES (?1, 0, ?2, ?3, '')",
+        params![credit_id, artist_id, display_name],
+    )?;
+    transaction.execute(
+        "INSERT INTO entity_artist_credits
+         (entity_type, entity_id, credit_id, relationship)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![entity_type, entity_id, credit_id, relationship],
+    )?;
+    Ok(())
+}
+
+fn insert_local_claim(
+    transaction: &Transaction<'_>,
+    entity_type: &str,
+    entity_id: &str,
+    field: &str,
+    value: &str,
+) -> Result<()> {
+    let claim_id = uuid::Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+    let value_json = serde_json::to_string(value)?;
+    transaction.execute(
+        "INSERT INTO metadata_claims
+         (id, entity_type, entity_id, field, value_state, value_json,
+          source_kind, retrieved_at, confidence, data_license, locked)
+         VALUES (?1, ?2, ?3, ?4, 'known', ?5, 'local-tags', ?6, 0.5, 'user-owned', 0)",
+        params![claim_id, entity_type, entity_id, field, value_json, now],
+    )?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO canonical_values
+         (entity_type, entity_id, field, value_state, value_json,
+          winning_claim_id, policy_version, resolved_at)
+         VALUES (?1, ?2, ?3, 'known', ?4, ?5, 1, ?6)",
+        params![entity_type, entity_id, field, value_json, claim_id, now],
+    )?;
+    Ok(())
+}
+
+fn provider_license(provider: &str) -> &'static str {
+    match provider {
+        "musicbrainz" | "discogs-dump" => "CC0-1.0",
+        _ => "source-specific",
+    }
+}
+
+fn prepare_import_assets(album: Option<&Album>, items: &[Item]) -> Result<Vec<PreparedAsset>> {
+    let mut assets = Vec::with_capacity(
+        items.len() + usize::from(album.is_some_and(|album| album.artpath.is_some())),
+    );
+    for item in items {
+        assets.push(prepare_asset(&item.path, "audio")?);
+    }
+    if let Some(artwork) = album.and_then(|album| album.artpath.as_ref()) {
+        assets.push(prepare_asset(artwork, "artwork")?);
+    }
+    Ok(assets)
+}
+
+fn prepare_asset(path: &Path, role: &'static str) -> Result<PreparedAsset> {
+    let before = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PreparedAsset {
+                id: uuid::Uuid::new_v4().to_string(),
+                path: path.to_path_buf(),
+                role,
+                verification_state: "unverified",
+                byte_size: None,
+                blake3: None,
+                sha256: None,
+                mtime: None,
+                entry_identity: None,
+                media_json: None,
+                audio_essence_hash: None,
+            });
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let before_content = std::fs::metadata(path)?;
+    let identity = file_identity(&before);
+    let digests = digest_file(path)?;
+    let after = std::fs::symlink_metadata(path)?;
+    let after_content = std::fs::metadata(path)?;
+    if file_identity(&after) != identity
+        || before_content.len() != digests.byte_size()
+        || after_content.len() != digests.byte_size()
+    {
+        return Err(Error::Import(format!(
+            "asset changed while calculating persistent identity: {}",
+            path.display()
+        )));
+    }
+    let media_json = (role == "audio")
+        .then(|| {
+            probe_media(path)
+                .ok()
+                .and_then(|media| serde_json::to_string(&media).ok())
+        })
+        .flatten();
+    let audio_essence_hash = if role == "audio" && media_json.is_some() {
+        decoded_audio_essence_hash(path).ok()
+    } else {
+        None
+    };
+    Ok(PreparedAsset {
+        id: uuid::Uuid::new_v4().to_string(),
+        path: path.to_path_buf(),
+        role,
+        verification_state: "verified",
+        byte_size: Some(digests.byte_size()),
+        blake3: Some(digests.blake3().to_string()),
+        sha256: Some(digests.sha256().to_string()),
+        mtime: Some(after.modified()?.into()),
+        entry_identity: Some(file_identity(&after)),
+        media_json,
+        audio_essence_hash,
+    })
+}
+
+fn find_or_insert_root(transaction: &Transaction<'_>, root: Option<&Path>) -> Result<String> {
+    const LEGACY_ROOT: &str = "00000000-0000-0000-0000-000000000000";
+    let Some(root) = root else {
+        return Ok(LEGACY_ROOT.into());
+    };
+    let stored = path_to_storage(root)?;
+    if let Some(id) = transaction
+        .query_row(
+            "SELECT id FROM library_roots WHERE path = ?1",
+            [stored],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        return Ok(id);
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+    let capabilities = RootCapabilities::detect(root)?;
+    capabilities.require_safe_mutation()?;
+    let capabilities_json = serde_json::to_string(&capabilities)?;
+    transaction.execute(
+        "INSERT INTO library_roots
+         (id, path, state, capabilities_json, created_at, updated_at)
+         VALUES (?1, ?2, 'online', ?3, ?4, ?4)",
+        params![id, stored, capabilities_json, now],
+    )?;
+    Ok(id)
+}
+
+fn insert_asset(
+    transaction: &Transaction<'_>,
+    root_id: &str,
+    root: Option<&Path>,
+    asset: &PreparedAsset,
+) -> Result<String> {
+    let absolute_path = path_to_storage(&asset.path)?;
+    if let Some(existing) = transaction
+        .query_row(
+            "SELECT id FROM assets WHERE absolute_path = ?1",
+            [absolute_path],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        return Err(Error::Import(format!(
+            "asset path is already registered as {existing}: {}",
+            asset.path.display()
+        )));
+    }
+    let relative = match root {
+        Some(root) => asset.path.strip_prefix(root).map_err(|_error| {
+            Error::Import(format!(
+                "asset is outside its configured library root: {}",
+                asset.path.display()
+            ))
+        })?,
+        None => asset.path.as_path(),
+    };
+    let relative = path_to_storage(relative)?;
+    let now = Utc::now().to_rfc3339();
+    transaction.execute(
+        "INSERT INTO assets
+         (id, root_id, relative_path, absolute_path, role, managed,
+          verification_state, byte_size, blake3, sha256, audio_essence_hash,
+          mtime, entry_identity, media_json,
+          first_seen_at, last_verified_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
+        params![
+            asset.id,
+            root_id,
+            relative,
+            absolute_path,
+            asset.role,
+            asset.verification_state,
+            asset.byte_size,
+            asset.blake3,
+            asset.sha256,
+            asset.audio_essence_hash,
+            asset.mtime.map(|mtime| mtime.to_rfc3339()),
+            asset.entry_identity,
+            asset.media_json,
+            now,
+        ],
+    )?;
+    Ok(asset.id.clone())
+}
+
+fn find_or_reuse_asset(
+    transaction: &Transaction<'_>,
+    root_id: &str,
+    root: Option<&Path>,
+    asset: &PreparedAsset,
+) -> Result<String> {
+    let absolute_path = path_to_storage(&asset.path)?;
+    let existing = transaction
+        .query_row(
+            "SELECT id, managed, verification_state, byte_size, blake3, sha256
+             FROM assets WHERE absolute_path = ?1",
+            [&absolute_path],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, bool>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<u64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some((id, managed, state, size, blake3, sha256)) = existing {
+        if managed
+            && state == "verified"
+            && size == asset.byte_size
+            && blake3 == asset.blake3
+            && sha256 == asset.sha256
+        {
+            return Ok(id);
+        }
+        return Err(Error::Import(format!(
+            "content-addressed asset path is not a verified identical managed asset: {}",
+            asset.path.display()
+        )));
+    }
+    insert_asset(transaction, root_id, root, asset)
+}
+
+fn store_artwork_metadata(
+    transaction: &Transaction<'_>,
+    asset_id: &str,
+    original_asset_id: &str,
+    release_id: &str,
+    metadata: &ArtworkAssetMetadata,
+) -> Result<()> {
+    let release_group_id = transaction.query_row(
+        "SELECT release_group_id FROM releases WHERE id = ?1",
+        [release_id],
+        |row| row.get::<_, Option<String>>(0),
+    )?;
+    let provenance = metadata.provenance();
+    let (width, height) = metadata.dimensions();
+    let exact_release_id = provenance.exact_release.then_some(release_id);
+    let fallback_group = (!provenance.exact_release)
+        .then_some(release_group_id)
+        .flatten();
+    let transform = (asset_id != original_asset_id).then(|| {
+        serde_json::json!({
+            "kind": "external-cover-projection",
+            "source_asset_id": original_asset_id,
+            "cropped": false,
+            "upscaled": false,
+            "generative": false
+        })
+        .to_string()
+    });
+    transaction.execute(
+        "INSERT INTO artwork_metadata
+         (asset_id, exact_release_id, release_group_id, potentially_inexact,
+          role, source_provider, source_reference, provider_release_id,
+          mime, width, height, approval_state, rights, original_asset_id, transform_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                 'approved', ?12, ?13, ?14)
+         ON CONFLICT(asset_id) DO NOTHING",
+        params![
+            asset_id,
+            exact_release_id,
+            fallback_group,
+            !provenance.exact_release,
+            provenance.role.as_str(),
+            provenance.source_provider,
+            provenance.source_reference,
+            provenance.provider_release_id,
+            metadata.mime(),
+            width,
+            height,
+            provenance.rights,
+            original_asset_id,
+            transform,
+        ],
+    )?;
+    Ok(())
+}
+
+fn update_asset(
+    transaction: &Transaction<'_>,
+    asset_id: &str,
+    root_id: &str,
+    root: Option<&Path>,
+    asset: &PreparedAsset,
+) -> Result<()> {
+    let absolute_path = path_to_storage(&asset.path)?;
+    let relative = match root {
+        Some(root) => asset.path.strip_prefix(root).map_err(|_error| {
+            Error::Import(format!(
+                "asset is outside its configured library root: {}",
+                asset.path.display()
+            ))
+        })?,
+        None => asset.path.as_path(),
+    };
+    let relative = path_to_storage(relative)?;
+    let now = Utc::now().to_rfc3339();
+    let changed = transaction.execute(
+        "UPDATE assets
+         SET root_id = ?1, relative_path = ?2, absolute_path = ?3, role = ?4,
+             managed = 1, verification_state = ?5, byte_size = ?6,
+             blake3 = ?7, sha256 = ?8, audio_essence_hash = ?9,
+             mtime = ?10, entry_identity = ?11, media_json = ?12,
+             projection_state = 'current', last_verified_at = ?13
+         WHERE id = ?14",
+        params![
+            root_id,
+            relative,
+            absolute_path,
+            asset.role,
+            asset.verification_state,
+            asset.byte_size,
+            asset.blake3,
+            asset.sha256,
+            asset.audio_essence_hash,
+            asset.mtime.map(|mtime| mtime.to_rfc3339()),
+            asset.entry_identity,
+            asset.media_json,
+            now,
+            asset_id,
+        ],
+    )?;
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err(Error::Import(format!(
+            "cannot verify missing asset record {asset_id}"
+        )))
     }
 }
 
@@ -1450,10 +3229,12 @@ fn row_to_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
         track_external_id: external_id(
             provider.as_deref(),
             row.get::<_, Option<String>>("external_track_id")?,
+            "recording",
         ),
         release_external_id: external_id(
             provider.as_deref(),
             row.get::<_, Option<String>>("external_release_id")?,
+            "release",
         ),
         added: parse_datetime(&row.get::<_, String>("added")?)?,
         mtime: parse_datetime(&row.get::<_, String>("mtime")?)?,
@@ -1473,16 +3254,17 @@ fn row_to_album(row: &rusqlite::Row<'_>) -> rusqlite::Result<Album> {
             row.get::<_, Option<String>>("metadata_provider")?
                 .as_deref(),
             row.get::<_, Option<String>>("external_release_id")?,
+            "release",
         ),
         added: parse_datetime(&row.get::<_, String>("added")?)?,
         extended: crate::ExtendedMetadata::default(),
     })
 }
 
-fn external_id(provider: Option<&str>, value: Option<String>) -> Option<ExternalId> {
+fn external_id(provider: Option<&str>, value: Option<String>, kind: &str) -> Option<ExternalId> {
     provider.zip(value).map(|(provider, value)| ExternalId {
         provider: provider.to_string(),
-        kind: String::new(),
+        kind: kind.to_owned(),
         value,
     })
 }
@@ -1514,6 +3296,10 @@ fn escape_like(value: &str) -> String {
         .replace('_', "!_")
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "typed recovery keeps every operation/state/file-role branch visible in one exhaustive protocol"
+)]
 fn recover_operation(operation: &PendingOperation) -> Result<()> {
     if operation.state == "recovery-required" {
         return Err(Error::Recovery(
@@ -1522,28 +3308,71 @@ fn recover_operation(operation: &PendingOperation) -> Result<()> {
         ));
     }
     let committed = operation.state == "db-committed" || operation.state == "cleanup-pending";
-    if operation.kind == OperationKind::TagWrite {
-        for file in &operation.files {
-            recover_tag_write(file, committed)?;
-        }
-        return Ok(());
-    }
-    for file in &operation.files {
+    for (ordinal, file) in operation.files.iter().enumerate() {
         match (operation.kind, committed) {
-            (OperationKind::RemoveDelete, false) => restore_quarantined(file)?,
+            (OperationKind::TagWrite, false) if file.role == "tag-rewrite" => {
+                rollback_regular_import(file)?;
+            }
+            (OperationKind::TagWrite, false) if file.role == "tag-original" => {
+                restore_quarantined(file)?;
+            }
+            (OperationKind::TagWrite, true) if file.role == "tag-rewrite" => {
+                remove_if_owned(&file.staged, file)?;
+                verify_owned(&file.destination, file)?;
+            }
+            (OperationKind::TagWrite, true) if file.role == "tag-original" => {
+                if file.staged.exists() || file.staged.is_symlink() {
+                    verify_source_identity(&file.staged, file)?;
+                    verify_owned(&file.staged, file)?;
+                }
+            }
+            (OperationKind::ArtworkWrite, false) if file.role == "artwork-rewrite" => {
+                rollback_regular_import(file)?;
+            }
+            (OperationKind::ArtworkWrite, false) if file.role == "artwork-original" => {
+                restore_quarantined(file)?;
+            }
+            (OperationKind::ArtworkWrite, true) if file.role == "artwork-rewrite" => {
+                remove_if_owned(&file.staged, file)?;
+                verify_owned(&file.destination, file)?;
+            }
+            (OperationKind::ArtworkWrite, true) if file.role == "artwork-original" => {
+                if file.staged.exists() || file.staged.is_symlink() {
+                    verify_source_identity(&file.staged, file)?;
+                    verify_owned(&file.staged, file)?;
+                }
+            }
+            (OperationKind::RemoveDelete | OperationKind::PurgeDelete, false) => {
+                restore_quarantined(file)?;
+            }
             (OperationKind::RemoveDelete, true) => {
                 if file.staged.exists() || file.staged.is_symlink() {
                     verify_source_identity(&file.staged, file)?;
+                    verify_owned(&file.staged, file)?;
                 }
+            }
+            (OperationKind::PurgeDelete, true) => remove_if_owned(&file.staged, file)?,
+            (
+                OperationKind::ManifestWrite
+                | OperationKind::RestoreCopy
+                | OperationKind::AncillaryCopy,
+                true,
+            ) => {
                 remove_if_owned(&file.staged, file)?;
+                verify_owned(&file.destination, file)?;
+            }
+            (
+                OperationKind::ManifestWrite
+                | OperationKind::RestoreCopy
+                | OperationKind::AncillaryCopy,
+                false,
+            ) => rollback_regular_import(file)?,
+            (OperationKind::PathWrite, committed) => {
+                recover_path_projection(file, committed)?;
             }
             (OperationKind::ImportMove, true) if file.role == "track" => {
                 verify_owned(&file.destination, file)?;
-                if file.source.exists() || file.source.is_symlink() {
-                    verify_source_identity(&file.source, file)?;
-                    verify_content_hash(&file.source, file)?;
-                    remove_file_synced(&file.source)?;
-                }
+                cleanup_move_source(&operation.id, ordinal, file)?;
                 remove_if_owned(&file.staged, file)?;
             }
             (OperationKind::ImportCopy | OperationKind::ImportMove, true) => {
@@ -1564,56 +3393,61 @@ fn recover_operation(operation: &PendingOperation) -> Result<()> {
             (OperationKind::ImportLink, false) => {
                 rollback_link_import(file)?;
             }
-            (OperationKind::ImportInPlace | OperationKind::TagWrite, _) => {}
+            (OperationKind::ImportInPlace, _) => {
+                return Err(Error::Recovery(format!(
+                    "in-place import journal unexpectedly contains file role {:?}",
+                    file.role
+                )));
+            }
+            (OperationKind::TagWrite, _) => {
+                return Err(Error::Recovery(format!(
+                    "tag journal has unknown file role {:?}",
+                    file.role
+                )));
+            }
+            (OperationKind::ArtworkWrite, _) => {
+                return Err(Error::Recovery(format!(
+                    "artwork journal has unknown file role {:?}",
+                    file.role
+                )));
+            }
         }
     }
     Ok(())
 }
 
-fn recover_tag_write(file: &JournalFile, committed: bool) -> Result<()> {
-    let original_exists = file.source.exists() || file.source.is_symlink();
-    let backup_exists = file.staged.exists() || file.staged.is_symlink();
-    let rewritten_exists = file.destination.exists() || file.destination.is_symlink();
-    if committed {
-        if !original_exists && rewritten_exists {
-            verify_owned(&file.destination, file)?;
-            std::fs::rename(&file.destination, &file.source)?;
-            if let Some(parent) = file.source.parent() {
-                sync_directory(parent)?;
+fn cleanup_move_source(operation_id: &str, ordinal: usize, file: &JournalFile) -> Result<()> {
+    let quarantine = move_cleanup_path(&file.source, operation_id, ordinal)?;
+    if !quarantine.exists() && !quarantine.is_symlink() {
+        if !file.source.exists() && !file.source.is_symlink() {
+            return Ok(());
+        }
+        rename_sibling_anchored(&file.source, &quarantine)?;
+        if let Err(error) = verify_source_identity(&quarantine, file)
+            .and_then(|()| verify_content_hash(&quarantine, file))
+        {
+            if let Err(restore_error) = rename_sibling_anchored(&quarantine, &file.source) {
+                return Err(Error::Recovery(format!(
+                    "{error}; acquired move source was preserved at {}; safe restore failed: {restore_error}",
+                    quarantine.display()
+                )));
             }
-        } else if rewritten_exists {
-            remove_if_owned(&file.destination, file)?;
+            return Err(error);
         }
-        if backup_exists {
-            verify_source_identity(&file.staged, file)?;
-            remove_file_synced(&file.staged)?;
-        }
-        return Ok(());
     }
+    verify_source_identity(&quarantine, file)?;
+    verify_content_hash(&quarantine, file)?;
+    remove_file_synced(&quarantine)
+}
 
-    if original_exists && backup_exists && same_entry(&file.source, &file.staged)? {
-        verify_source_identity(&file.source, file)?;
-        remove_file_synced(&file.staged)?;
-        if rewritten_exists {
-            remove_if_owned(&file.destination, file)?;
-        }
-        return Ok(());
-    }
-    if original_exists && backup_exists {
-        verify_owned(&file.source, file)?;
-        remove_file_synced(&file.source)?;
-    }
-    if backup_exists {
-        verify_source_identity(&file.staged, file)?;
-        std::fs::rename(&file.staged, &file.source)?;
-        if let Some(parent) = file.source.parent() {
-            sync_directory(parent)?;
-        }
-    }
-    if rewritten_exists {
-        remove_if_owned(&file.destination, file)?;
-    }
-    Ok(())
+fn move_cleanup_path(source: &Path, operation_id: &str, ordinal: usize) -> Result<PathBuf> {
+    let name = source.file_name().ok_or_else(|| {
+        Error::Recovery(format!("move source has no filename: {}", source.display()))
+    })?;
+    let mut quarantine_name = std::ffi::OsString::from(".");
+    quarantine_name.push(name);
+    quarantine_name.push(format!(".rsbts-{operation_id}-{ordinal}.move"));
+    Ok(source.with_file_name(quarantine_name))
 }
 
 fn restore_quarantined(file: &JournalFile) -> Result<()> {
@@ -1632,10 +3466,7 @@ fn restore_quarantined(file: &JournalFile) -> Result<()> {
     }
     verify_source_identity(&file.staged, file)?;
     verify_owned(&file.staged, file)?;
-    std::fs::rename(&file.staged, &file.source)?;
-    if let Some(parent) = file.source.parent() {
-        sync_directory(parent)?;
-    }
+    rename_sibling_anchored(&file.staged, &file.source)?;
     Ok(())
 }
 
@@ -1671,6 +3502,54 @@ fn rollback_link_import(file: &JournalFile) -> Result<()> {
     rollback_import_paths(file, remove_link_if_owned)
 }
 
+fn recover_path_projection(file: &JournalFile, committed: bool) -> Result<()> {
+    if committed {
+        remove_if_owned(&file.staged, file)?;
+        return verify_owned(&file.destination, file);
+    }
+    let source_exists = file.source.exists() || file.source.is_symlink();
+    let staged_exists = file.staged.exists() || file.staged.is_symlink();
+    let destination_exists = file.destination.exists() || file.destination.is_symlink();
+    if source_exists {
+        if staged_exists || destination_exists {
+            return Err(Error::Recovery(format!(
+                "path-projection source is occupied; preserving every candidate for review: {}",
+                file.source.display()
+            )));
+        }
+        return Ok(());
+    }
+    let retained = if staged_exists {
+        &file.staged
+    } else if destination_exists {
+        &file.destination
+    } else {
+        return Err(Error::Recovery(format!(
+            "path projection lost every expected candidate for {}",
+            file.source.display()
+        )));
+    };
+    verify_owned(retained, file)?;
+    let anchor = common_path_ancestor(retained, &file.source)?;
+    AnchoredRoot::open(&anchor)?.rename_noreplace(retained, &file.source)
+}
+
+fn common_path_ancestor(left: &Path, right: &Path) -> Result<PathBuf> {
+    let mut ancestor = left
+        .parent()
+        .ok_or_else(|| Error::Recovery(format!("path has no parent: {}", left.display())))?;
+    while !right.starts_with(ancestor) {
+        ancestor = ancestor.parent().ok_or_else(|| {
+            Error::Recovery(format!(
+                "paths do not share an absolute recovery root: {} and {}",
+                left.display(),
+                right.display()
+            ))
+        })?;
+    }
+    Ok(ancestor.to_path_buf())
+}
+
 fn rollback_import_paths(
     file: &JournalFile,
     remove_owned: fn(&Path, &JournalFile) -> Result<()>,
@@ -1679,6 +3558,9 @@ fn rollback_import_paths(
     let destination_exists = file.destination.exists() || file.destination.is_symlink();
     if file.state == "prepared" {
         return remove_owned(&file.staged, file);
+    }
+    if file.state == "acquired" {
+        return remove_if_entry_owned(&file.staged, file);
     }
     if staged_exists && destination_exists && !same_entry(&file.staged, &file.destination)? {
         // A no-clobber finalization failed because another file won the destination.
@@ -1691,6 +3573,26 @@ fn rollback_import_paths(
         remove_owned(&file.staged, file)?;
     }
     Ok(())
+}
+
+fn remove_if_entry_owned(path: &Path, file: &JournalFile) -> Result<()> {
+    if !path.exists() && !path.is_symlink() {
+        return Ok(());
+    }
+    let expected = file.owned_identity.as_deref().ok_or_else(|| {
+        Error::Recovery(format!(
+            "journal has no acquired identity for {}; preserving it",
+            path.display()
+        ))
+    })?;
+    let metadata = std::fs::symlink_metadata(path)?;
+    if file_object_identity(&metadata) != expected {
+        return Err(Error::Recovery(format!(
+            "acquired journal path was replaced; preserving {}",
+            path.display()
+        )));
+    }
+    remove_file_synced(path)
 }
 
 #[cfg(unix)]
@@ -1754,14 +3656,21 @@ fn verify_content_hash(path: &Path, file: &JournalFile) -> Result<()> {
         ))
     })?;
     let actual = journal_hash_path(path, &file.role)?;
-    if actual == expected {
-        Ok(())
-    } else {
-        Err(Error::Recovery(format!(
+    if actual != expected {
+        return Err(Error::Recovery(format!(
             "refusing to touch changed journal path {}",
             path.display()
-        )))
+        )));
     }
+    if let Some(expected_sha256) = &file.sha256 {
+        if path.is_symlink() || digest_file(path)?.sha256() != expected_sha256 {
+            return Err(Error::Recovery(format!(
+                "refusing to touch journal path with changed SHA-256: {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn verify_source_identity(path: &Path, file: &JournalFile) -> Result<()> {
@@ -1816,34 +3725,48 @@ pub(crate) fn file_identity(metadata: &std::fs::Metadata) -> String {
     )
 }
 
+#[cfg(unix)]
+pub(crate) fn file_object_identity(metadata: &std::fs::Metadata) -> String {
+    use std::os::unix::fs::MetadataExt;
+
+    format!("{}:{}", metadata.dev(), metadata.ino())
+}
+
 #[cfg(not(unix))]
 pub(crate) fn file_identity(metadata: &std::fs::Metadata) -> String {
     format!("{}:{:?}", metadata.len(), metadata.modified().ok())
 }
 
-pub(crate) fn remove_file_synced(path: &Path) -> Result<()> {
-    std::fs::remove_file(path)?;
-    if let Some(parent) = path.parent() {
-        sync_directory(parent)?;
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-#[doc(hidden)]
-pub fn sync_directory(path: &Path) -> Result<()> {
-    match std::fs::File::open(path).and_then(|directory| directory.sync_all()) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => Ok(()),
-        Err(error) => Err(error.into()),
-    }
-}
-
 #[cfg(not(unix))]
-#[allow(clippy::unnecessary_wraps)]
-#[doc(hidden)]
-pub const fn sync_directory(_path: &Path) -> Result<()> {
-    Ok(())
+pub(crate) fn file_object_identity(metadata: &std::fs::Metadata) -> String {
+    format!("{:?}", metadata.created().ok())
+}
+
+pub(crate) fn remove_file_synced(path: &Path) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        Error::Recovery(format!(
+            "filesystem entry has no anchored parent: {}",
+            path.display()
+        ))
+    })?;
+    AnchoredRoot::open(parent)?.remove_file(path)
+}
+
+fn rename_sibling_anchored(source: &Path, destination: &Path) -> Result<()> {
+    let parent = source.parent().ok_or_else(|| {
+        Error::Recovery(format!(
+            "filesystem entry has no anchored parent: {}",
+            source.display()
+        ))
+    })?;
+    if destination.parent() != Some(parent) {
+        return Err(Error::Recovery(format!(
+            "safe recovery rename must remain in one directory: {} -> {}",
+            source.display(),
+            destination.display()
+        )));
+    }
+    AnchoredRoot::open(parent)?.rename_noreplace(source, destination)
 }
 
 #[cfg(unix)]
@@ -1913,6 +3836,30 @@ mod tests {
     }
 
     #[test]
+    fn current_schema_dry_run_uses_a_read_only_connection_without_copying() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let database = temporary.path().join("library.db");
+        drop(Library::open(&database)?);
+
+        let snapshot = Library::open_snapshot(&database)?;
+        assert_eq!(snapshot.path(), Some(database.as_path()));
+        assert!(snapshot
+            .create_operation(OperationKind::ImportCopy, &[])
+            .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_second_library_writer_is_rejected_before_database_work() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let database = temporary.path().join("library.db");
+        let first = Library::open(&database)?;
+        assert!(Library::open(&database).is_err());
+        assert!(first.query_items(&Query::all())?.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn audit_preserves_and_reports_missing_files() -> Result<()> {
         let mut library = Library::open_in_memory()?;
         let operation = library.create_operation(OperationKind::ImportCopy, &[])?;
@@ -1960,28 +3907,76 @@ mod tests {
     }
 
     #[test]
-    fn audit_reports_foreign_key_corruption_that_normal_open_allows() -> Result<()> {
+    fn quick_and_deep_audit_detect_external_asset_changes() -> Result<()> {
         let temporary = tempfile::tempdir()?;
-        let database_path = temporary.path().join("library.db");
-        drop(Library::open(&database_path)?);
+        let path = temporary.path().join("track.flac");
+        std::fs::write(&path, b"original audio")?;
+        let mut library = Library::open_in_memory()?;
+        let operation = library.create_operation(OperationKind::ImportCopy, &[])?;
+        let album = Album {
+            id: None,
+            album: "Album".into(),
+            albumartist: "Artist".into(),
+            year: None,
+            artpath: None,
+            external_id: None,
+            added: Utc::now(),
+            extended: crate::ExtendedMetadata::default(),
+        };
+        let item = Item {
+            id: None,
+            album_id: None,
+            path: path.clone(),
+            title: "Track".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            albumartist: None,
+            genre: None,
+            year: None,
+            track: Some(1),
+            disc: Some(1),
+            format: AudioFormat::Flac,
+            bitrate: 1,
+            length: 1.0,
+            file_size: Some(14),
+            track_external_id: None,
+            release_external_id: None,
+            added: Utc::now(),
+            mtime: Utc::now(),
+            singleton: false,
+            extended: crate::ExtendedMetadata::default(),
+        };
+        library.commit_import(&operation, Some(&album), &[item])?;
+        library.complete_operation(&operation)?;
 
-        let connection = Connection::open(&database_path)?;
-        connection.pragma_update(None, "foreign_keys", "OFF")?;
-        connection.execute(
-            "INSERT INTO items
-             (album_id, path, title, artist, album, format, bitrate, length, added, mtime)
-             VALUES (999, '/missing.flac', 'Track', 'Artist', 'Album', 'FLAC', 1, 1,
-                     '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
-            [],
+        std::fs::write(&path, b"changed")?;
+        let quick = library.audit_with_mode(AuditMode::Quick)?;
+        assert!(quick.issues.iter().any(|issue| matches!(
+            issue,
+            AuditIssue::AssetSizeMismatch { path: changed, .. } if changed == &path
+        )));
+
+        assert!(matches!(
+            library.audit_with_mode(AuditMode::Deep),
+            Err(Error::Operation(detail))
+                if detail.contains("durable, paged fixity workflow")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn completed_operations_remain_as_durable_history() -> Result<()> {
+        let library = Library::open_in_memory()?;
+        let operation = library.create_operation(OperationKind::ImportCopy, &[])?;
+        library.complete_operation(&operation)?;
+        let (state, completed_at): (String, Option<String>) = library.conn.query_row(
+            "SELECT state, completed_at FROM operation_journal WHERE id = ?1",
+            [&operation],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        drop(connection);
-
-        let library = Library::open(&database_path)?;
-        let report = library.audit()?;
-        assert!(report
-            .issues
-            .iter()
-            .any(|issue| matches!(issue, AuditIssue::ForeignKeyViolations { count: 1 })));
+        assert_eq!(state, "complete");
+        assert!(completed_at.is_some());
+        assert!(library.pending_operations()?.is_empty());
         Ok(())
     }
 
@@ -2089,6 +4084,87 @@ mod tests {
     }
 
     #[test]
+    fn cached_statistics_follow_insert_update_and_delete() -> Result<()> {
+        let library = Library::open_in_memory()?;
+        library.conn.execute(
+            "INSERT INTO albums (album, albumartist, added)
+             VALUES ('First', 'Artist A', '2026-01-01T00:00:00Z'),
+                    ('Second', 'Artist B', '2026-01-01T00:00:00Z')",
+            [],
+        )?;
+        let first_album: i64 =
+            library
+                .conn
+                .query_row("SELECT id FROM albums WHERE album = 'First'", [], |row| {
+                    row.get(0)
+                })?;
+        let second_album: i64 =
+            library
+                .conn
+                .query_row("SELECT id FROM albums WHERE album = 'Second'", [], |row| {
+                    row.get(0)
+                })?;
+        library.conn.execute(
+            "INSERT INTO items
+             (album_id, path, title, artist, album, format, bitrate, length,
+              added, mtime, file_size)
+             VALUES (?1, '/one.wav', 'One', 'Artist A', 'First', 'WAV', 0, 2.0,
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', NULL),
+                    (?1, '/two.wav', 'Two', 'Artist B', 'First', 'WAV', 0, 3.0,
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 4)",
+            [first_album],
+        )?;
+        let stats = library.stats()?;
+        assert_eq!(
+            (
+                stats.tracks,
+                stats.albums,
+                stats.artists,
+                stats.total_length,
+                stats.total_size,
+                stats.unknown_sizes
+            ),
+            (2, 1, 2, 5.0, 4, 1)
+        );
+
+        library.conn.execute(
+            "UPDATE items SET album_id = ?1, artist = 'Artist B',
+                    length = 7.0, file_size = 8
+             WHERE title = 'One'",
+            [second_album],
+        )?;
+        let stats = library.stats()?;
+        assert_eq!(
+            (
+                stats.tracks,
+                stats.albums,
+                stats.artists,
+                stats.total_length,
+                stats.total_size,
+                stats.unknown_sizes
+            ),
+            (2, 2, 1, 10.0, 12, 0)
+        );
+
+        library
+            .conn
+            .execute("DELETE FROM items WHERE title = 'Two'", [])?;
+        let stats = library.stats()?;
+        assert_eq!(
+            (
+                stats.tracks,
+                stats.albums,
+                stats.artists,
+                stats.total_length,
+                stats.total_size,
+                stats.unknown_sizes
+            ),
+            (1, 1, 1, 7.0, 8, 0)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn album_substrings_treat_like_metacharacters_literally() -> Result<()> {
         let library = Library::open_in_memory()?;
         library.conn.execute(
@@ -2126,6 +4202,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn rollback_preserves_a_destination_that_lost_the_race() -> Result<()> {
         let temporary = tempfile::tempdir()?;
@@ -2144,6 +4221,7 @@ mod tests {
                 staged: staged.clone(),
                 destination: destination.clone(),
                 content_hash: Some(hash),
+                sha256: None,
                 source_identity: None,
                 owned_identity: Some(file_identity(&std::fs::metadata(&staged)?)),
                 role: "track".into(),
@@ -2159,6 +4237,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn rollback_removes_a_hard_link_finalized_by_rsbts() -> Result<()> {
         let temporary = tempfile::tempdir()?;
@@ -2177,6 +4256,7 @@ mod tests {
                 staged: staged.clone(),
                 destination: destination.clone(),
                 content_hash: Some(hash),
+                sha256: None,
                 source_identity: None,
                 owned_identity: Some(file_identity(&std::fs::metadata(&staged)?)),
                 role: "track".into(),
@@ -2192,7 +4272,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn rollback_removes_a_finalized_import_link_owned_by_rsbts() -> Result<()> {
         let temporary = tempfile::tempdir()?;
@@ -2211,6 +4291,7 @@ mod tests {
                 staged: staged.clone(),
                 destination: destination.clone(),
                 content_hash: Some(hash_path(&staged)?),
+                sha256: None,
                 source_identity: None,
                 owned_identity: Some(owned_identity),
                 role: "track".into(),
@@ -2248,6 +4329,7 @@ mod tests {
                 staged: staged.clone(),
                 destination: destination.clone(),
                 content_hash: Some(hash),
+                sha256: None,
                 source_identity: None,
                 owned_identity: Some(owned_identity),
                 role: "track".into(),
@@ -2284,6 +4366,7 @@ mod tests {
                 staged,
                 destination: destination.clone(),
                 content_hash: Some(hash),
+                sha256: None,
                 source_identity: Some(file_identity(&std::fs::metadata(&source)?)),
                 owned_identity: Some(file_identity(&std::fs::metadata(&destination)?)),
                 role: "track".into(),
@@ -2313,6 +4396,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn committed_move_recovery_removes_the_original_source() -> Result<()> {
         let temporary = tempfile::tempdir()?;
@@ -2331,6 +4415,7 @@ mod tests {
                 staged,
                 destination: destination.clone(),
                 content_hash: Some(hash),
+                sha256: None,
                 source_identity: Some(identity),
                 owned_identity: Some(file_identity(&std::fs::metadata(&destination)?)),
                 role: "track".into(),
@@ -2347,6 +4432,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn uncommitted_removal_recovery_restores_a_regular_file() -> Result<()> {
         let temporary = tempfile::tempdir()?;
@@ -2363,6 +4449,7 @@ mod tests {
                 staged: staged.clone(),
                 destination: source.clone(),
                 content_hash: Some(hash),
+                sha256: None,
                 source_identity: Some(identity.clone()),
                 owned_identity: Some(identity),
                 role: "track".into(),
@@ -2381,7 +4468,7 @@ mod tests {
     }
 
     #[test]
-    fn committed_removal_recovery_deletes_the_quarantine() -> Result<()> {
+    fn committed_removal_recovery_retains_the_quarantine() -> Result<()> {
         let temporary = tempfile::tempdir()?;
         let source = temporary.path().join("source");
         let staged = temporary.path().join("staged");
@@ -2396,6 +4483,7 @@ mod tests {
                 staged: staged.clone(),
                 destination: PathBuf::new(),
                 content_hash: Some(hash),
+                sha256: None,
                 source_identity: Some(identity.clone()),
                 owned_identity: Some(identity),
                 role: "track".into(),
@@ -2408,7 +4496,7 @@ mod tests {
         let report = library.recover_pending()?;
 
         assert_eq!(report.recovered_operations, [operation]);
-        assert!(!staged.exists());
+        assert_eq!(std::fs::read(staged)?, b"audio");
         Ok(())
     }
 
@@ -2519,7 +4607,7 @@ mod tests {
         assert!(path_to_storage(path).is_err());
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn removal_recovery_restores_a_dangling_symlink() -> Result<()> {
         let temporary = tempfile::tempdir()?;
@@ -2537,6 +4625,7 @@ mod tests {
                 staged: staged.clone(),
                 destination: source.clone(),
                 content_hash: Some(hash),
+                sha256: None,
                 source_identity: Some(identity.clone()),
                 owned_identity: Some(identity),
                 role: "symlink".into(),
@@ -2554,6 +4643,93 @@ mod tests {
         assert!(source.is_symlink());
         assert_eq!(std::fs::read_link(&source)?, missing_target);
         assert!(!staged.is_symlink());
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn move_cleanup_never_treats_a_dangling_quarantine_as_absent() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir()?;
+        let source = temporary.path().join("source.flac");
+        let operation = uuid::Uuid::new_v4().to_string();
+        let quarantine = move_cleanup_path(&source, &operation, 0)?;
+        symlink(temporary.path().join("missing-target"), &quarantine)?;
+        let file = JournalFile {
+            source,
+            staged: PathBuf::new(),
+            destination: temporary.path().join("destination.flac"),
+            content_hash: Some("unreachable".into()),
+            sha256: None,
+            source_identity: Some("unreachable".into()),
+            owned_identity: None,
+            role: "track".into(),
+            state: "finalized".into(),
+        };
+
+        assert!(cleanup_move_source(&operation, 0, &file).is_err());
+        assert!(quarantine.is_symlink());
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn move_cleanup_never_treats_a_dangling_source_as_missing() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir()?;
+        let source = temporary.path().join("source.flac");
+        symlink(temporary.path().join("missing-target"), &source)?;
+        let operation = uuid::Uuid::new_v4().to_string();
+        let file = JournalFile {
+            source: source.clone(),
+            staged: PathBuf::new(),
+            destination: temporary.path().join("destination.flac"),
+            content_hash: Some("unreachable".into()),
+            sha256: None,
+            source_identity: Some("unreachable".into()),
+            owned_identity: None,
+            role: "track".into(),
+            state: "finalized".into(),
+        };
+
+        assert!(cleanup_move_source(&operation, 0, &file).is_err());
+        assert!(source.is_symlink());
+        assert!(!move_cleanup_path(&source, &operation, 0)?.is_symlink());
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn quarantine_restore_rejects_a_dangling_newcomer_before_rename() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir()?;
+        let source = temporary.path().join("source.flac");
+        let staged = temporary.path().join("quarantine.flac");
+        std::fs::write(&staged, b"owned bytes")?;
+        symlink(temporary.path().join("missing-target"), &source)?;
+        let metadata = std::fs::metadata(&staged)?;
+        let digests = digest_file(&staged)?;
+        let file = JournalFile {
+            source: source.clone(),
+            staged: staged.clone(),
+            destination: source.clone(),
+            content_hash: Some(digests.blake3().into()),
+            sha256: Some(digests.sha256().into()),
+            source_identity: Some(file_identity(&metadata)),
+            owned_identity: Some(file_identity(&metadata)),
+            role: "track".into(),
+            state: "quarantined".into(),
+        };
+
+        assert!(matches!(
+            restore_quarantined(&file),
+            Err(Error::Recovery(detail)) if detail.contains("destination already exists")
+        ));
+        assert!(source.is_symlink());
+        assert_eq!(std::fs::read(staged)?, b"owned bytes");
         Ok(())
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "rsbts"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.89"
 description = "A safe music library manager with provider-neutral metadata matching"
@@ -9,6 +9,7 @@ repository = "https://github.com/sxndmxn/rsbts"
 documentation = "https://docs.rs/rsbts"
 keywords = ["music", "library", "musicbrainz", "cli"]
 categories = ["command-line-utilities", "multimedia::audio"]
+exclude = ["benchmarks/", "fuzz/"]
 
 [dependencies]
 async-trait = "0.1"
@@ -18,7 +19,9 @@ clap = { version = "4", features = ["derive"] }
 dialoguer = { version = "0.12", default-features = false }
 dirs = "5"
 indicatif = "0.18"
+image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 lofty = "0.24"
+moxcms = "0.8"
 num-traits = "0.2"
 pathfinding = "4"
 reqwest = "0.12"
@@ -27,19 +30,24 @@ regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+sha2 = "0.10"
 strsim = "0.11"
+symphonia = { version = "0.5", features = ["all"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 toml = "0.8"
 unicode-normalization = "0.1"
+unicode-casefold = "0.2"
+unicode-segmentation = "1"
 urlencoding = "2"
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1.1", features = ["fs"] }
 
 [dev-dependencies]
+proptest = "1.7"
 tempfile = "3"
 
 [lints.rust]

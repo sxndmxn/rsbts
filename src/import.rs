@@ -2,14 +2,12 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 #[cfg(not(unix))]
 use std::fs::OpenOptions;
-#[cfg(unix)]
-use std::io::{Seek, SeekFrom};
 
 use chrono::Utc;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -19,15 +17,20 @@ use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
 
-#[cfg(not(unix))]
-use crate::db::sync_directory;
-use crate::db::{
-    file_identity, hash_path, remove_file_synced, JournalFile, Library, OperationKind,
+use crate::artwork::{
+    original_path, validate_artwork, ArtworkAssetMetadata, ArtworkProvenance, ArtworkRole,
 };
+use crate::asset::{digest_file, digest_reader};
+use crate::db::{
+    file_identity, file_object_identity, hash_path, JournalFile, Library, OperationKind,
+};
+use crate::fsops::AnchoredRoot;
 use crate::pathformat::format_relative_path;
 use crate::provider::{
-    MetadataProvider, ProviderTrack, ReleaseCandidate, ReleaseQuery, TrackCandidate, TrackQuery,
+    MetadataProvider, ProviderEntityId, ProviderEntityKind, ProviderTrack, ReleaseCandidate,
+    ReleaseQuery, SearchPage, TrackCandidate, TrackQuery,
 };
+use crate::roots::RootCapabilities;
 use crate::tags::{is_audio_file, read_tags};
 use crate::{
     validate_album_metadata, validate_item_metadata, Album, Error, ExternalId, Item, Result,
@@ -45,6 +48,7 @@ const MAX_MATCH_TRACKS: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum Action {
     #[default]
     Copy,
@@ -66,59 +70,76 @@ pub struct ImportOptions {
     pub runner_up_margin: f64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanIssue {
     pub path: PathBuf,
     pub message: String,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ImportPlan {
     pub albums: Vec<AlbumPlan>,
     pub scan_issues: Vec<ScanIssue>,
     pub provider_warnings: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlbumPlan {
     pub source_artist: String,
     pub source_album: String,
     pub items: Vec<Item>,
     pub candidates: Vec<ScoredCandidate>,
+    pub candidate_set_complete: bool,
     pub lookup_error: Option<String>,
     pub singleton: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScoredCandidate {
     pub release: ReleaseCandidate,
     pub confidence: ConfidenceBreakdown,
     pub track_matches: Vec<TrackMatch>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfidenceBreakdown {
     pub artist: f64,
     pub album: f64,
     pub mean_track: f64,
     pub provider: f64,
     pub composite: f64,
-    pub runner_up_margin: f64,
+    /// Confidence that the files represent the candidate recordings.
+    pub recording_identity: f64,
+    /// Confidence that the album belongs to the candidate release group.
+    pub release_group_identity: f64,
+    /// Confidence in the exact edition, based only on edition-specific evidence.
+    pub exact_release_identity: f64,
+    pub runner_up_margin: Option<f64>,
+    pub candidate_set_complete: bool,
     pub high_confidence: bool,
     pub gate_failures: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the booleans are independent, serialized matching-gate evidence rather than mutually exclusive state"
+)]
 pub struct TrackMatch {
     pub item_index: usize,
     pub track_index: usize,
     pub title_similarity: f64,
     pub duration_delta_seconds: Option<f64>,
     pub number_and_disc_match: bool,
+    pub medium_match: bool,
+    pub printed_position_match: bool,
+    pub special_track_compatible: bool,
+    pub pregap_compatible: bool,
     pub score: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ApprovalChoice {
     Candidate(usize),
     AsIs,
@@ -130,6 +151,7 @@ pub struct SourceFingerprint {
     pub size: u64,
     pub modified: SystemTime,
     pub content_hash: String,
+    pub sha256: String,
     pub identity: String,
 }
 
@@ -145,8 +167,11 @@ pub struct PlannedTrack {
 #[derive(Debug, Clone)]
 pub struct PlannedArtwork {
     pub destination: PathBuf,
+    pub original: ArtworkAssetMetadata,
+    pub original_already_present: bool,
     pub bytes: Vec<u8>,
     pub content_hash: String,
+    pub sha256: String,
 }
 
 #[derive(Debug, Clone)]
@@ -159,7 +184,7 @@ pub struct ApprovedAlbumPlan {
     pub warnings: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ImportReport {
     pub imported_tracks: usize,
     pub already_managed_tracks: usize,
@@ -189,6 +214,10 @@ impl<'a> ImportPlanner<'a> {
 
     /// Scan paths and query the metadata provider without mutating the library.
     #[allow(clippy::future_not_send)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "planning keeps singleton and release candidate completeness decisions together"
+    )]
     pub async fn plan(&self, paths: &[PathBuf]) -> ImportPlan {
         let progress = ConsoleProgress::new();
         let (items, scan_issues) = scan_paths(paths, self.options.follow_symlinks, &progress);
@@ -219,6 +248,7 @@ impl<'a> ImportPlanner<'a> {
                             self.options.runner_up_margin,
                         ),
                         items: group.items,
+                        candidate_set_complete: false,
                         lookup_error: None,
                         singleton: true,
                     }),
@@ -227,6 +257,7 @@ impl<'a> ImportPlanner<'a> {
                         source_album: group.album,
                         items: group.items,
                         candidates: Vec::new(),
+                        candidate_set_complete: false,
                         lookup_error: Some(error.to_string()),
                         singleton: true,
                     }),
@@ -238,29 +269,53 @@ impl<'a> ImportPlanner<'a> {
                 album: group.album.clone(),
                 track_count: group.items.len(),
             };
-            match self
-                .provider
-                .search_releases(&query, self.options.search_limit)
-                .await
-            {
-                Ok(releases) => albums.push(AlbumPlan {
-                    source_artist: group.artist,
-                    source_album: group.album,
-                    candidates: score_candidates(
-                        &group.items,
-                        releases,
-                        self.options.auto_accept_threshold,
-                        self.options.runner_up_margin,
-                    ),
-                    items: group.items,
-                    lookup_error: None,
-                    singleton: false,
-                }),
+            let direct_id = common_release_id(&group.items);
+            let lookup = if let Some(id) = direct_id {
+                match ProviderEntityId::new(id.provider(), ProviderEntityKind::Release, id.value())
+                {
+                    Ok(id) => self
+                        .provider
+                        .lookup_release(&id)
+                        .await
+                        .map(|candidate| SearchPage::complete(vec![candidate])),
+                    Err(error) => Err(error),
+                }
+            } else {
+                self.provider
+                    .search_releases(&query, self.options.search_limit)
+                    .await
+            };
+            match lookup {
+                Ok(page) => {
+                    let lookup_error = (!page.errors.is_empty()).then(|| {
+                        page.errors
+                            .iter()
+                            .map(|error| error.detail.as_str())
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    });
+                    albums.push(AlbumPlan {
+                        source_artist: group.artist,
+                        source_album: group.album,
+                        candidates: score_candidates(
+                            &group.items,
+                            page.candidates,
+                            page.complete,
+                            self.options.auto_accept_threshold,
+                            self.options.runner_up_margin,
+                        ),
+                        items: group.items,
+                        candidate_set_complete: page.complete,
+                        lookup_error,
+                        singleton: false,
+                    });
+                }
                 Err(error) => albums.push(AlbumPlan {
                     source_artist: group.artist,
                     source_album: group.album,
                     items: group.items,
                     candidates: Vec::new(),
+                    candidate_set_complete: false,
                     lookup_error: Some(error.to_string()),
                     singleton: false,
                 }),
@@ -332,7 +387,8 @@ impl<'a> ImportPlanner<'a> {
             };
             reject_duplicate_destination(&mut destinations, &source, &destination)?;
 
-            let content_hash = hash_path(&source)?;
+            let digests = digest_file(&source)?;
+            let content_hash = digests.blake3().to_string();
             let managed = self.library.item_exists(&destination)?;
             let destination_exists = destination.exists() || destination.is_symlink();
             let already_managed =
@@ -359,6 +415,7 @@ impl<'a> ImportPlanner<'a> {
                     size: metadata.len(),
                     modified: metadata.modified()?,
                     content_hash,
+                    sha256: digests.sha256().to_string(),
                     identity: file_identity(&metadata),
                 },
                 item,
@@ -392,32 +449,73 @@ impl<'a> ImportPlanner<'a> {
         };
         match self
             .provider
-            .fetch_cover_art_for(&candidate.release.provider, &candidate.release.external_id)
+            .fetch_artwork(&candidate.release.external_id)
             .await
         {
-            Ok(Some(bytes)) => {
-                let Some(extension) = artwork_extension(&bytes) else {
-                    warnings.push("cover art has an unsupported or invalid image format".into());
+            Ok(candidates) => {
+                let Some(candidate_artwork) = candidates
+                    .into_iter()
+                    .find(|artwork| artwork.role() == &ArtworkRole::Front)
+                else {
                     return Ok(None);
                 };
+                let bytes = candidate_artwork.bytes().to_vec();
+                let validated = match validate_artwork(&bytes) {
+                    Ok(validated) => validated,
+                    Err(error) => {
+                        warnings.push(format!(
+                            "cover art failed bounded decode validation: {error}"
+                        ));
+                        return Ok(None);
+                    }
+                };
+                let extension = validated.extension();
+                let original_destination = original_path(&self.options.library_dir, &validated);
+                let original_already_present =
+                    original_destination.exists() || original_destination.is_symlink();
+                if original_already_present {
+                    let existing = digest_file(&original_destination)?;
+                    if existing.sha256() != validated.sha256() {
+                        return Err(Error::Import(format!(
+                            "content-addressed artwork path contains different bytes: {}",
+                            original_destination.display()
+                        )));
+                    }
+                }
                 let destination = artwork_parent.join(format!("cover.{extension}"));
                 validate_destination(&self.options.library_dir, &destination)?;
-                if let Some(album) = album {
-                    album.artpath = Some(destination.clone());
-                }
                 if destination.exists() || destination.is_symlink() {
                     warnings.push("existing cover art will not be overwritten".into());
                     Ok(None)
                 } else {
+                    if let Some(album) = album {
+                        album.artpath = Some(destination.clone());
+                    }
                     let content_hash = blake3::hash(&bytes).to_hex().to_string();
+                    let provenance = ArtworkProvenance {
+                        role: candidate_artwork.role().clone(),
+                        source_provider: Some(self.provider.name().into()),
+                        source_reference: Some(candidate_artwork.source_reference().into()),
+                        provider_release_id: candidate_artwork
+                            .provider_release_id()
+                            .map(str::to_owned),
+                        exact_release: candidate_artwork.exact_release(),
+                        rights: candidate_artwork.rights().map(str::to_owned),
+                    };
                     Ok(Some(PlannedArtwork {
                         destination,
+                        original: ArtworkAssetMetadata::from_validated(
+                            original_destination,
+                            &validated,
+                            provenance,
+                        ),
+                        original_already_present,
                         bytes,
                         content_hash,
+                        sha256: validated.sha256().to_owned(),
                     }))
                 }
             }
-            Ok(None) => Ok(None),
             Err(error) => {
                 warnings.push(format!("cover art lookup failed: {error}"));
                 Ok(None)
@@ -436,6 +534,7 @@ impl<'a> ImportExecutor<'a> {
     }
 
     /// Execute one approved album atomically with respect to the database.
+    #[allow(clippy::too_many_lines)]
     pub fn execute(&mut self, mut plan: ApprovedAlbumPlan) -> Result<ImportReport> {
         self.validate_plan_shape(&plan)?;
         let active_tracks = plan
@@ -455,16 +554,22 @@ impl<'a> ImportExecutor<'a> {
         if plan.action == Action::InPlace {
             return self.execute_in_place(&plan, &active_tracks, already_managed_tracks);
         }
+        RootCapabilities::detect(&plan.library_dir)?.require_safe_mutation()?;
 
         let transfer_id = uuid::Uuid::new_v4();
-        let mut journal_files =
-            Vec::with_capacity(active_tracks.len() + usize::from(plan.artwork.is_some()));
+        let mut journal_files = Vec::with_capacity(
+            active_tracks.len()
+                + plan.artwork.as_ref().map_or(0, |artwork| {
+                    1 + usize::from(!artwork.original_already_present)
+                }),
+        );
         for track in &active_tracks {
             journal_files.push(JournalFile {
                 source: track.source.clone(),
                 staged: staging_path(&track.destination, transfer_id, "stage")?,
                 destination: track.destination.clone(),
                 content_hash: Some(track.fingerprint.content_hash.clone()),
+                sha256: Some(track.fingerprint.sha256.clone()),
                 source_identity: Some(track.fingerprint.identity.clone()),
                 owned_identity: None,
                 role: "track".into(),
@@ -472,14 +577,28 @@ impl<'a> ImportExecutor<'a> {
             });
         }
         if let Some(artwork) = &plan.artwork {
+            if !artwork.original_already_present {
+                journal_files.push(JournalFile {
+                    source: PathBuf::new(),
+                    staged: staging_path(artwork.original.path(), transfer_id, "art-original")?,
+                    destination: artwork.original.path().to_path_buf(),
+                    content_hash: Some(artwork.content_hash.clone()),
+                    sha256: Some(artwork.sha256.clone()),
+                    source_identity: None,
+                    owned_identity: None,
+                    role: "artwork-original".into(),
+                    state: "prepared".into(),
+                });
+            }
             journal_files.push(JournalFile {
                 source: PathBuf::new(),
                 staged: staging_path(&artwork.destination, transfer_id, "art")?,
                 destination: artwork.destination.clone(),
                 content_hash: Some(artwork.content_hash.clone()),
+                sha256: Some(artwork.sha256.clone()),
                 source_identity: None,
                 owned_identity: None,
-                role: "artwork".into(),
+                role: "artwork-projection".into(),
                 state: "prepared".into(),
             });
         }
@@ -491,8 +610,12 @@ impl<'a> ImportExecutor<'a> {
             Action::InPlace => OperationKind::ImportInPlace,
         };
         let operation_id = self.library.create_operation(kind, &journal_files)?;
+        let root = match AnchoredRoot::open_or_create(&plan.library_dir) {
+            Ok(root) => root,
+            Err(error) => return Err(self.rollback_failed(&operation_id, error)),
+        };
         if let Err(error) =
-            self.stage_and_finalize(&operation_id, &plan, &active_tracks, &journal_files)
+            self.stage_and_finalize(&root, &operation_id, &plan, &active_tracks, &journal_files)
         {
             return Err(self.rollback_failed(&operation_id, error));
         }
@@ -501,30 +624,23 @@ impl<'a> ImportExecutor<'a> {
             .iter()
             .map(|track| track.item.clone())
             .collect::<Vec<_>>();
-        if let Err(error) = self
-            .library
-            .commit_import(&operation_id, plan.album.as_ref(), &items)
-        {
+        if let Err(error) = self.library.commit_import_at_root_with_artwork(
+            &operation_id,
+            plan.album.as_ref(),
+            &items,
+            Some(&plan.library_dir),
+            plan.artwork.as_ref().map(|artwork| &artwork.original),
+        ) {
             return Err(self.rollback_failed(&operation_id, error));
         }
 
-        let mut cleanup_recovered = false;
+        let cleanup_recovered = false;
         if plan.action == Action::Move {
             self.library
                 .set_operation_state(&operation_id, "cleanup-pending", None)?;
-            if let Err(error) = remove_move_sources(&active_tracks) {
-                self.library.set_operation_state(
-                    &operation_id,
-                    "cleanup-pending",
-                    Some(&error.to_string()),
-                )?;
-                let recovery = self.library.recover_pending()?;
-                if !recovery.unresolved.is_empty() {
-                    return Err(Error::Recovery(recovery.unresolved.join("; ")));
-                }
-                cleanup_recovered = true;
-            } else {
-                self.library.complete_operation(&operation_id)?;
+            let recovery = self.library.recover_pending()?;
+            if !recovery.unresolved.is_empty() {
+                return Err(Error::Recovery(recovery.unresolved.join("; ")));
             }
         } else {
             self.library.complete_operation(&operation_id)?;
@@ -622,6 +738,7 @@ impl<'a> ImportExecutor<'a> {
         }
         if let Some(artwork) = &plan.artwork {
             validate_destination(&plan.library_dir, &artwork.destination)?;
+            validate_destination(&plan.library_dir, artwork.original.path())?;
             if destinations.contains(&artwork.destination) {
                 return Err(Error::Import(format!(
                     "artwork collides with a track destination: {}",
@@ -635,69 +752,114 @@ impl<'a> ImportExecutor<'a> {
                     "approved artwork content does not match its plan".into(),
                 ));
             }
+            if artwork.original_already_present {
+                let existing = digest_file(artwork.original.path())?;
+                if existing.blake3() != artwork.content_hash {
+                    return Err(Error::Import(
+                        "content-addressed original changed after planning".into(),
+                    ));
+                }
+            }
         }
         Ok(())
     }
 
     fn stage_and_finalize(
         &self,
+        root: &AnchoredRoot,
         operation_id: &str,
         plan: &ApprovedAlbumPlan,
         tracks: &[&PlannedTrack],
         files: &[JournalFile],
     ) -> Result<()> {
-        let destination_root = DestinationRoot::open(&plan.library_dir)?;
-        let mut prepared = Vec::with_capacity(files.len());
         self.library
             .set_operation_state(operation_id, "staging", None)?;
         for (ordinal, track) in tracks.iter().enumerate() {
             validate_source(track)?;
             validate_destination(&plan.library_dir, &track.destination)?;
-            let destination =
-                destination_root.resolve(&files[ordinal].staged, &track.destination)?;
-            destination.ensure_destination_absent()?;
-            let staged_identity = match plan.action {
+            root.create_parent_all(&track.destination)?;
+            match plan.action {
                 Action::Copy | Action::Move => {
-                    destination.stage_regular(&track.source, &track.fingerprint.content_hash)?
+                    root.copy_new_observed(&track.source, &files[ordinal].staged, |metadata| {
+                        self.library.set_acquired_file_identity(
+                            operation_id,
+                            ordinal,
+                            &file_object_identity(metadata),
+                        )
+                    })?;
+                    verify_anchored_digests(
+                        root,
+                        &files[ordinal].staged,
+                        &track.fingerprint.content_hash,
+                        &track.fingerprint.sha256,
+                    )?;
                 }
                 Action::Link => {
-                    destination.stage_link(&track.source, &track.fingerprint.content_hash)?
+                    root.symlink_new_observed(&track.source, &files[ordinal].staged, |metadata| {
+                        self.library.set_acquired_file_identity(
+                            operation_id,
+                            ordinal,
+                            &file_object_identity(metadata),
+                        )
+                    })?;
+                    if root.read_link(&files[ordinal].staged)? != track.source {
+                        return Err(Error::Import(format!(
+                            "staged symlink validation failed: {}",
+                            files[ordinal].staged.display()
+                        )));
+                    }
                 }
                 Action::InPlace => {
                     return Err(Error::Import(
-                        "in-place imports do not stage filesystem operations".into(),
+                        "in-place imports do not have a file-staging phase".into(),
                     ));
                 }
-            };
+            }
+            let staged_identity = file_identity(&root.entry_metadata(&files[ordinal].staged)?);
             self.library
                 .set_staged_file_identity(operation_id, ordinal, &staged_identity)?;
-            prepared.push(PreparedDestination {
-                destination,
-                identity: staged_identity,
-            });
         }
 
         if let Some(artwork) = &plan.artwork {
-            let ordinal = tracks.len();
-            validate_destination(&plan.library_dir, &artwork.destination)?;
-            let destination =
-                destination_root.resolve(&files[ordinal].staged, &artwork.destination)?;
-            destination.ensure_destination_absent()?;
-            let staged_identity = destination.stage_bytes(&artwork.bytes, &artwork.content_hash)?;
-            self.library
-                .set_staged_file_identity(operation_id, ordinal, &staged_identity)?;
-            prepared.push(PreparedDestination {
-                destination,
-                identity: staged_identity,
-            });
+            for (ordinal, file) in files.iter().enumerate().skip(tracks.len()) {
+                validate_destination(&plan.library_dir, &file.destination)?;
+                root.create_parent_all(&file.destination)?;
+                root.write_new_observed(&file.staged, &artwork.bytes, |metadata| {
+                    self.library.set_acquired_file_identity(
+                        operation_id,
+                        ordinal,
+                        &file_object_identity(metadata),
+                    )
+                })?;
+                verify_anchored_digests(
+                    root,
+                    &file.staged,
+                    &artwork.content_hash,
+                    &artwork.sha256,
+                )?;
+                validate_artwork(&read_anchored(root, &file.staged)?)?;
+                let staged_identity = file_identity(&root.entry_metadata(&file.staged)?);
+                self.library
+                    .set_staged_file_identity(operation_id, ordinal, &staged_identity)?;
+            }
         }
 
         self.library
             .set_operation_state(operation_id, "finalizing", None)?;
-        for (ordinal, destination) in prepared.iter().enumerate() {
-            destination.destination.finalize(&destination.identity)?;
+        for (ordinal, track) in tracks.iter().enumerate() {
+            validate_destination(&plan.library_dir, &track.destination)?;
+            root.rename_noreplace(&files[ordinal].staged, &track.destination)?;
             self.library
                 .set_file_state(operation_id, ordinal, "finalized")?;
+        }
+        if plan.artwork.is_some() {
+            for (ordinal, file) in files.iter().enumerate().skip(tracks.len()) {
+                validate_destination(&plan.library_dir, &file.destination)?;
+                root.rename_noreplace(&file.staged, &file.destination)?;
+                validate_artwork(&read_anchored(root, &file.destination)?)?;
+                self.library
+                    .set_file_state(operation_id, ordinal, "finalized")?;
+            }
         }
         Ok(())
     }
@@ -705,7 +867,7 @@ impl<'a> ImportExecutor<'a> {
     fn rollback_failed(&mut self, operation_id: &str, error: Error) -> Error {
         let _ = self
             .library
-            .set_operation_state(operation_id, "failed", Some(&error.to_string()));
+            .record_operation_failure(operation_id, &error.to_string());
         match self.library.recover_pending() {
             Ok(report) if report.unresolved.is_empty() => error,
             Ok(report) => Error::Recovery(format!(
@@ -869,7 +1031,7 @@ fn scan_paths<P: ScanProgress>(
     for path in paths {
         for entry in WalkDir::new(path).follow_links(follow_symlinks) {
             match entry {
-                Ok(entry) if entry.file_type().is_file() && is_audio_file(entry.path()) => {
+                Ok(entry) if entry.file_type().is_file() => {
                     match std::fs::canonicalize(entry.path()) {
                         Ok(canonical) if canonical.to_str().is_none() => {
                             issues.push(ScanIssue {
@@ -878,7 +1040,11 @@ fn scan_paths<P: ScanProgress>(
                                     .into(),
                             });
                         }
-                        Ok(canonical) if seen.insert(canonical.clone()) => files.push(canonical),
+                        Ok(canonical)
+                            if is_audio_file(&canonical) && seen.insert(canonical.clone()) =>
+                        {
+                            files.push(canonical);
+                        }
                         Ok(_) => {}
                         Err(error) => issues.push(ScanIssue {
                             path: entry.path().to_path_buf(),
@@ -1021,12 +1187,18 @@ fn score_track_candidates(
                 provider_score: provider,
                 tracks: vec![ProviderTrack {
                     external_id: track.external_id,
+                    release_track_external_id: None,
                     title: track.title,
                     artist: track.artist,
                     number: item.track,
+                    printed_position: item.track.map(|value| value.to_string()),
                     disc: item.disc,
                     length_ms: track.length_ms,
+                    is_hidden: false,
+                    is_data_track: false,
+                    pregap_ms: None,
                 }],
+                edition: crate::provider::EditionEvidence::default(),
             };
             ScoredCandidate {
                 release,
@@ -1036,7 +1208,11 @@ fn score_track_candidates(
                     mean_track: title,
                     provider,
                     composite,
-                    runner_up_margin: 0.0,
+                    recording_identity: title,
+                    release_group_identity: 0.0,
+                    exact_release_identity: 0.0,
+                    runner_up_margin: None,
+                    candidate_set_complete: false,
                     high_confidence: false,
                     gate_failures: failures,
                 },
@@ -1046,6 +1222,10 @@ fn score_track_candidates(
                     title_similarity: title,
                     duration_delta_seconds,
                     number_and_disc_match: true,
+                    medium_match: true,
+                    printed_position_match: true,
+                    special_track_compatible: true,
+                    pregap_compatible: true,
                     score: title,
                 }],
             }
@@ -1073,13 +1253,18 @@ fn apply_singleton_confidence_gates(
     threshold: f64,
     required_margin: f64,
 ) {
-    best.confidence.runner_up_margin = best.confidence.composite - runner_up;
+    best.confidence.runner_up_margin = Some(best.confidence.composite - runner_up);
     let thresholds_valid =
         (0.0..=1.0).contains(&threshold) && (0.0..=1.0).contains(&required_margin);
     if !thresholds_valid {
         best.confidence
             .gate_failures
             .push("matching thresholds are invalid".into());
+    }
+    if !best.confidence.candidate_set_complete {
+        best.confidence
+            .gate_failures
+            .push("provider candidate set is incomplete".into());
     }
     if thresholds_valid && best.confidence.composite < threshold {
         best.confidence.gate_failures.push(format!(
@@ -1088,10 +1273,15 @@ fn apply_singleton_confidence_gates(
             threshold * 100.0
         ));
     }
-    if thresholds_valid && best.confidence.runner_up_margin < required_margin {
+    if thresholds_valid
+        && best
+            .confidence
+            .runner_up_margin
+            .is_none_or(|margin| margin < required_margin)
+    {
         best.confidence.gate_failures.push(format!(
             "runner-up margin {:.1}% is below {:.1}%",
-            best.confidence.runner_up_margin * 100.0,
+            best.confidence.runner_up_margin.unwrap_or_default() * 100.0,
             required_margin * 100.0
         ));
     }
@@ -1101,6 +1291,7 @@ fn apply_singleton_confidence_gates(
 fn score_candidates(
     items: &[Item],
     releases: Vec<ReleaseCandidate>,
+    candidate_set_complete: bool,
     threshold: f64,
     required_margin: f64,
 ) -> Vec<ScoredCandidate> {
@@ -1137,6 +1328,7 @@ fn score_candidates(
                     mean_track.mul_add(TRACK_WEIGHT, provider * PROVIDER_WEIGHT),
                 ),
             );
+            let exact_release_identity = exact_release_confidence(&release);
             ScoredCandidate {
                 release,
                 confidence: ConfidenceBreakdown {
@@ -1145,7 +1337,12 @@ fn score_candidates(
                     mean_track,
                     provider,
                     composite,
-                    runner_up_margin: 0.0,
+                    recording_identity: mean_track,
+                    release_group_identity: artist
+                        .mul_add(0.35, album.mul_add(0.35, mean_track * 0.30)),
+                    exact_release_identity,
+                    runner_up_margin: None,
+                    candidate_set_complete,
                     high_confidence: false,
                     gate_failures: Vec::new(),
                 },
@@ -1163,9 +1360,10 @@ fn score_candidates(
 
     let runner_up = candidates
         .get(1)
-        .map_or(0.0, |candidate| candidate.confidence.composite);
+        .map(|candidate| candidate.confidence.composite);
     if let Some(best) = candidates.first_mut() {
-        best.confidence.runner_up_margin = best.confidence.composite - runner_up;
+        best.confidence.runner_up_margin =
+            runner_up.map(|runner_up| best.confidence.composite - runner_up);
         best.confidence.gate_failures =
             confidence_gate_failures(items, best, threshold, required_margin);
         best.confidence.high_confidence = best.confidence.gate_failures.is_empty();
@@ -1182,6 +1380,9 @@ fn confidence_gate_failures(
     let mut failures = Vec::new();
     if !(0.0..=1.0).contains(&threshold) || !(0.0..=1.0).contains(&required_margin) {
         failures.push("matching thresholds are invalid".into());
+    }
+    if !candidate.confidence.candidate_set_complete {
+        failures.push("provider candidate set is incomplete".into());
     }
     if items.iter().any(|item| {
         is_placeholder(item.effective_albumartist())
@@ -1222,6 +1423,30 @@ fn confidence_gate_failures(
                 matched.item_index + 1
             ));
         }
+        if !matched.medium_match {
+            failures.push(format!(
+                "track {} crosses a candidate medium boundary",
+                matched.item_index + 1
+            ));
+        }
+        if !matched.printed_position_match {
+            failures.push(format!(
+                "track {} printed position contradicts its numeric position",
+                matched.item_index + 1
+            ));
+        }
+        if !matched.special_track_compatible {
+            failures.push(format!(
+                "track {} cannot substantiate candidate hidden/data-track state",
+                matched.item_index + 1
+            ));
+        }
+        if !matched.pregap_compatible {
+            failures.push(format!(
+                "track {} cannot substantiate candidate pregap evidence",
+                matched.item_index + 1
+            ));
+        }
     }
     if candidate.track_matches.len() != items.len() {
         failures.push("not every source track could be assigned".into());
@@ -1233,14 +1458,69 @@ fn confidence_gate_failures(
             threshold * 100.0
         ));
     }
-    if candidate.confidence.runner_up_margin < required_margin {
-        failures.push(format!(
+    let direct_release_identity = common_release_id(items).is_some_and(|id| {
+        id.kind() == "release"
+            && id.provider() == candidate.release.provider
+            && id.value() == candidate.release.external_id
+            && candidate.release.edition.explicit_id
+    });
+    match candidate.confidence.runner_up_margin {
+        Some(margin) if margin + 1e-12 < required_margin => failures.push(format!(
             "runner-up margin {:.1} points is below {:.1}",
-            candidate.confidence.runner_up_margin * 100.0,
+            margin * 100.0,
             required_margin * 100.0
-        ));
+        )),
+        None if !direct_release_identity => failures
+            .push("runner-up margin is unknown because fewer than two candidates resolved".into()),
+        _ => {}
     }
     failures
+}
+
+fn common_release_id(items: &[Item]) -> Option<&ExternalId> {
+    let first = items.first()?.release_external_id.as_ref()?;
+    if !items.iter().all(|item| {
+        item.release_external_id.as_ref().is_some_and(|id| {
+            id.provider == first.provider && id.kind == first.kind && id.value == first.value
+        })
+    }) {
+        return None;
+    }
+    Some(first)
+}
+
+fn exact_release_confidence(release: &ReleaseCandidate) -> f64 {
+    let evidence = &release.edition;
+    if evidence.explicit_id {
+        return 1.0;
+    }
+    let mut score: f64 = 0.0;
+    if evidence.barcode.is_some() {
+        score += 0.35;
+    }
+    if !evidence.labels_and_catalog_numbers.is_empty() {
+        score += 0.35;
+    }
+    if !evidence.disc_ids.is_empty() {
+        score += 0.6;
+    }
+    if evidence.country.is_some() {
+        score += 0.1;
+    }
+    if !evidence.media_formats.is_empty() {
+        score += 0.1;
+    }
+    score.min(1.0)
+}
+
+/// Assign source items to provider release tracks using the same bounded
+/// structural matcher used by import planning.
+///
+/// Malformed, empty, or pathologically large inputs abstain with an empty
+/// assignment rather than allocating an unbounded cost matrix.
+#[must_use]
+pub fn assign_release_tracks(items: &[Item], tracks: &[ProviderTrack]) -> Vec<TrackMatch> {
+    match_tracks(items, tracks)
 }
 
 // `Item::track` intentionally maps to provider `number`; their field names differ by contract.
@@ -1274,23 +1554,56 @@ fn match_tracks(items: &[Item], tracks: &[ProviderTrack]) -> Vec<TrackMatch> {
                     (1.0 - (delta - DURATION_GATE_SECONDS) / 12.0).clamp(0.0, 1.0)
                 }
             });
-            let score = if duration_delta_seconds.is_some() {
-                title_similarity.mul_add(0.7, duration_score * 0.3)
-            } else {
-                title_similarity
-            };
             let number_and_disc_match = item.track.is_some()
                 && provider_track.number.is_some()
                 && (item.track == provider_track.number)
                 && (item.disc.unwrap_or(1) == provider_track.disc.unwrap_or(1));
-            costs[item_index][track_index] =
-                (-(score * 100_000.0)).round().to_i64().unwrap_or(-100_000);
+            let medium_match = item.disc.unwrap_or(1) == provider_track.disc.unwrap_or(1);
+            let printed_position_match =
+                provider_track
+                    .printed_position
+                    .as_ref()
+                    .is_none_or(|printed| {
+                        item.track
+                            .is_some_and(|number| printed == &number.to_string())
+                    });
+            let special_track_compatible =
+                !provider_track.is_hidden && !provider_track.is_data_track;
+            let pregap_compatible = provider_track.pregap_ms.unwrap_or(0) == 0;
+            let structural_score = [
+                number_and_disc_match,
+                medium_match,
+                printed_position_match,
+                special_track_compatible,
+                pregap_compatible,
+            ]
+            .into_iter()
+            .map(u8::from)
+            .map(f64::from)
+            .sum::<f64>()
+                / 5.0;
+            let score = if duration_delta_seconds.is_some() {
+                title_similarity
+                    .mul_add(0.55, duration_score.mul_add(0.25, structural_score * 0.20))
+            } else {
+                title_similarity.mul_add(0.75, structural_score * 0.25)
+            };
+            let score = if special_track_compatible && medium_match {
+                score
+            } else {
+                score * 0.25
+            };
+            costs[item_index][track_index] = (-(score * 100_000.0)).round() as i64;
             scores[item_index][track_index] = Some(TrackMatch {
                 item_index,
                 track_index,
                 title_similarity,
                 duration_delta_seconds,
                 number_and_disc_match,
+                medium_match,
+                printed_position_match,
+                special_track_compatible,
+                pregap_compatible,
                 score,
             });
         }
@@ -1339,14 +1652,26 @@ fn apply_release_metadata(items: &mut [Item], candidate: &ScoredCandidate) {
         item.artist.clone_from(&track.artist);
         item.track = track.number;
         item.disc = track.disc;
-        let track_id = ExternalId {
-            provider: candidate.release.provider.clone(),
-            kind: "recording".into(),
-            value: track.external_id.clone(),
-        };
-        item.track_external_id = Some(track_id.clone());
-        if !item.extended.external_ids.contains(&track_id) {
-            item.extended.external_ids.push(track_id);
+        if !track.external_id.is_empty() {
+            let recording_id = ExternalId {
+                provider: candidate.release.provider.clone(),
+                kind: "recording".into(),
+                value: track.external_id.clone(),
+            };
+            item.track_external_id = Some(recording_id.clone());
+            if !item.extended.external_ids.contains(&recording_id) {
+                item.extended.external_ids.push(recording_id);
+            }
+        }
+        if let Some(value) = &track.release_track_external_id {
+            let release_track_id = ExternalId {
+                provider: candidate.release.provider.clone(),
+                kind: "release-track".into(),
+                value: value.clone(),
+            };
+            if !item.extended.external_ids.contains(&release_track_id) {
+                item.extended.external_ids.push(release_track_id);
+            }
         }
     }
 }
@@ -1423,18 +1748,6 @@ fn validate_destination(root: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn validate_destination_for_execution(destination: &Path) -> Result<()> {
-    if destination.exists() || destination.is_symlink() {
-        Err(Error::Import(format!(
-            "destination appeared after planning: {}",
-            destination.display()
-        )))
-    } else {
-        Ok(())
-    }
-}
-
 fn common_track_parent(tracks: &[PlannedTrack]) -> Option<PathBuf> {
     let mut common = tracks.first()?.destination.parent()?.to_path_buf();
     for track in tracks.iter().skip(1) {
@@ -1450,17 +1763,9 @@ fn common_track_parent(tracks: &[PlannedTrack]) -> Option<PathBuf> {
 }
 
 fn artwork_extension(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
-        Some("jpg")
-    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        Some("png")
-    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
-        Some("webp")
-    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        Some("gif")
-    } else {
-        None
-    }
+    validate_artwork(bytes)
+        .ok()
+        .map(|artwork| artwork.extension())
 }
 
 fn staging_path(destination: &Path, operation: uuid::Uuid, suffix: &str) -> Result<PathBuf> {
@@ -1486,13 +1791,14 @@ fn append_extension(path: &Path, extension: &std::ffi::OsStr) -> PathBuf {
 
 fn validate_source(track: &PlannedTrack) -> Result<()> {
     let before = std::fs::metadata(&track.source)?;
-    let content_hash = hash_path(&track.source)?;
+    let digests = digest_file(&track.source)?;
     let after = std::fs::metadata(&track.source)?;
     if before.len() != track.fingerprint.size
         || before.modified()? != track.fingerprint.modified
         || file_identity(&before) != track.fingerprint.identity
         || file_identity(&after) != track.fingerprint.identity
-        || content_hash != track.fingerprint.content_hash
+        || digests.blake3() != track.fingerprint.content_hash
+        || digests.sha256() != track.fingerprint.sha256
     {
         return Err(Error::Import(format!(
             "source changed after planning: {}",
@@ -1512,562 +1818,40 @@ pub(crate) fn stage_relocation(
 ) -> Result<()> {
     validate_source(track)?;
     validate_destination(library_dir, &track.destination)?;
-    let root = DestinationRoot::open(library_dir)?;
-    let destination = root.resolve(&journal_file.staged, &track.destination)?;
-    destination.ensure_destination_absent()?;
+    let root = AnchoredRoot::open_or_create(library_dir)?;
+    root.create_parent_all(&journal_file.staged)?;
     library.set_operation_state(operation_id, "staging", None)?;
-    let identity = destination.stage_regular(&track.source, &track.fingerprint.content_hash)?;
-    library.set_staged_file_identity(operation_id, 0, &identity)?;
+    root.copy_new_observed(&track.source, &journal_file.staged, |metadata| {
+        library.set_acquired_file_identity(operation_id, 0, &file_object_identity(metadata))
+    })?;
+    verify_anchored_digests(
+        &root,
+        &journal_file.staged,
+        &track.fingerprint.content_hash,
+        &track.fingerprint.sha256,
+    )?;
+    let identity = file_identity(&root.entry_metadata(&journal_file.staged)?);
+    library.set_staged_file_full_evidence(
+        operation_id,
+        0,
+        &identity,
+        &track.fingerprint.content_hash,
+        &track.fingerprint.sha256,
+    )?;
     library.set_operation_state(operation_id, "finalizing", None)?;
-    destination.finalize(&identity)?;
+    root.rename_noreplace(&journal_file.staged, &track.destination)?;
     library.set_file_state(operation_id, 0, "finalized")?;
     Ok(())
 }
 
-struct PreparedDestination<'a> {
-    destination: DestinationFile<'a>,
-    identity: String,
-}
-
-#[cfg(unix)]
-struct DestinationRoot {
-    path: PathBuf,
-    directory: rustix::fd::OwnedFd,
-    identity: String,
-}
-
-#[cfg(unix)]
-struct DestinationFile<'a> {
-    root: &'a DestinationRoot,
-    directory: rustix::fd::OwnedFd,
-    relative_parent: PathBuf,
-    parent_identity: String,
-    staged_name: std::ffi::OsString,
-    destination_name: std::ffi::OsString,
-    staged_path: PathBuf,
-    destination_path: PathBuf,
-}
-
-#[cfg(unix)]
-impl DestinationRoot {
-    fn open(path: &Path) -> Result<Self> {
-        let directory = open_root(path, true)?;
-        let identity = directory_identity(&directory)?;
-        let root = Self {
-            path: path.to_path_buf(),
-            directory,
-            identity,
-        };
-        root.ensure_current()?;
-        Ok(root)
-    }
-
-    fn resolve<'a>(&'a self, staged: &Path, destination: &Path) -> Result<DestinationFile<'a>> {
-        self.ensure_current()?;
-        let destination_relative = destination.strip_prefix(&self.path).map_err(|error| {
-            Error::Import(format!(
-                "destination escapes the library directory: {}: {error}",
-                destination.display()
-            ))
-        })?;
-        let staged_relative = staged.strip_prefix(&self.path).map_err(|error| {
-            Error::Import(format!(
-                "staging path escapes the library directory: {}: {error}",
-                staged.display()
-            ))
-        })?;
-        let destination_parent = destination_relative.parent().ok_or_else(|| {
-            Error::Import(format!(
-                "destination has no parent: {}",
-                destination.display()
-            ))
-        })?;
-        if staged_relative.parent() != Some(destination_parent) {
-            return Err(Error::Import(format!(
-                "staging path does not share the destination parent: {}",
-                staged.display()
-            )));
-        }
-        let destination_name = normal_filename(destination_relative, "destination")?;
-        let staged_name = normal_filename(staged_relative, "staging")?;
-        let directory = self.open_relative_directory(destination_parent, true)?;
-        let parent_identity = directory_identity(&directory)?;
-        Ok(DestinationFile {
-            root: self,
-            directory,
-            relative_parent: destination_parent.to_path_buf(),
-            parent_identity,
-            staged_name,
-            destination_name,
-            staged_path: staged.to_path_buf(),
-            destination_path: destination.to_path_buf(),
-        })
-    }
-
-    fn ensure_current(&self) -> Result<()> {
-        let current = open_root(&self.path, false)?;
-        if directory_identity(&current)? == self.identity {
-            Ok(())
-        } else {
-            Err(Error::Import(format!(
-                "library directory changed during execution: {}",
-                self.path.display()
-            )))
-        }
-    }
-
-    fn open_relative_directory(
-        &self,
-        relative: &Path,
-        create_missing: bool,
-    ) -> Result<rustix::fd::OwnedFd> {
-        let mut directory =
-            rustix::io::dup(&self.directory).map_err(|error| Error::Io(error.into()))?;
-        let mut display_path = self.path.clone();
-        for component in relative.components() {
-            let std::path::Component::Normal(name) = component else {
-                return Err(Error::Import(format!(
-                    "destination contains an unsafe path component: {}",
-                    relative.display()
-                )));
-            };
-            display_path.push(name);
-            let flags = rustix::fs::OFlags::RDONLY
-                | rustix::fs::OFlags::DIRECTORY
-                | rustix::fs::OFlags::NOFOLLOW
-                | rustix::fs::OFlags::CLOEXEC;
-            let opened =
-                match rustix::fs::openat(&directory, name, flags, rustix::fs::Mode::empty()) {
-                    Ok(opened) => opened,
-                    Err(rustix::io::Errno::NOENT) if create_missing => {
-                        match rustix::fs::mkdirat(&directory, name, rustix::fs::Mode::from(0o777)) {
-                            Ok(()) => {
-                                rustix::fs::fsync(&directory)
-                                    .map_err(|error| Error::Io(error.into()))?;
-                            }
-                            Err(rustix::io::Errno::EXIST) => {}
-                            Err(error) => {
-                                return Err(destination_error(
-                                    "cannot create destination directory",
-                                    &display_path,
-                                    error,
-                                ));
-                            }
-                        }
-                        rustix::fs::openat(&directory, name, flags, rustix::fs::Mode::empty())
-                            .map_err(|error| {
-                                destination_error(
-                                    "cannot open newly created destination directory",
-                                    &display_path,
-                                    error,
-                                )
-                            })?
-                    }
-                    Err(error) => {
-                        return Err(destination_error(
-                            "destination parent is not a stable, real directory",
-                            &display_path,
-                            error,
-                        ));
-                    }
-                };
-            directory = opened;
-        }
-        Ok(directory)
-    }
-}
-
-#[cfg(unix)]
-impl DestinationFile<'_> {
-    fn ensure_destination_absent(&self) -> Result<()> {
-        self.ensure_parent_current()?;
-        self.ensure_absent(&self.destination_name, &self.destination_path)
-    }
-
-    fn stage_regular(&self, source: &Path, expected_hash: &str) -> Result<String> {
-        self.ensure_parent_current()?;
-        self.ensure_absent(&self.destination_name, &self.destination_path)?;
-        let descriptor = rustix::fs::openat(
-            &self.directory,
-            &self.staged_name,
-            rustix::fs::OFlags::RDWR
-                | rustix::fs::OFlags::CREATE
-                | rustix::fs::OFlags::EXCL
-                | rustix::fs::OFlags::NOFOLLOW
-                | rustix::fs::OFlags::CLOEXEC,
-            rustix::fs::Mode::from(0o644),
-        )
-        .map_err(|error| {
-            destination_error("cannot create staging file", &self.staged_path, error)
-        })?;
-        let mut output = std::fs::File::from(descriptor);
-        let result = (|| {
-            let mut input = std::fs::File::open(source)?;
-            std::io::copy(&mut input, &mut output)?;
-            output.sync_all()?;
-            verify_open_file_hash(&mut output, expected_hash, &self.staged_path)?;
-            self.ensure_parent_current()
-        })();
-        let identity = file_identity(&output.metadata()?);
-        if let Err(error) = result {
-            return Err(self.cleanup_created(
-                &self.staged_name,
-                &self.staged_path,
-                &identity,
-                error,
-            ));
-        }
-        Ok(identity)
-    }
-
-    fn stage_bytes(&self, bytes: &[u8], expected_hash: &str) -> Result<String> {
-        self.ensure_parent_current()?;
-        self.ensure_absent(&self.destination_name, &self.destination_path)?;
-        let descriptor = rustix::fs::openat(
-            &self.directory,
-            &self.staged_name,
-            rustix::fs::OFlags::RDWR
-                | rustix::fs::OFlags::CREATE
-                | rustix::fs::OFlags::EXCL
-                | rustix::fs::OFlags::NOFOLLOW
-                | rustix::fs::OFlags::CLOEXEC,
-            rustix::fs::Mode::from(0o644),
-        )
-        .map_err(|error| {
-            destination_error("cannot create staging file", &self.staged_path, error)
-        })?;
-        let mut output = std::fs::File::from(descriptor);
-        let result = (|| {
-            output.write_all(bytes)?;
-            output.sync_all()?;
-            verify_open_file_hash(&mut output, expected_hash, &self.staged_path)?;
-            self.ensure_parent_current()
-        })();
-        let identity = file_identity(&output.metadata()?);
-        if let Err(error) = result {
-            return Err(self.cleanup_created(
-                &self.staged_name,
-                &self.staged_path,
-                &identity,
-                error,
-            ));
-        }
-        Ok(identity)
-    }
-
-    fn stage_link(&self, source: &Path, expected_hash: &str) -> Result<String> {
-        use std::os::unix::ffi::OsStrExt;
-
-        self.ensure_parent_current()?;
-        self.ensure_absent(&self.destination_name, &self.destination_path)?;
-        rustix::fs::symlinkat(source, &self.directory, &self.staged_name).map_err(|error| {
-            destination_error("cannot create staging link", &self.staged_path, error)
-        })?;
-        let identity = match self.entry_identity(&self.staged_name, &self.staged_path) {
-            Ok(Some(identity)) => identity,
-            Ok(None) => {
-                return Err(Error::Recovery(format!(
-                    "new staging link disappeared before it could be journaled: {}",
-                    self.staged_path.display()
-                )));
-            }
-            Err(error) => return Err(error),
-        };
-        let result = (|| {
-            let target = rustix::fs::readlinkat(&self.directory, &self.staged_name, Vec::new())
-                .map_err(|error| {
-                    destination_error("cannot inspect staging link", &self.staged_path, error)
-                })?;
-            if target.to_bytes() != source.as_os_str().as_bytes() {
-                return Err(Error::Import(format!(
-                    "staging link target changed during creation: {}",
-                    self.staged_path.display()
-                )));
-            }
-            verify_hash(source, expected_hash)?;
-            self.ensure_parent_current()
-        })();
-        if let Err(error) = result {
-            return Err(self.cleanup_created(
-                &self.staged_name,
-                &self.staged_path,
-                &identity,
-                error,
-            ));
-        }
-        Ok(identity)
-    }
-
-    fn finalize(&self, expected_identity: &str) -> Result<()> {
-        self.ensure_parent_current()?;
-        self.ensure_owned(&self.staged_name, &self.staged_path, expected_identity)?;
-        self.ensure_absent(&self.destination_name, &self.destination_path)?;
-        rustix::fs::linkat(
-            &self.directory,
-            &self.staged_name,
-            &self.directory,
-            &self.destination_name,
-            rustix::fs::AtFlags::empty(),
-        )
-        .map_err(|error| {
-            destination_error(
-                "cannot finalize staging file without overwriting",
-                &self.destination_path,
-                error,
-            )
-        })?;
-        let result = (|| {
-            self.ensure_owned(
-                &self.destination_name,
-                &self.destination_path,
-                expected_identity,
-            )?;
-            rustix::fs::unlinkat(
-                &self.directory,
-                &self.staged_name,
-                rustix::fs::AtFlags::empty(),
-            )
-            .map_err(|error| {
-                destination_error(
-                    "cannot remove finalized staging name",
-                    &self.staged_path,
-                    error,
-                )
-            })?;
-            rustix::fs::fsync(&self.directory).map_err(|error| Error::Io(error.into()))?;
-            self.ensure_parent_current()
-        })();
-        if let Err(error) = result {
-            return Err(self.cleanup_created(
-                &self.destination_name,
-                &self.destination_path,
-                expected_identity,
-                error,
-            ));
-        }
-        Ok(())
-    }
-
-    fn ensure_parent_current(&self) -> Result<()> {
-        self.root.ensure_current()?;
-        let current = self
-            .root
-            .open_relative_directory(&self.relative_parent, false)?;
-        if directory_identity(&current)? == self.parent_identity {
-            Ok(())
-        } else {
-            Err(Error::Import(format!(
-                "destination parent changed during execution: {}",
-                self.destination_path
-                    .parent()
-                    .map_or_else(String::new, |path| path.display().to_string())
-            )))
-        }
-    }
-
-    fn ensure_absent(&self, name: &std::ffi::OsStr, path: &Path) -> Result<()> {
-        match self.entry_identity(name, path)? {
-            None => Ok(()),
-            Some(_) => Err(Error::Import(format!(
-                "destination appeared after planning: {}",
-                path.display()
-            ))),
-        }
-    }
-
-    fn ensure_owned(&self, name: &std::ffi::OsStr, path: &Path, identity: &str) -> Result<()> {
-        match self.entry_identity(name, path)? {
-            Some(actual) if actual == identity => Ok(()),
-            Some(_) => Err(Error::Recovery(format!(
-                "refusing to touch a replaced destination entry: {}",
-                path.display()
-            ))),
-            None => Err(Error::Recovery(format!(
-                "owned destination entry disappeared: {}",
-                path.display()
-            ))),
-        }
-    }
-
-    fn entry_identity(&self, name: &std::ffi::OsStr, path: &Path) -> Result<Option<String>> {
-        match rustix::fs::statat(&self.directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(stat) => Ok(Some(stat_identity(&stat))),
-            Err(rustix::io::Errno::NOENT) => Ok(None),
-            Err(error) => Err(destination_error(
-                "cannot inspect destination entry",
-                path,
-                error,
-            )),
-        }
-    }
-
-    fn cleanup_created(
-        &self,
-        name: &std::ffi::OsStr,
-        path: &Path,
-        identity: &str,
-        original: Error,
-    ) -> Error {
-        match self.entry_identity(name, path) {
-            Ok(None) => original,
-            Ok(Some(actual)) if actual != identity => Error::Recovery(format!(
-                "{original}; preserving replaced destination entry {}",
-                path.display()
-            )),
-            Ok(Some(_)) => {
-                match rustix::fs::unlinkat(&self.directory, name, rustix::fs::AtFlags::empty()) {
-                    Ok(()) => {
-                        if let Err(sync_error) = rustix::fs::fsync(&self.directory) {
-                            Error::Recovery(format!(
-                            "{original}; removed failed destination but could not sync its directory: {}",
-                            std::io::Error::from(sync_error)
-                        ))
-                        } else {
-                            original
-                        }
-                    }
-                    Err(cleanup_error) => Error::Recovery(format!(
-                        "{original}; could not remove owned failed destination {}: {}",
-                        path.display(),
-                        std::io::Error::from(cleanup_error)
-                    )),
-                }
-            }
-            Err(cleanup_error) => Error::Recovery(format!(
-                "{original}; could not verify owned failed destination {}: {cleanup_error}",
-                path.display()
-            )),
-        }
-    }
-}
-
-#[cfg(unix)]
-fn open_directory(path: &Path) -> std::result::Result<rustix::fd::OwnedFd, rustix::io::Errno> {
-    rustix::fs::open(
-        path,
-        rustix::fs::OFlags::RDONLY
-            | rustix::fs::OFlags::DIRECTORY
-            | rustix::fs::OFlags::NOFOLLOW
-            | rustix::fs::OFlags::CLOEXEC,
-        rustix::fs::Mode::empty(),
-    )
-}
-
-#[cfg(unix)]
-fn open_root(path: &Path, create_missing: bool) -> Result<rustix::fd::OwnedFd> {
-    if !path.is_absolute() {
-        return Err(Error::Import(format!(
-            "library directory must be absolute: {}",
-            path.display()
-        )));
-    }
-
-    let mut directory = open_directory(Path::new("/"))
-        .map_err(|error| destination_error("cannot open filesystem root", Path::new("/"), error))?;
-    let mut display_path = PathBuf::from("/");
-    for component in path.components() {
-        let name = match component {
-            std::path::Component::RootDir => continue,
-            std::path::Component::Normal(name) => name,
-            _ => {
-                return Err(Error::Import(format!(
-                    "library directory contains an unsafe path component: {}",
-                    path.display()
-                )));
-            }
-        };
-        display_path.push(name);
-        let flags = rustix::fs::OFlags::RDONLY
-            | rustix::fs::OFlags::DIRECTORY
-            | rustix::fs::OFlags::NOFOLLOW
-            | rustix::fs::OFlags::CLOEXEC;
-        let opened = match rustix::fs::openat(&directory, name, flags, rustix::fs::Mode::empty()) {
-            Ok(opened) => opened,
-            Err(rustix::io::Errno::NOENT) if create_missing => {
-                match rustix::fs::mkdirat(&directory, name, rustix::fs::Mode::from(0o777)) {
-                    Ok(()) => {
-                        rustix::fs::fsync(&directory).map_err(|error| Error::Io(error.into()))?;
-                    }
-                    Err(rustix::io::Errno::EXIST) => {}
-                    Err(error) => {
-                        return Err(destination_error(
-                            "cannot create library directory",
-                            &display_path,
-                            error,
-                        ));
-                    }
-                }
-                rustix::fs::openat(&directory, name, flags, rustix::fs::Mode::empty()).map_err(
-                    |error| {
-                        destination_error(
-                            "new library directory is not a stable, real directory",
-                            &display_path,
-                            error,
-                        )
-                    },
-                )?
-            }
-            Err(error) => {
-                return Err(destination_error(
-                    "library directory path is not a stable, real directory",
-                    &display_path,
-                    error,
-                ));
-            }
-        };
-        directory = opened;
-    }
-    Ok(directory)
-}
-
-#[cfg(unix)]
-fn directory_identity(directory: &rustix::fd::OwnedFd) -> Result<String> {
-    let stat = rustix::fs::fstat(directory).map_err(|error| Error::Io(error.into()))?;
-    Ok(format!("{}:{}", stat.st_dev, stat.st_ino))
-}
-
-#[cfg(unix)]
-fn stat_identity(stat: &rustix::fs::Stat) -> String {
-    format!(
-        "{}:{}:{}:{}:{}",
-        stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime, stat.st_mtime_nsec
-    )
-}
-
-#[cfg(unix)]
-fn normal_filename(path: &Path, role: &str) -> Result<std::ffi::OsString> {
-    let mut components = path.components();
-    let Some(std::path::Component::Normal(name)) = components.next_back() else {
-        return Err(Error::Import(format!(
-            "{role} path has no safe filename: {}",
-            path.display()
-        )));
-    };
-    if components.any(|component| !matches!(component, std::path::Component::Normal(_))) {
-        return Err(Error::Import(format!(
-            "{role} path contains an unsafe component: {}",
-            path.display()
-        )));
-    }
-    Ok(name.to_os_string())
-}
-
-#[cfg(unix)]
-fn destination_error(action: &str, path: &Path, error: rustix::io::Errno) -> Error {
-    Error::Import(format!(
-        "{action} {}: {}",
-        path.display(),
-        std::io::Error::from(error)
-    ))
-}
-
-#[cfg(unix)]
-fn verify_open_file_hash(file: &mut std::fs::File, expected: &str, path: &Path) -> Result<()> {
-    file.seek(SeekFrom::Start(0))?;
-    let mut hasher = blake3::Hasher::new();
-    std::io::copy(file, &mut hasher)?;
-    let actual = hasher.finalize().to_hex().to_string();
-    if actual == expected {
+fn verify_anchored_digests(
+    root: &AnchoredRoot,
+    path: &Path,
+    expected_blake3: &str,
+    expected_sha256: &str,
+) -> Result<()> {
+    let digests = digest_reader(root.open_file(path)?)?;
+    if digests.blake3() == expected_blake3 && digests.sha256() == expected_sha256 {
         Ok(())
     } else {
         Err(Error::Import(format!(
@@ -2077,180 +1861,21 @@ fn verify_open_file_hash(file: &mut std::fs::File, expected: &str, path: &Path) 
     }
 }
 
-#[cfg(not(unix))]
-struct DestinationRoot {
-    path: PathBuf,
-}
-
-#[cfg(not(unix))]
-struct DestinationFile<'a> {
-    _root: &'a DestinationRoot,
-    staged_path: PathBuf,
-    destination_path: PathBuf,
-}
-
-#[cfg(not(unix))]
-impl DestinationRoot {
-    fn open(path: &Path) -> Result<Self> {
-        Ok(Self {
-            path: path.to_path_buf(),
-        })
-    }
-
-    fn resolve<'a>(&'a self, staged: &Path, destination: &Path) -> Result<DestinationFile<'a>> {
-        validate_destination(&self.path, staged)?;
-        validate_destination(&self.path, destination)?;
-        create_parent(destination)?;
-        validate_destination(&self.path, destination)?;
-        Ok(DestinationFile {
-            _root: self,
-            staged_path: staged.to_path_buf(),
-            destination_path: destination.to_path_buf(),
-        })
-    }
-}
-
-#[cfg(not(unix))]
-impl DestinationFile<'_> {
-    fn ensure_destination_absent(&self) -> Result<()> {
-        validate_destination_for_execution(&self.destination_path)
-    }
-
-    fn stage_regular(&self, source: &Path, expected_hash: &str) -> Result<String> {
-        copy_new(source, &self.staged_path)?;
-        verify_hash(&self.staged_path, expected_hash)?;
-        Ok(file_identity(&std::fs::symlink_metadata(
-            &self.staged_path,
-        )?))
-    }
-
-    fn stage_bytes(&self, bytes: &[u8], expected_hash: &str) -> Result<String> {
-        write_new(&self.staged_path, bytes)?;
-        verify_hash(&self.staged_path, expected_hash)?;
-        Ok(file_identity(&std::fs::symlink_metadata(
-            &self.staged_path,
-        )?))
-    }
-
-    fn stage_link(&self, source: &Path, expected_hash: &str) -> Result<String> {
-        create_symlink(source, &self.staged_path)?;
-        verify_hash(&self.staged_path, expected_hash)?;
-        Ok(file_identity(&std::fs::symlink_metadata(
-            &self.staged_path,
-        )?))
-    }
-
-    fn finalize(&self, _expected_identity: &str) -> Result<()> {
-        validate_destination_for_execution(&self.destination_path)?;
-        finalize_regular_file(&self.staged_path, &self.destination_path)
-    }
-}
-
-#[cfg(not(unix))]
-fn create_parent(path: &Path) -> Result<()> {
-    let Some(parent) = path.parent() else {
-        return Ok(());
-    };
-    let mut missing = Vec::new();
-    let mut current = parent;
-    loop {
-        match std::fs::symlink_metadata(current) {
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => break,
-            Ok(_) => {
-                return Err(Error::Import(format!(
-                    "destination parent is not a real directory: {}",
-                    current.display()
-                )));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                missing.push(current.to_path_buf());
-                current = current.parent().ok_or_else(|| {
-                    Error::Import(format!(
-                        "cannot locate an existing ancestor for {}",
-                        parent.display()
-                    ))
-                })?;
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-    for directory in missing.iter().rev() {
-        std::fs::create_dir(directory)?;
-        if let Some(ancestor) = directory.parent() {
-            sync_directory(ancestor)?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn copy_new(source: &Path, destination: &Path) -> Result<()> {
-    let mut input = std::fs::File::open(source)?;
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(destination)?;
-    std::io::copy(&mut input, &mut output)?;
-    output.sync_all()?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_new(destination: &Path, bytes: &[u8]) -> Result<()> {
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(destination)?;
-    output.write_all(bytes)?;
-    output.sync_all()?;
-    Ok(())
-}
-
-#[cfg(windows)]
-fn create_symlink(source: &Path, destination: &Path) -> Result<()> {
-    std::os::windows::fs::symlink_file(source, destination)?;
-    Ok(())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn create_symlink(_source: &Path, _destination: &Path) -> Result<()> {
-    Err(Error::Import(
-        "symbolic links are unsupported on this platform".into(),
-    ))
-}
-
-fn verify_hash(path: &Path, expected: &str) -> Result<()> {
-    if hash_path(path)? == expected {
-        Ok(())
-    } else {
-        Err(Error::Import(format!(
-            "staged content verification failed: {}",
-            path.display()
-        )))
-    }
-}
-
-#[cfg(not(unix))]
-fn finalize_regular_file(staged: &Path, destination: &Path) -> Result<()> {
-    std::fs::hard_link(staged, destination)?;
-    std::fs::remove_file(staged)?;
-    if let Some(parent) = destination.parent() {
-        sync_directory(parent)?;
-    }
-    Ok(())
-}
-
-fn remove_move_sources(tracks: &[&PlannedTrack]) -> Result<()> {
-    for track in tracks {
-        validate_source(track)?;
-        remove_file_synced(&track.source)?;
-    }
-    Ok(())
+fn read_anchored(root: &AnchoredRoot, path: &Path) -> Result<Vec<u8>> {
+    let mut input = root.open_file(path)?;
+    let mut bytes = Vec::new();
+    input.read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
+    use proptest::prelude::*;
+
     use super::*;
+    use crate::provider::SearchPage;
     use crate::AudioFormat;
     use async_trait::async_trait;
     use std::io::Read;
@@ -2263,12 +1888,8 @@ mod tests {
             "empty"
         }
 
-        async fn search_releases(
-            &self,
-            _query: &ReleaseQuery,
-            _limit: u32,
-        ) -> Result<Vec<ReleaseCandidate>> {
-            Ok(Vec::new())
+        async fn search_releases(&self, _query: &ReleaseQuery, _limit: u32) -> Result<SearchPage> {
+            Ok(SearchPage::complete(Vec::new()))
         }
 
         async fn fetch_cover_art(&self, _release_id: &str) -> Result<Option<Vec<u8>>> {
@@ -2302,6 +1923,59 @@ mod tests {
         }
     }
 
+    proptest! {
+        #[test]
+        fn arbitrary_track_sets_have_finite_unique_bounded_assignments(
+            sources in proptest::collection::vec(("[a-zA-Z0-9 ]{0,32}", 0_u32..32, 0_u32..8), 0..32),
+            candidates in proptest::collection::vec(("[a-zA-Z0-9 ]{0,32}", 0_u32..32, 0_u32..8), 0..32),
+        ) {
+            let items = sources
+                .iter()
+                .enumerate()
+                .map(|(index, (title, track, disc))| {
+                    let mut value = item(PathBuf::from(format!("{index}.wav")), title, *track);
+                    value.disc = Some(*disc);
+                    value
+                })
+                .collect::<Vec<_>>();
+            let tracks = candidates
+                .iter()
+                .enumerate()
+                .map(|(index, (title, number, disc))| ProviderTrack {
+                    external_id: format!("recording-{index}"),
+                    release_track_external_id: Some(format!("release-track-{index}")),
+                    title: title.clone(),
+                    artist: "Artist".into(),
+                    number: Some(*number),
+                    printed_position: Some(number.to_string()),
+                    disc: Some(*disc),
+                    length_ms: Some(index as u64 * 1_000),
+                    is_hidden: false,
+                    is_data_track: false,
+                    pregap_ms: None,
+                })
+                .collect::<Vec<_>>();
+            let assignments = assign_release_tracks(&items, &tracks);
+            prop_assert!(assignments.len() <= items.len().min(tracks.len()));
+            let assignments_valid = assignments.iter().all(|assignment| {
+                assignment.item_index < items.len()
+                    && assignment.track_index < tracks.len()
+                    && assignment.score.is_finite()
+            });
+            prop_assert!(assignments_valid);
+            let item_indices = assignments
+                .iter()
+                .map(|assignment| assignment.item_index)
+                .collect::<HashSet<_>>();
+            let track_indices = assignments
+                .iter()
+                .map(|assignment| assignment.track_index)
+                .collect::<HashSet<_>>();
+            prop_assert_eq!(item_indices.len(), assignments.len());
+            prop_assert_eq!(track_indices.len(), assignments.len());
+        }
+    }
+
     fn release(title: &str, second_track: &str) -> ReleaseCandidate {
         ReleaseCandidate {
             provider: "test".into(),
@@ -2313,21 +1987,32 @@ mod tests {
             tracks: vec![
                 ProviderTrack {
                     external_id: "one".into(),
+                    release_track_external_id: Some("release-track-one".into()),
                     title: "War Pigs".into(),
                     artist: "Black Sabbath".into(),
                     number: Some(1),
+                    printed_position: Some("1".into()),
                     disc: Some(1),
                     length_ms: Some(180_000),
+                    is_hidden: false,
+                    is_data_track: false,
+                    pregap_ms: None,
                 },
                 ProviderTrack {
                     external_id: "two".into(),
+                    release_track_external_id: Some("release-track-two".into()),
                     title: second_track.into(),
                     artist: "Black Sabbath".into(),
                     number: Some(2),
+                    printed_position: Some("2".into()),
                     disc: Some(1),
                     length_ms: Some(180_000),
+                    is_hidden: false,
+                    is_data_track: false,
+                    pregap_ms: None,
                 },
             ],
+            edition: crate::provider::EditionEvidence::default(),
         }
     }
 
@@ -2340,6 +2025,7 @@ mod tests {
         let candidates = score_candidates(
             &items,
             vec![release("a", "Paranoid"), release("b", "Paranoid")],
+            true,
             0.92,
             0.05,
         );
@@ -2352,21 +2038,61 @@ mod tests {
     }
 
     #[test]
-    fn singleton_confidence_requires_a_valid_runner_up_margin() {
-        let source = item(PathBuf::from("single.flac"), "Track", 1);
-        let candidate = TrackCandidate {
-            provider: "musicbrainz".into(),
-            external_id: "recording".into(),
-            title: "Track".into(),
-            artist: "Black Sabbath".into(),
-            length_ms: Some(180_000),
-            provider_score: 1.0,
-            release_external_id: None,
-        };
-        let invalid_threshold_candidate = candidate.clone();
-        let candidates = score_track_candidates(
-            std::slice::from_ref(&source),
-            vec![candidate.clone(), candidate],
+    fn a_single_candidate_has_unknown_margin_and_cannot_autoaccept() {
+        let items = vec![
+            item("/tmp/one.flac".into(), "War Pigs", 1),
+            item("/tmp/two.flac".into(), "Paranoid", 2),
+        ];
+        let candidates =
+            score_candidates(&items, vec![release("only", "Paranoid")], true, 0.92, 0.05);
+        assert_eq!(candidates[0].confidence.runner_up_margin, None);
+        assert!(!candidates[0].confidence.high_confidence);
+        assert!(candidates[0]
+            .confidence
+            .gate_failures
+            .iter()
+            .any(|failure| failure.contains("unknown")));
+    }
+
+    #[test]
+    fn a_direct_embedded_release_id_supplies_real_uniqueness_evidence() -> Result<()> {
+        let release_id = ExternalId::new_typed("test", "release", "direct")?;
+        let mut items = vec![
+            item("/tmp/one.flac".into(), "War Pigs", 1),
+            item("/tmp/two.flac".into(), "Paranoid", 2),
+        ];
+        for item in &mut items {
+            item.release_external_id = Some(release_id.clone());
+        }
+        let mut direct = release("direct", "Paranoid");
+        direct.edition.explicit_id = true;
+
+        let candidates = score_candidates(&items, vec![direct], true, 0.92, 0.05);
+
+        assert_eq!(candidates[0].confidence.runner_up_margin, None);
+        assert!(
+            candidates[0].confidence.high_confidence,
+            "{:?}",
+            candidates[0].confidence.gate_failures
+        );
+        assert!(candidates[0]
+            .confidence
+            .gate_failures
+            .iter()
+            .all(|failure| !failure.contains("runner-up")));
+        Ok(())
+    }
+
+    #[test]
+    fn an_incomplete_candidate_page_always_abstains() {
+        let items = vec![
+            item("/tmp/one.flac".into(), "War Pigs", 1),
+            item("/tmp/two.flac".into(), "Paranoid", 2),
+        ];
+        let candidates = score_candidates(
+            &items,
+            vec![release("best", "Paranoid"), release("other", "Wrong")],
+            false,
             0.92,
             0.05,
         );
@@ -2375,20 +2101,7 @@ mod tests {
             .confidence
             .gate_failures
             .iter()
-            .any(|failure| failure.contains("runner-up margin")));
-
-        let candidates = score_track_candidates(
-            &[source],
-            vec![invalid_threshold_candidate],
-            f64::NAN,
-            f64::NAN,
-        );
-        assert!(!candidates[0].confidence.high_confidence);
-        assert!(candidates[0]
-            .confidence
-            .gate_failures
-            .iter()
-            .any(|failure| failure.contains("thresholds are invalid")));
+            .any(|failure| failure.contains("incomplete")));
     }
 
     #[test]
@@ -2396,11 +2109,16 @@ mod tests {
         let source = item(PathBuf::from("source.flac"), "Track", 1);
         let provider = ProviderTrack {
             external_id: "track".into(),
+            release_track_external_id: None,
             title: "Track".into(),
             artist: "Artist".into(),
             number: Some(1),
+            printed_position: Some("1".into()),
             disc: Some(1),
             length_ms: Some(180_000),
+            is_hidden: false,
+            is_data_track: false,
+            pregap_ms: None,
         };
         assert!(match_tracks(&vec![source; MAX_MATCH_TRACKS + 1], &[provider]).is_empty());
     }
@@ -2411,13 +2129,20 @@ mod tests {
             item("/tmp/one.flac".into(), "War Pigs", 1),
             item("/tmp/two.flac".into(), "Paranoid", 2),
         ];
+        let mut other = release("other", "Wrong");
+        other.tracks[0].title = "Different".into();
         let candidates = score_candidates(
             &items,
-            vec![release("best", "Paranoid"), release("other", "Wrong")],
+            vec![release("best", "Paranoid"), other],
+            true,
             0.92,
             0.05,
         );
-        assert!(candidates[0].confidence.high_confidence);
+        assert!(
+            candidates[0].confidence.high_confidence,
+            "{:?}",
+            candidates[0].confidence.gate_failures
+        );
         assert!(candidates[0].confidence.composite >= 0.92);
     }
 
@@ -2430,7 +2155,7 @@ mod tests {
         let mut candidate = release("bad-score", "Paranoid");
         candidate.provider_score = f64::NAN;
 
-        let candidates = score_candidates(&items, vec![candidate], 0.92, 0.05);
+        let candidates = score_candidates(&items, vec![candidate], true, 0.92, 0.05);
 
         assert!(candidates[0].confidence.provider.abs() < f64::EPSILON);
         assert!(!candidates[0].confidence.high_confidence);
@@ -2445,6 +2170,7 @@ mod tests {
         let candidates = score_candidates(
             &items,
             vec![release("candidate", "Paranoid")],
+            true,
             f64::NAN,
             0.05,
         );
@@ -2458,10 +2184,11 @@ mod tests {
 
     #[test]
     fn artwork_uses_its_detected_format() {
-        assert_eq!(artwork_extension(&[0xff, 0xd8, 0xff, 0x00]), Some("jpg"));
-        assert_eq!(artwork_extension(b"\x89PNG\r\n\x1a\nrest"), Some("png"));
-        assert_eq!(artwork_extension(b"RIFF0000WEBPrest"), Some("webp"));
-        assert_eq!(artwork_extension(b"GIF89arest"), Some("gif"));
+        let image = image::DynamicImage::new_rgb8(1, 1);
+        let mut png = std::io::Cursor::new(Vec::new());
+        assert!(image.write_to(&mut png, image::ImageFormat::Png).is_ok());
+        assert_eq!(artwork_extension(png.get_ref()), Some("png"));
+        assert_eq!(artwork_extension(b"\x89PNG\r\n\x1a\nrest"), None);
         assert_eq!(artwork_extension(b"not an image"), None);
     }
 
@@ -2514,6 +2241,7 @@ mod tests {
             source_album: "Paranoid".into(),
             items: vec![source_item],
             candidates: Vec::new(),
+            candidate_set_complete: true,
             lookup_error: None,
             singleton: false,
         };
@@ -2539,6 +2267,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn regular_file_finalization_never_overwrites() -> Result<()> {
         let temporary = tempfile::tempdir()?;
@@ -2547,17 +2276,15 @@ mod tests {
         let destination = temporary_path.join("destination");
         std::fs::write(&staged, b"new")?;
         std::fs::write(&destination, b"old")?;
-        let root = DestinationRoot::open(&temporary_path)?;
-        let destination_file = root.resolve(&staged, &destination)?;
-        let identity = file_identity(&std::fs::symlink_metadata(&staged)?);
-        assert!(destination_file.finalize(&identity).is_err());
+        let root = AnchoredRoot::open_or_create(&temporary_path)?;
+        assert!(root.rename_noreplace(&staged, &destination).is_err());
         let mut value = String::new();
         std::fs::File::open(destination)?.read_to_string(&mut value)?;
         assert_eq!(value, "old");
         Ok(())
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn library_creation_rejects_a_symlinked_ancestor() -> Result<()> {
         let temporary = tempfile::tempdir()?;
@@ -2566,12 +2293,12 @@ mod tests {
         std::fs::create_dir(&outside)?;
         std::os::unix::fs::symlink(&outside, &redirected)?;
 
-        assert!(DestinationRoot::open(&redirected.join("library")).is_err());
+        assert!(AnchoredRoot::open_or_create(&redirected.join("library")).is_err());
         assert!(!outside.join("library").exists());
         Ok(())
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn staging_rejects_a_parent_replaced_by_a_symlink() -> Result<()> {
         let temporary = tempfile::tempdir()?;
@@ -2582,18 +2309,16 @@ mod tests {
         let detached = temporary_path.join("detached-album");
         let outside = temporary_path.join("outside");
         let staged = parent.join(".track.stage");
-        let destination = parent.join("track.flac");
         std::fs::write(&source, b"audio")?;
         std::fs::create_dir_all(&parent)?;
         std::fs::create_dir(&outside)?;
 
-        let root = DestinationRoot::open(&library_dir)?;
-        let destination_file = root.resolve(&staged, &destination)?;
+        let root = AnchoredRoot::open_or_create(&library_dir)?;
         std::fs::rename(&parent, &detached)?;
         std::os::unix::fs::symlink(&outside, &parent)?;
 
-        assert!(destination_file
-            .stage_regular(&source, &hash_path(&source)?)
+        assert!(root
+            .copy_new_observed(&source, &staged, |_metadata| Ok(()))
             .is_err());
         assert!(!outside.join(".track.stage").exists());
         assert!(!outside.join("track.flac").exists());
@@ -2601,7 +2326,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn finalization_rejects_a_parent_replaced_by_a_symlink() -> Result<()> {
         let temporary = tempfile::tempdir()?;
@@ -2617,13 +2342,12 @@ mod tests {
         std::fs::create_dir_all(&parent)?;
         std::fs::create_dir(&outside)?;
 
-        let root = DestinationRoot::open(&library_dir)?;
-        let destination_file = root.resolve(&staged, &destination)?;
-        let identity = destination_file.stage_regular(&source, &hash_path(&source)?)?;
+        let root = AnchoredRoot::open_or_create(&library_dir)?;
+        root.copy_new_observed(&source, &staged, |_metadata| Ok(()))?;
         std::fs::rename(&parent, &detached)?;
         std::os::unix::fs::symlink(&outside, &parent)?;
 
-        assert!(destination_file.finalize(&identity).is_err());
+        assert!(root.rename_noreplace(&staged, &destination).is_err());
         assert!(!outside.join(".track.stage").exists());
         assert!(!outside.join("track.flac").exists());
         assert!(detached.join(".track.stage").exists());
@@ -2650,6 +2374,7 @@ mod tests {
             );
         let destination = library_dir.join("Artist/Album/01 - Track.flac");
         let metadata = std::fs::metadata(source)?;
+        let digests = digest_file(source)?;
         let mut planned_item = item(destination.clone(), "Track", 1);
         planned_item.file_size = Some(metadata.len());
         planned_item.mtime = metadata.modified()?.into();
@@ -2670,7 +2395,8 @@ mod tests {
                 fingerprint: SourceFingerprint {
                     size: metadata.len(),
                     modified: metadata.modified()?,
-                    content_hash: hash_path(source)?,
+                    content_hash: digests.blake3().to_string(),
+                    sha256: digests.sha256().to_string(),
                     identity: file_identity(&metadata),
                 },
                 item: planned_item,
@@ -2683,6 +2409,7 @@ mod tests {
         })
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn executor_supports_copy_move_and_link() -> Result<()> {
         for action in [Action::Copy, Action::Move, Action::Link] {
@@ -2703,8 +2430,87 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
-    fn move_cleanup_preserves_an_identical_source_replacement() -> Result<()> {
+    fn every_import_safety_boundary_recovers_without_losing_unowned_bytes() -> Result<()> {
+        fn one(
+            failure: Option<(usize, Option<i32>)>,
+        ) -> Result<(Result<ImportReport>, Vec<&'static str>)> {
+            let temporary = tempfile::tempdir()?;
+            let source = temporary.path().join("source.flac");
+            let library_dir = temporary.path().join("library");
+            std::fs::write(&source, b"unowned source bytes")?;
+            let plan = approved_plan(&source, &library_dir, Action::Copy)?;
+            let destination = plan.tracks[0].destination.clone();
+            let mut library = Library::open_in_memory()?;
+            let (result, hits) = match failure {
+                None => crate::failpoints::run_recording(|| {
+                    ImportExecutor::new(&mut library).execute(plan)
+                }),
+                Some((index, None)) => crate::failpoints::run_failing(index, || {
+                    ImportExecutor::new(&mut library).execute(plan)
+                }),
+                Some((index, Some(raw_os_error))) => {
+                    crate::failpoints::run_failing_io(index, raw_os_error, || {
+                        ImportExecutor::new(&mut library).execute(plan)
+                    })
+                }
+            };
+
+            let recovery = library.recover_pending()?;
+            assert!(recovery.unresolved.is_empty(), "{recovery:?}");
+            assert!(library.recover_pending()?.unresolved.is_empty());
+            assert_eq!(std::fs::read(&source)?, b"unowned source bytes");
+            let items = library.query_items(&crate::query::Query::all())?;
+            if destination.exists() {
+                assert_eq!(std::fs::read(&destination)?, b"unowned source bytes");
+                assert_eq!(items.len(), 1);
+            } else {
+                assert!(items.is_empty());
+            }
+            if library_dir.exists() {
+                for entry in walkdir::WalkDir::new(&library_dir) {
+                    let entry = entry.map_err(|error| Error::Import(error.to_string()))?;
+                    let name = entry.file_name().to_string_lossy();
+                    assert!(
+                        !name.contains(".rsbts-") || entry.path() == destination,
+                        "orphaned staging entry: {}",
+                        entry.path().display()
+                    );
+                }
+            }
+            Ok((result, hits))
+        }
+
+        let (success, boundaries) = one(None)?;
+        assert!(success.is_ok());
+        assert!(boundaries.len() >= 10, "insufficient boundary coverage");
+        for index in 0..boundaries.len() {
+            let (result, observed) = one(Some((index, None)))?;
+            assert!(
+                result.is_err(),
+                "boundary {index} did not fail: {observed:?}"
+            );
+        }
+        for (boundary, raw_os_error) in [
+            ("fs.before-create-new-file", 13),
+            ("fs.before-copy-staged-bytes", 28),
+        ] {
+            let index = boundaries
+                .iter()
+                .position(|observed| observed == &boundary)
+                .ok_or_else(|| Error::Operation(format!("missing {boundary} boundary")))?;
+            let (result, observed) = one(Some((index, Some(raw_os_error))))?;
+            assert!(
+                matches!(result, Err(Error::Io(ref error)) if error.raw_os_error() == Some(raw_os_error)),
+                "{boundary} did not propagate its operating-system error: {observed:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn move_execution_preserves_an_identical_source_replacement() -> Result<()> {
         let temporary = tempfile::tempdir()?;
         let source = temporary.path().join("source.flac");
         let original = temporary.path().join("original.flac");
@@ -2714,8 +2520,10 @@ mod tests {
         std::fs::rename(&source, &original)?;
         std::fs::write(&source, b"audio")?;
 
-        assert!(remove_move_sources(&[&plan.tracks[0]]).is_err());
+        let mut library = Library::open_in_memory()?;
+        assert!(ImportExecutor::new(&mut library).execute(plan).is_err());
         assert_eq!(std::fs::read(source)?, b"audio");
+        assert_eq!(std::fs::read(original)?, b"audio");
         Ok(())
     }
 

@@ -2,6 +2,7 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
+use rsbts::catalog::{Confidence, DataLicense, EntityId, EntityKind, MetadataClaim, ValueState};
 use rusqlite::Connection;
 
 fn run(config: &Path, arguments: &[&str]) -> std::io::Result<Output> {
@@ -45,6 +46,29 @@ fn stored_item_and_album_year(
     })?;
     let album_year = connection.query_row("SELECT year FROM albums", [], |row| row.get(0))?;
     Ok((title, item_year, album_year))
+}
+
+fn minimal_wav() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&38_u32.to_le_bytes());
+    bytes.extend_from_slice(b"WAVEfmt ");
+    bytes.extend_from_slice(&16_u32.to_le_bytes());
+    bytes.extend_from_slice(&1_u16.to_le_bytes());
+    bytes.extend_from_slice(&1_u16.to_le_bytes());
+    bytes.extend_from_slice(&44_100_u32.to_le_bytes());
+    bytes.extend_from_slice(&88_200_u32.to_le_bytes());
+    bytes.extend_from_slice(&2_u16.to_le_bytes());
+    bytes.extend_from_slice(&16_u16.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&2_u32.to_le_bytes());
+    bytes.extend_from_slice(&0_i16.to_le_bytes());
+    bytes
+}
+
+fn parse_json_document(output: &Output) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    assert_success(output);
+    Ok(serde_json::from_slice(&output.stdout)?)
 }
 
 #[test]
@@ -124,94 +148,206 @@ fn invalid_commands_fail_before_opening_the_database() -> Result<(), Box<dyn std
 }
 
 #[test]
-fn beets_migration_dry_run_is_read_only_and_execution_creates_a_new_catalog(
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one disposable workflow verifies the complete machine-output and dry-run contract"
+)]
+fn machine_output_is_parseable_and_projection_previews_are_read_only(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let temporary = tempfile::tempdir()?;
     let config_path = temporary.path().join("config.toml");
-    let default_database = temporary.path().join("unused-default.db");
-    let organized = temporary.path().join("organized");
+    let database_path = temporary.path().join("library.db");
+    let library_path = temporary.path().join("organized");
+    std::fs::create_dir(&library_path)?;
     std::fs::write(
         &config_path,
         format!(
-            "[library]\ndirectory = '{}'\ndatabase = '{}'\n",
-            organized.display(),
-            default_database.display()
+            "[library]\ndirectory = '{}'\ndatabase = '{}'\n[import]\nfetch_art = false\n",
+            library_path.display(),
+            database_path.display()
         ),
     )?;
-    let source = temporary.path().join("beets.db");
-    let missing_track = temporary.path().join("missing.wav");
-    let connection = Connection::open(&source)?;
-    connection.execute_batch(
-        "CREATE TABLE albums (id INTEGER PRIMARY KEY, album TEXT, albumartist TEXT);
-         CREATE TABLE items (
-            id INTEGER PRIMARY KEY, album_id INTEGER, path TEXT, title TEXT,
-            artist TEXT, album TEXT, format TEXT, length REAL, added REAL, mtime REAL
-         );",
+
+    let stats = run(&config_path, &["--output", "json", "stats"])?;
+    assert_eq!(parse_json_document(&stats)?["tracks"], 0);
+
+    let track = library_path.join("track.wav");
+    std::fs::write(&track, minimal_wav())?;
+    let connection = Connection::open(&database_path)?;
+    connection.execute(
+        "INSERT INTO albums (album, albumartist, year, added)
+         VALUES ('Album', 'Artist', 2026, '2026-01-01T00:00:00+00:00')",
+        [],
     )?;
+    let album_id = connection.last_insert_rowid();
     connection.execute(
         "INSERT INTO items
-         (id, album_id, path, title, artist, album, format, length, added, mtime)
-         VALUES (1, NULL, ?1, 'Migrated Single', 'Artist', '', 'WAV', 1.0, 1.0, 1.0)",
-        [missing_track.to_string_lossy().as_ref()],
+         (album_id, path, title, artist, album, albumartist, year, track, disc,
+          format, bitrate, length, added, mtime, file_size)
+         VALUES (?1, ?2, 'Track', 'Artist', 'Album', 'Artist', 2026, 1, 1,
+                 'WAV', 705, 0.1, '2026-01-01T00:00:00+00:00',
+                 '2026-01-01T00:00:00+00:00', ?3)",
+        rusqlite::params![
+            album_id,
+            track.to_string_lossy(),
+            std::fs::metadata(&track)?.len()
+        ],
     )?;
     drop(connection);
-    let source_before = std::fs::read(&source)?;
-    let output_database = temporary.path().join("migrated.db");
-    let output_config = temporary.path().join("migrated.toml");
-    let source_arg = source.to_string_lossy();
-    let database_arg = output_database.to_string_lossy();
-    let config_arg = output_config.to_string_lossy();
+    assert_success(&run(&config_path, &["verify"])?);
 
-    let output = run(
+    let connection = Connection::open(&database_path)?;
+    let (item_id, asset_id): (i64, String) = connection.query_row(
+        "SELECT i.id, ia.asset_id FROM items i
+         JOIN item_assets ia ON ia.item_id = i.id AND ia.relationship = 'audio'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    drop(connection);
+
+    let library = rsbts::db::Library::open(&database_path)?;
+    let entity = EntityId::new();
+    library.append_metadata_claim(&MetadataClaim::new(
+        EntityKind::Release,
+        entity.clone(),
+        "title",
+        ValueState::Known(serde_json::json!("Provider Album")),
+        "provider-api",
+        Some("fixture".into()),
+        Some("release-1".into()),
+        Confidence::new(1.0)?,
+        DataLicense::Cc0,
+        false,
+    )?)?;
+    drop(library);
+
+    let list = run(&config_path, &["--output", "jsonl", "ls", "--limit", "1"])?;
+    assert_success(&list);
+    for line in String::from_utf8(list.stdout)?.lines() {
+        let _: serde_json::Value = serde_json::from_str(line)?;
+    }
+
+    let provider = run_preserving_database(
         &config_path,
+        &database_path,
         &[
-            "migrate",
-            "beets",
-            "--beets-library",
-            source_arg.as_ref(),
-            "--output-database",
-            database_arg.as_ref(),
-            "--output-config",
-            config_arg.as_ref(),
+            "--output",
+            "json",
+            "provider-refresh",
+            "release",
+            entity.as_str(),
             "--dry-run",
         ],
     )?;
-    assert_success(&output);
-    assert!(!output_database.exists());
-    assert!(!output_config.exists());
-    assert!(!default_database.exists());
-    assert_eq!(std::fs::read(&source)?, source_before);
+    assert!(parse_json_document(&provider)?["plan"]["diffs"].is_array());
 
-    let output = run(
+    let tag = run_preserving_database(
         &config_path,
+        &database_path,
         &[
-            "migrate",
-            "beets",
-            "--beets-library",
-            source_arg.as_ref(),
-            "--output-database",
-            database_arg.as_ref(),
-            "--output-config",
-            config_arg.as_ref(),
-            "--yes",
+            "--output",
+            "json",
+            "tag-project",
+            &item_id.to_string(),
+            "--title",
+            "Projected Track",
+            "--artist",
+            "Artist",
+            "--album",
+            "Album",
+            "--album-artist",
+            "Artist",
+            "--dry-run",
         ],
     )?;
-    assert_success(&output);
-    assert!(output_config.exists());
-    assert_eq!(std::fs::read(&source)?, source_before);
-    let migrated = Connection::open(&output_database)?;
-    let (count, singleton, album_id): (u64, bool, Option<i64>) = migrated.query_row(
-        "SELECT COUNT(*), singleton, album_id FROM items",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    assert!(parse_json_document(&tag)?["plan"]["before"].is_object());
+
+    let path = run_preserving_database(
+        &config_path,
+        &database_path,
+        &[
+            "--output",
+            "json",
+            "path-project",
+            &asset_id,
+            "Artist/Album/01 - Track.wav",
+            "--dry-run",
+        ],
     )?;
-    assert_eq!(count, 1);
-    assert!(singleton);
-    assert!(album_id.is_none());
+    assert_eq!(parse_json_document(&path)?["plan"]["asset_id"], asset_id);
+
+    let removal = run_preserving_database(
+        &config_path,
+        &database_path,
+        &[
+            "--output",
+            "json",
+            "rm",
+            "--delete",
+            "--dry-run",
+            "artist:=Artist",
+        ],
+    )?;
+    assert_eq!(parse_json_document(&removal)?["plan"]["delete_files"], true);
+
+    let integrity = run(&config_path, &["--output", "json", "integrity"])?;
+    assert_success(&integrity);
+    assert_eq!(parse_json_document(&integrity)?["truncated"], false);
+
+    let deep = run(&config_path, &["--output", "json", "audit", "--deep"])?;
+    assert_success(&deep);
+    let plan_id = parse_json_document(&deep)?["id"]
+        .as_str()
+        .ok_or("deep audit did not emit a plan ID")?
+        .to_owned();
+    assert_success(&run(
+        &config_path,
+        &["--output", "json", "fixity", "approve", &plan_id],
+    )?);
+    let progress = run(
+        &config_path,
+        &[
+            "--output",
+            "json",
+            "fixity",
+            "run",
+            &plan_id,
+            "--page-size",
+            "1",
+        ],
+    )?;
+    assert_success(&progress);
+    assert_eq!(parse_json_document(&progress)?["complete"], false);
+    let completed = run(
+        &config_path,
+        &[
+            "--output",
+            "json",
+            "fixity",
+            "run",
+            &plan_id,
+            "--page-size",
+            "1",
+        ],
+    )?;
+    assert_success(&completed);
+    assert_eq!(parse_json_document(&completed)?["complete"], true);
+    let results = run(
+        &config_path,
+        &[
+            "--output", "jsonl", "fixity", "results", &plan_id, "--limit", "10",
+        ],
+    )?;
+    assert_success(&results);
+    assert!(!String::from_utf8(results.stdout)?.trim().is_empty());
+
     Ok(())
 }
 
 #[test]
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[allow(clippy::too_many_lines)]
 fn disposable_cli_workflow_is_atomic_and_confirmation_safe(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let temporary = tempfile::tempdir()?;
@@ -254,6 +390,14 @@ fn disposable_cli_workflow_is_atomic_and_confirmation_safe(
         ],
     )?;
     drop(connection);
+
+    let output = run_preserving_database(&config_path, &database_path, &["audit"])?;
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Missing managed asset"));
+
+    let output = run(&config_path, &["verify", "artist:=\"Test Artist\""])?;
+    assert_success(&output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Verified 1 asset(s)"));
 
     let output = run_preserving_database(&config_path, &database_path, &["audit"])?;
     assert_success(&output);
