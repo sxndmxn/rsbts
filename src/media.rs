@@ -8,7 +8,6 @@ use blake3::Hasher;
 use lofty::config::ParseOptions;
 use lofty::file::{AudioFile, FileType, TaggedFileExt};
 use lofty::mp4::{Mp4Codec, Mp4File};
-use lofty::probe::Probe;
 use lofty::tag::TagType;
 use serde::{Deserialize, Serialize};
 use symphonia::core::audio::SampleBuffer;
@@ -188,7 +187,7 @@ pub fn probe_media(path: &Path) -> Result<MediaDescriptor> {
 
 pub(crate) fn probe_media_from_file(file: File, path_hint: &Path) -> Result<MediaDescriptor> {
     let codec_reader = file.try_clone()?;
-    let tagged = Probe::new(BufReader::new(file)).guess_file_type()?.read()?;
+    let tagged = crate::tags::probe_native(BufReader::new(file))?.read()?;
     let file_type = tagged.file_type();
     let properties = tagged.properties();
     let (container, codec) = classify(codec_reader, file_type, path_hint)?;

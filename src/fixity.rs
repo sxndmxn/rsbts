@@ -51,9 +51,9 @@ impl FixityScheduleId {
 
     pub fn parse(value: impl Into<String>) -> Result<Self> {
         let value = value.into();
-        uuid::Uuid::parse_str(&value)
+        let id = uuid::Uuid::parse_str(&value)
             .map_err(|error| Error::Operation(format!("invalid fixity schedule ID: {error}")))?;
-        Ok(Self(value.to_ascii_lowercase()))
+        Ok(Self(id.to_string()))
     }
 
     #[must_use]
@@ -90,6 +90,23 @@ pub struct FixitySchedule {
 }
 
 impl FixitySchedule {
+    /// Validate the interval and its next occurrence without opening the library.
+    pub fn validate_interval(
+        interval: std::time::Duration,
+        first_run_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let seconds = i64::try_from(interval.as_secs()).map_err(|_error| {
+            Error::Operation("fixity interval exceeds the supported range".into())
+        })?;
+        if seconds == 0 {
+            return Err(Error::Operation(
+                "fixity interval must be at least one second".into(),
+            ));
+        }
+        advance_schedule(first_run_at, seconds, first_run_at)?;
+        Ok(())
+    }
+
     #[must_use]
     pub const fn id(&self) -> &FixityScheduleId {
         &self.id
@@ -201,7 +218,7 @@ impl FixityResultState {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FixityPlan {
     id: PlanId,
     mode: FixityMode,
@@ -340,12 +357,7 @@ impl Library {
                     row.get::<_, u64>(0)
                 })?;
         let request = json!({"mode": mode});
-        let preview = json!({
-            "mode": mode,
-            "managed_assets": asset_count,
-            "streamed": true,
-            "resumable": true,
-        });
+        let preview = fixity_preview(mode, asset_count, false);
         let id =
             self.create_durable_plan(PlanKind::Audit, &request, &preview, Some(asset_count))?;
         Ok(FixityPlan {
@@ -370,10 +382,21 @@ impl Library {
             return Err(Error::Operation("plan is not a fixity audit".into()));
         }
         let request: Request = serde_json::from_value(durable.request().clone())?;
+        let asset_count = durable
+            .progress()
+            .1
+            .ok_or_else(|| Error::Operation("fixity plan has no saved asset count".into()))?;
+        if durable.preview()
+            != &fixity_preview(request.mode, asset_count, request.schedule_id.is_some())
+        {
+            return Err(Error::Operation(
+                "plan does not contain a reviewed fixity preview".into(),
+            ));
+        }
         Ok(FixityPlan {
             id: id.clone(),
             mode: request.mode,
-            asset_count: durable.progress().1.unwrap_or(0),
+            asset_count,
             schedule_id: request.schedule_id,
         })
     }
@@ -386,14 +409,8 @@ impl Library {
         interval: std::time::Duration,
         first_run_at: DateTime<Utc>,
     ) -> Result<FixityScheduleId> {
-        let interval_seconds = i64::try_from(interval.as_secs()).map_err(|_error| {
-            Error::Operation("fixity interval exceeds the supported range".into())
-        })?;
-        if interval_seconds == 0 {
-            return Err(Error::Operation(
-                "fixity interval must be at least one second".into(),
-            ));
-        }
+        FixitySchedule::validate_interval(interval, first_run_at)?;
+        let interval_seconds = interval.as_secs();
         let id = FixityScheduleId::new();
         let now = Utc::now().to_rfc3339();
         self.conn.execute(
@@ -445,13 +462,7 @@ impl Library {
                 "schedule_id": schedule.id,
                 "scheduled_for": schedule.next_run_at,
             });
-            let preview = json!({
-                "mode": schedule.mode,
-                "managed_assets": asset_count,
-                "streamed": true,
-                "resumable": true,
-                "scheduled": true,
-            });
+            let preview = fixity_preview(schedule.mode, asset_count, true);
             let timestamp = now.to_rfc3339();
             transaction.execute(
                 "INSERT INTO durable_plans
@@ -609,7 +620,17 @@ impl Library {
     }
 
     pub fn approve_fixity(&self, plan: &FixityPlan) -> Result<()> {
+        self.require_fixity_review(plan)?;
         self.approve_durable_plan(plan.id())
+    }
+
+    fn require_fixity_review(&self, plan: &FixityPlan) -> Result<()> {
+        if self.fixity_plan(plan.id())? != *plan {
+            return Err(Error::Operation(
+                "fixity plan does not match its saved review".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Process at most `page_size` assets and persist the cursor and results.
@@ -619,7 +640,18 @@ impl Library {
                 "fixity page size must be between 1 and 4096".into(),
             ));
         }
-        if self.durable_plan(plan.id())?.cancel_requested() {
+        self.require_fixity_review(plan)?;
+        let saved = self.durable_plan(plan.id())?;
+        if !matches!(
+            saved.state(),
+            PlanState::Approved | PlanState::Running | PlanState::Paused
+        ) {
+            return Err(Error::Operation(format!(
+                "fixity plan cannot run from state {:?}",
+                saved.state()
+            )));
+        }
+        if saved.cancel_requested() {
             return self.cancel_fixity(plan);
         }
         self.ensure_fixity_running(plan)?;
@@ -942,6 +974,19 @@ impl Library {
     }
 }
 
+fn fixity_preview(mode: FixityMode, asset_count: u64, scheduled: bool) -> serde_json::Value {
+    let mut preview = json!({
+        "mode": mode,
+        "managed_assets": asset_count,
+        "streamed": true,
+        "resumable": true,
+    });
+    if scheduled {
+        preview["scheduled"] = json!(true);
+    }
+    preview
+}
+
 #[derive(Debug)]
 struct DueSchedule {
     id: FixityScheduleId,
@@ -1001,8 +1046,10 @@ fn advance_schedule(
     let seconds = interval_seconds
         .checked_mul(steps)
         .ok_or_else(|| Error::Operation("fixity schedule advance overflowed".into()))?;
+    let duration = TimeDelta::try_seconds(seconds)
+        .ok_or_else(|| Error::Operation("fixity interval exceeds the supported range".into()))?;
     scheduled
-        .checked_add_signed(TimeDelta::seconds(seconds))
+        .checked_add_signed(duration)
         .ok_or_else(|| Error::Operation("fixity schedule exceeds the supported date range".into()))
 }
 
@@ -1298,6 +1345,253 @@ mod tests {
         library.complete_operation(&operation)
     }
 
+    fn approved_fixity_fixture(directory: &Path) -> Result<(Library, FixityPlan)> {
+        let mut library = Library::open_in_memory()?;
+        for index in 0..2 {
+            let path = directory.join(format!("track-{index}.wav"));
+            std::fs::write(&path, wav(index as i16))?;
+            add_item(&mut library, &path, index)?;
+        }
+        let plan = library.plan_fixity(FixityMode::Deep)?;
+        library.approve_fixity(&plan)?;
+        Ok((library, plan))
+    }
+
+    fn fixity_review_snapshot(library: &Library, id: &PlanId) -> Result<serde_json::Value> {
+        let runs: u64 = library
+            .conn
+            .query_row("SELECT COUNT(*) FROM fixity_runs", [], |row| row.get(0))?;
+        let results: u64 =
+            library
+                .conn
+                .query_row("SELECT COUNT(*) FROM fixity_results", [], |row| row.get(0))?;
+        Ok(json!({
+            "plan": library.durable_plan(id)?,
+            "events": library.plan_events(id)?,
+            "schedules": library.fixity_schedules_page(None, 4096)?,
+            "runs": runs,
+            "results": results,
+        }))
+    }
+
+    fn require_changed_fixity_rejection(
+        library: &Library,
+        changed: &FixityPlan,
+        case: &str,
+    ) -> Result<()> {
+        let before = fixity_review_snapshot(library, changed.id())?;
+        let result = library.run_fixity_page(changed, 10);
+        assert!(result.is_err(), "{case} reused fixity approval: {result:?}");
+        assert_eq!(
+            fixity_review_snapshot(library, changed.id())?,
+            before,
+            "{case} changed saved fixity state before rejection"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fixity_execution_rejects_changed_mode() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let (library, plan) = approved_fixity_fixture(temporary.path())?;
+        let mut serialized = serde_json::to_value(&plan)?;
+        serialized["mode"] = json!("quick");
+        let changed = serde_json::from_value(serialized)?;
+
+        require_changed_fixity_rejection(&library, &changed, "changed mode")?;
+        assert!(library.run_fixity_page(&plan, 10)?.complete());
+        Ok(())
+    }
+
+    #[test]
+    fn fixity_approval_rejects_changed_review() -> Result<()> {
+        let library = Library::open_in_memory()?;
+        let plan = library.plan_fixity(FixityMode::Deep)?;
+        let before = fixity_review_snapshot(&library, plan.id())?;
+        let mut serialized = serde_json::to_value(&plan)?;
+        serialized["mode"] = json!("quick");
+        let changed: FixityPlan = serde_json::from_value(serialized)?;
+
+        assert!(
+            library.approve_fixity(&changed).is_err(),
+            "changed review approved a different saved fixity plan"
+        );
+        assert_eq!(fixity_review_snapshot(&library, plan.id())?, before);
+        library.approve_fixity(&plan)?;
+        Ok(())
+    }
+
+    #[test]
+    fn fixity_execution_rejects_changed_asset_count() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let (library, plan) = approved_fixity_fixture(temporary.path())?;
+        let mut serialized = serde_json::to_value(&plan)?;
+        serialized["asset_count"] = json!(0);
+        let changed = serde_json::from_value(serialized)?;
+
+        require_changed_fixity_rejection(&library, &changed, "changed asset count")?;
+        assert!(library.run_fixity_page(&plan, 10)?.complete());
+        Ok(())
+    }
+
+    #[test]
+    fn fixity_execution_rejects_changed_schedule_id() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let (library, plan) = approved_fixity_fixture(temporary.path())?;
+        let schedule = library.schedule_fixity(
+            FixityMode::Deep,
+            std::time::Duration::from_secs(60),
+            Utc::now() + TimeDelta::days(1),
+        )?;
+        let mut serialized = serde_json::to_value(&plan)?;
+        serialized["schedule_id"] = json!(schedule);
+        let changed = serde_json::from_value(serialized)?;
+
+        require_changed_fixity_rejection(&library, &changed, "changed schedule ID")?;
+        assert!(library.run_fixity_page(&plan, 10)?.complete());
+        assert!(library
+            .scheduled_fixity_history(&schedule, None, 10)?
+            .is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn fixity_execution_rejects_an_unrelated_plan_kind() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let (library, plan) = approved_fixity_fixture(temporary.path())?;
+        let saved = library.durable_plan(plan.id())?;
+        let unrelated = library.create_durable_plan(
+            PlanKind::Manifest,
+            saved.request(),
+            saved.preview(),
+            Some(plan.asset_count()),
+        )?;
+        library.approve_durable_plan(&unrelated)?;
+        let mut serialized = serde_json::to_value(&plan)?;
+        serialized["id"] = json!(unrelated);
+        let changed = serde_json::from_value(serialized)?;
+
+        require_changed_fixity_rejection(&library, &changed, "unrelated plan kind")
+    }
+
+    #[test]
+    fn fixity_execution_rejects_an_unrelated_audit_preview() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let (library, plan) = approved_fixity_fixture(temporary.path())?;
+        let saved = library.durable_plan(plan.id())?;
+        let unrelated = library.create_durable_plan(
+            PlanKind::Audit,
+            saved.request(),
+            &json!({"unrelated": true}),
+            Some(plan.asset_count()),
+        )?;
+        library.approve_durable_plan(&unrelated)?;
+        let mut serialized = serde_json::to_value(&plan)?;
+        serialized["id"] = json!(unrelated);
+        let changed = serde_json::from_value(serialized)?;
+
+        require_changed_fixity_rejection(&library, &changed, "unrelated audit preview")
+    }
+
+    #[test]
+    fn fixity_cancellation_rejects_changed_review_before_start() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let (library, plan) = approved_fixity_fixture(temporary.path())?;
+        let schedule = library.schedule_fixity(
+            FixityMode::Deep,
+            std::time::Duration::from_secs(60),
+            Utc::now() + TimeDelta::days(1),
+        )?;
+        library.request_plan_cancellation(plan.id())?;
+        let mut serialized = serde_json::to_value(&plan)?;
+        serialized["mode"] = json!("quick");
+        serialized["asset_count"] = json!(0);
+        serialized["schedule_id"] = json!(schedule);
+        let changed = serde_json::from_value(serialized)?;
+
+        require_changed_fixity_rejection(&library, &changed, "changed cancellation review")?;
+        assert!(!library.run_fixity_page(&plan, 10)?.complete());
+        assert_eq!(
+            library.durable_plan(plan.id())?.state(),
+            PlanState::Cancelled
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fixity_resume_rejects_changed_review() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let (library, plan) = approved_fixity_fixture(temporary.path())?;
+        let first = library.run_fixity_page(&plan, 1)?;
+        library.pause_durable_plan(plan.id(), first.cursor())?;
+        let mut serialized = serde_json::to_value(&plan)?;
+        serialized["mode"] = json!("quick");
+        let changed = serde_json::from_value(serialized)?;
+
+        require_changed_fixity_rejection(&library, &changed, "changed resume review")?;
+        assert_eq!(library.durable_plan(plan.id())?.state(), PlanState::Paused);
+        let resumed = library.run_fixity_page(&plan, 10)?;
+        assert!(resumed.complete());
+        assert_eq!(resumed.checked(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn cancelled_fixity_rejects_repeated_execution_without_history_changes() -> Result<()> {
+        let library = Library::open_in_memory()?;
+        let now = Utc::now();
+        let schedule =
+            library.schedule_fixity(FixityMode::Deep, std::time::Duration::from_secs(60), now)?;
+        let plans = library.plan_due_fixity(now, 1)?;
+        let plan = &plans[0];
+        library.request_plan_cancellation(plan.id())?;
+        library.run_fixity_page(plan, 10)?;
+        let before = fixity_review_snapshot(&library, plan.id())?;
+
+        let repeated = library.run_fixity_page(plan, 10);
+
+        assert_eq!(
+            fixity_review_snapshot(&library, plan.id())?,
+            before,
+            "repeated cancellation changed event history or schedule completion"
+        );
+        assert!(repeated.is_err());
+        assert_eq!(
+            library.scheduled_fixity_history(&schedule, None, 10)?[0].state(),
+            PlanState::Cancelled
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn alternate_fixity_schedule_id_forms_find_the_same_schedule() -> Result<()> {
+        let library = Library::open_in_memory()?;
+        let schedule = library.schedule_fixity(
+            FixityMode::Quick,
+            std::time::Duration::from_secs(60),
+            Utc::now(),
+        )?;
+        let id = uuid::Uuid::parse_str(schedule.as_str())
+            .map_err(|error| Error::Operation(error.to_string()))?;
+        for form in [
+            id.simple().to_string(),
+            id.braced().to_string(),
+            id.urn().to_string(),
+            schedule.as_str().to_ascii_uppercase(),
+        ] {
+            let parsed = FixityScheduleId::parse(form.clone())?;
+            assert!(
+                library.set_fixity_schedule_enabled(&parsed, false).is_ok(),
+                "schedule lookup missed an accepted UUID form: {form}"
+            );
+            assert_eq!(&parsed, &schedule);
+            let decoded: FixityScheduleId = serde_json::from_value(json!(form))?;
+            assert_eq!(decoded, schedule);
+            library.set_fixity_schedule_enabled(&parsed, true)?;
+        }
+        Ok(())
+    }
+
     #[test]
     fn deep_fixity_is_paged_resumable_and_retains_history() -> Result<()> {
         let temporary = tempfile::tempdir()?;
@@ -1377,7 +1671,7 @@ mod tests {
             library.durable_plan(plans[0].id())?.state(),
             PlanState::Approved
         );
-        assert!(library.plan_due_fixity(now, 10)?.is_empty());
+        assert_eq!(library.plan_due_fixity(now, 10)?, [] as [FixityPlan; 0]);
 
         let progress = library.run_fixity_page(&plans[0], 10)?;
         assert!(progress.complete());

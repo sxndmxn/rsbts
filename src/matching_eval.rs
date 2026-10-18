@@ -10,15 +10,42 @@ pub const MIN_HARD_NEGATIVE_CASES: u64 = 30_000;
 pub const MIN_RELEASE_GROUP_STRATA: usize = 100;
 const MAX_STRATUM_FRACTION: f64 = 0.01;
 const Z_95_ONE_SIDED: f64 = 1.644_853_626_951_472_2;
+const AUTOACCEPT_POLICY_VERSION: u32 = 1;
 
 /// One independently identified same-release-group, wrong-edition case.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct HardNegativeCase {
     case_id: String,
     release_group_id: String,
     expected_edition_id: String,
     competing_edition_id: String,
     accepted: bool,
+}
+
+impl<'de> Deserialize<'de> for HardNegativeCase {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            case_id: String,
+            release_group_id: String,
+            expected_edition_id: String,
+            competing_edition_id: String,
+            accepted: bool,
+        }
+
+        let value = Wire::deserialize(deserializer)?;
+        Self::new(
+            value.case_id,
+            value.release_group_id,
+            value.expected_edition_id,
+            value.competing_edition_id,
+            value.accepted,
+        )
+        .map_err(serde::de::Error::custom)
+    }
 }
 
 impl HardNegativeCase {
@@ -55,7 +82,7 @@ impl HardNegativeCase {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct MatchingEvaluationReport {
     case_count: u64,
     accepted_count: u64,
@@ -68,7 +95,100 @@ pub struct MatchingEvaluationReport {
     independent_case_ids: bool,
 }
 
+impl<'de> Deserialize<'de> for MatchingEvaluationReport {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            case_count: u64,
+            accepted_count: u64,
+            false_accept_count: u64,
+            release_group_strata: usize,
+            largest_stratum: u64,
+            acceptance_coverage: f64,
+            false_accept_rate: f64,
+            false_accept_rate_upper_95: f64,
+            independent_case_ids: bool,
+        }
+
+        let value = Wire::deserialize(deserializer)?;
+        let report = Self {
+            case_count: value.case_count,
+            accepted_count: value.accepted_count,
+            false_accept_count: value.false_accept_count,
+            release_group_strata: value.release_group_strata,
+            largest_stratum: value.largest_stratum,
+            acceptance_coverage: value.acceptance_coverage,
+            false_accept_rate: value.false_accept_rate,
+            false_accept_rate_upper_95: value.false_accept_rate_upper_95,
+            independent_case_ids: value.independent_case_ids,
+        };
+        report.validate().map_err(serde::de::Error::custom)?;
+        Ok(report)
+    }
+}
+
 impl MatchingEvaluationReport {
+    // Aggregate validation cannot verify the source cases or their provenance.
+    fn validate(&self) -> Result<()> {
+        if self.accepted_count > self.case_count
+            || self.false_accept_count != self.accepted_count
+            || (!self.independent_case_ids && self.case_count < 2)
+        {
+            return Err(Error::Operation(
+                "inconsistent hard-negative evaluation counts".into(),
+            ));
+        }
+        let strata = u64::try_from(self.release_group_strata).map_err(|_error| {
+            Error::Operation("evaluation strata exceed the count range".into())
+        })?;
+        let valid_strata = if self.case_count == 0 {
+            strata == 0 && self.largest_stratum == 0
+        } else {
+            strata > 0
+                && strata <= self.case_count
+                && self.largest_stratum >= self.case_count.div_ceil(strata)
+                && self.largest_stratum <= self.case_count - strata + 1
+        };
+        if !valid_strata {
+            return Err(Error::Operation(
+                "inconsistent hard-negative evaluation strata".into(),
+            ));
+        }
+        let denominator = self.case_count.max(1) as f64;
+        for (name, actual, expected) in [
+            (
+                "acceptance coverage",
+                self.acceptance_coverage,
+                self.accepted_count as f64 / denominator,
+            ),
+            (
+                "false accept rate",
+                self.false_accept_rate,
+                self.false_accept_count as f64 / denominator,
+            ),
+            (
+                "false accept upper bound",
+                self.false_accept_rate_upper_95,
+                wilson_upper_95(self.false_accept_count, self.case_count),
+            ),
+        ] {
+            // JSON round trips can change the final floating-point bit.
+            let tolerance = expected.abs() * f64::EPSILON * 4.0;
+            if !actual.is_finite()
+                || !(0.0..=1.0).contains(&actual)
+                || (actual - expected).abs() > tolerance
+            {
+                return Err(Error::Operation(format!(
+                    "inconsistent hard-negative evaluation {name}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub const fn case_count(&self) -> u64 {
         self.case_count
@@ -91,10 +211,32 @@ impl MatchingEvaluationReport {
 }
 
 /// Proof object required by any future unattended fuzzy exact-release path.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AutoacceptAttestation {
     report: MatchingEvaluationReport,
     policy_version: u32,
+}
+
+impl<'de> Deserialize<'de> for AutoacceptAttestation {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            report: MatchingEvaluationReport,
+            policy_version: u32,
+        }
+
+        let value = Wire::deserialize(deserializer)?;
+        if value.policy_version != AUTOACCEPT_POLICY_VERSION {
+            return Err(serde::de::Error::custom(Error::Operation(format!(
+                "unsupported autoaccept policy version: {}",
+                value.policy_version
+            ))));
+        }
+        Self::from_report(value.report).map_err(serde::de::Error::custom)
+    }
 }
 
 impl AutoacceptAttestation {
@@ -116,7 +258,7 @@ impl AutoacceptAttestation {
         }
         Ok(Self {
             report,
-            policy_version: 1,
+            policy_version: AUTOACCEPT_POLICY_VERSION,
         })
     }
 
@@ -182,9 +324,8 @@ fn wilson_upper_95(successes: u64, trials: u64) -> f64 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn attestation_requires_30k_independent_balanced_zero_false_accepts() -> Result<()> {
-        let cases = (0..MIN_HARD_NEGATIVE_CASES)
+    fn balanced_cases() -> Result<Vec<HardNegativeCase>> {
+        (0..MIN_HARD_NEGATIVE_CASES)
             .map(|index| {
                 HardNegativeCase::new(
                     format!("case-{index}"),
@@ -194,8 +335,12 @@ mod tests {
                     false,
                 )
             })
-            .collect::<Result<Vec<_>>>()?;
-        let report = evaluate_hard_negatives(cases);
+            .collect()
+    }
+
+    #[test]
+    fn attestation_requires_30k_independent_balanced_zero_false_accepts() -> Result<()> {
+        let report = evaluate_hard_negatives(balanced_cases()?);
         assert_eq!(report.false_accept_count(), 0);
         assert!(report.acceptance_coverage().abs() < f64::EPSILON);
         assert!(report.false_accept_rate_upper_95() < 0.000_1);
@@ -204,13 +349,22 @@ mod tests {
     }
 
     #[test]
-    fn one_false_accept_or_duplicate_case_blocks_attestation() -> Result<()> {
-        let cases = vec![
-            HardNegativeCase::new("same", "group", "a", "b", false)?,
-            HardNegativeCase::new("same", "group", "c", "d", true)?,
-        ];
+    fn one_false_accept_blocks_an_otherwise_valid_attestation() -> Result<()> {
+        let mut cases = balanced_cases()?;
+        cases[0].accepted = true;
         let report = evaluate_hard_negatives(cases);
         assert_eq!(report.false_accept_count(), 1);
+        assert!(AutoacceptAttestation::from_report(report).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_case_blocks_an_otherwise_valid_attestation() -> Result<()> {
+        let mut cases = balanced_cases()?;
+        let duplicate_id = cases[0].case_id.clone();
+        cases[1].case_id = duplicate_id;
+        let report = evaluate_hard_negatives(cases);
+        assert_eq!(report.false_accept_count(), 0);
         assert!(AutoacceptAttestation::from_report(report).is_err());
         Ok(())
     }

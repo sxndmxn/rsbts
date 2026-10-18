@@ -94,6 +94,14 @@ impl Query {
         input.parse()
     }
 
+    /// Return whether the query contains a filter rather than only sort terms.
+    #[must_use]
+    pub fn has_filters(&self) -> bool {
+        self.terms
+            .iter()
+            .any(|term| matches!(term, QueryTerm::FullText(_) | QueryTerm::Field { .. }))
+    }
+
     pub fn compile(&self) -> CompiledQuery {
         let mut condition_groups = vec![Vec::new()];
         let mut order_by = Vec::new();
@@ -143,7 +151,7 @@ impl Query {
         let where_clause = if conditions.is_empty() {
             String::new()
         } else {
-            format!(" WHERE {}", conditions.join(" OR "))
+            format!(" WHERE ({})", conditions.join(" OR "))
         };
         let order_clause = if order_by.is_empty() {
             " ORDER BY artist, album, disc, track".to_string()
@@ -251,6 +259,9 @@ fn tokenize(input: &str) -> Result<Vec<String>> {
 
     for character in input.chars() {
         if escaped {
+            if !matches!(character, '\\' | '"') {
+                current.push('\\');
+            }
             current.push(character);
             escaped = false;
             continue;
@@ -428,7 +439,34 @@ fn compile_field(
     if let QueryField::Flexible(name) = field {
         parameters.push(Value::Text(name.clone()));
         let expression = "json_extract(entity_metadata.value_json, '$.value')";
-        let predicate = compile_expression(expression, operation, parameters);
+        let predicate = if matches!(
+            operation,
+            FieldOperation::Exact(_) | FieldOperation::Range { .. }
+        ) {
+            let numeric = match operation {
+                FieldOperation::Exact(value) => is_numeric_bound(value),
+                FieldOperation::Range { start, end } => {
+                    start.iter().chain(end).all(|value| is_numeric_bound(value))
+                }
+                _ => false,
+            };
+            let numeric_predicate = if numeric {
+                compile_expression(
+                    &format!("CAST({expression} AS NUMERIC)"),
+                    operation,
+                    parameters,
+                )
+            } else {
+                "0".into()
+            };
+            let text_predicate = compile_expression(expression, operation, parameters);
+            format!(
+                "CASE WHEN entity_metadata.value_type IN ('integer', 'float')
+                 THEN ({numeric_predicate}) ELSE ({text_predicate}) END"
+            )
+        } else {
+            compile_expression(expression, operation, parameters)
+        };
         return format!(
             "EXISTS (SELECT 1 FROM entity_metadata
              WHERE entity_type = 'item' AND entity_id = items.id
@@ -437,6 +475,13 @@ fn compile_field(
     }
     let column = field.column().unwrap_or("id");
     compile_expression(column, operation, parameters)
+}
+
+fn is_numeric_bound(value: &str) -> bool {
+    value
+        .trim_matches(|character: char| character.is_ascii_whitespace())
+        .parse::<f64>()
+        .is_ok_and(f64::is_finite)
 }
 
 fn compile_expression(
@@ -506,7 +551,8 @@ fn parse_relative_date(value: &str) -> Option<String> {
     if days < 0 {
         return None;
     }
-    let date = chrono::Utc::now().checked_sub_signed(chrono::Duration::days(days))?;
+    let duration = chrono::Duration::try_days(days)?;
+    let date = chrono::Utc::now().checked_sub_signed(duration)?;
     Some(date.format("%Y-%m-%d").to_string())
 }
 
@@ -516,9 +562,59 @@ mod tests {
 
     use super::*;
 
+    fn flexible_query_ids(input: &str) -> Result<Vec<i64>> {
+        let connection = rusqlite::Connection::open_in_memory()?;
+        connection.execute_batch(
+            "CREATE TABLE items (
+                id INTEGER PRIMARY KEY, artist TEXT, album TEXT, disc INTEGER, track INTEGER
+             );
+             CREATE TABLE entity_metadata (
+                entity_type TEXT, entity_id INTEGER, field TEXT, value_type TEXT, value_json TEXT
+             );",
+        )?;
+        let values = [
+            ("integer", serde_json::json!(2)),
+            ("float", serde_json::json!(2.5)),
+            ("integer", serde_json::json!(12)),
+            ("string", serde_json::json!("2")),
+            ("string", serde_json::json!("12")),
+            ("boolean", serde_json::json!(true)),
+            ("string_list", serde_json::json!(["2"])),
+            ("integer", serde_json::Value::Null),
+            ("string", serde_json::json!("2broken")),
+            ("float", serde_json::json!(0.0)),
+            ("float", serde_json::json!(2.0)),
+            ("string", serde_json::json!("2.5")),
+            ("integer", serde_json::json!(i64::MAX)),
+            ("integer", serde_json::json!(i64::MIN)),
+            ("float", serde_json::json!(f64::MAX)),
+        ];
+        for (id, (value_type, value)) in (1_i64..).zip(values) {
+            connection.execute("INSERT INTO items (id, track) VALUES (?1, ?1)", [id])?;
+            connection.execute(
+                "INSERT INTO entity_metadata
+                 (entity_type, entity_id, field, value_type, value_json)
+                 VALUES ('item', ?1, 'rating', ?2, ?3)",
+                rusqlite::params![
+                    id,
+                    value_type,
+                    serde_json::json!({"type": value_type, "value": value}).to_string()
+                ],
+            )?;
+        }
+        let compiled = Query::parse(&format!("{input} track+"))?.compile();
+        let mut statement = connection.prepare(&compiled.sql)?;
+        let ids = statement
+            .query_map(rusqlite::params_from_iter(compiled.parameters), |row| {
+                row.get(0)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(ids)
+    }
+
     proptest! {
         #[test]
-        fn arbitrary_query_text_never_panics_or_interpolates_a_successful_parse(
+        fn arbitrary_query_text_compiles_to_bounded_ordered_sql(
             input in ".{0,2048}"
         ) {
             if let Ok(query) = Query::parse(&input) {
@@ -581,6 +677,64 @@ mod tests {
                 Value::Text("Master of Reality".into())
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn quoted_values_preserve_literal_backslashes_and_existing_escapes() -> Result<()> {
+        let compiled =
+            Query::parse(r#"title::"\d+\s+\w+" path:"C:\Music\Artist\Song.flac" title:"a\"b\\c""#)?
+                .compile();
+        assert_eq!(
+            compiled.parameters,
+            [
+                Value::Text("\\d+\\s+\\w+".into()),
+                Value::Text("%C:\\Music\\Artist\\Song.flac%".into()),
+                Value::Text("%a\"b\\c%".into()),
+            ]
+        );
+        assert!(Query::parse(r#"title:"trailing\"#).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn flexible_numeric_exact_queries_match_integer_and_float_values() -> Result<()> {
+        assert_eq!(flexible_query_ids("flex.rating:=2")?, [1, 4, 11]);
+        assert_eq!(flexible_query_ids("flex.rating:=2.5")?, [2, 12]);
+        assert_eq!(flexible_query_ids("flex.rating:=2broken")?, [9]);
+        assert_eq!(flexible_query_ids("flex.rating:=1")?, [] as [i64; 0]);
+        assert_eq!(flexible_query_ids("flex.rating:=0")?, [10]);
+        assert_eq!(
+            flexible_query_ids("flex.rating:=9223372036854775807")?,
+            [13]
+        );
+        assert_eq!(
+            flexible_query_ids("flex.rating:=-9223372036854775808")?,
+            [14]
+        );
+        assert_eq!(
+            flexible_query_ids("flex.rating:=1.7976931348623157e308")?,
+            [15]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn flexible_numeric_ranges_preserve_number_order_and_string_semantics() -> Result<()> {
+        assert_eq!(
+            flexible_query_ids("flex.rating:1..3")?,
+            [1, 2, 4, 5, 9, 11, 12]
+        );
+        assert_eq!(
+            flexible_query_ids("flex.rating:..3broken")?,
+            [4, 5, 6, 9, 12]
+        );
+        for invalid in ["3broken", "NaN", "inf", "-inf", "1e309"] {
+            let ids = flexible_query_ids(&format!("flex.rating:..{invalid}"))?;
+            assert!(ids
+                .iter()
+                .all(|id| ![1, 2, 3, 10, 11, 13, 14, 15].contains(id)));
+        }
         Ok(())
     }
 

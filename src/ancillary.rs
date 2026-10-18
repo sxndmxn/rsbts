@@ -13,8 +13,8 @@ use crate::asset::{digest_file, digest_reader};
 use crate::db::{file_identity, file_object_identity, JournalFile, Library, OperationKind};
 use crate::fsops::AnchoredRoot;
 use crate::naming::{collision_key, sanitize_component, NamingProfile};
-use crate::operations::{PlanId, PlanKind, PlanState};
-use crate::roots::{RootId, RootState};
+use crate::operations::{DurablePlan, PlanId, PlanKind, PlanState};
+use crate::roots::RootId;
 use crate::tags::is_audio_file;
 use crate::{Error, Result};
 
@@ -215,12 +215,7 @@ impl Library {
             }
         }
         let root = self.library_root(root_id)?;
-        if root.state() != RootState::Online {
-            return Err(Error::Root(
-                "ancillary destination root must be online".into(),
-            ));
-        }
-        root.capabilities().require_safe_mutation()?;
+        root.require_safe_mutation()?;
         let output_root = AnchoredRoot::open(root.path())?;
         let destination_directory =
             crate::naming::sanitize_relative_path(destination_directory, profile)?;
@@ -241,6 +236,7 @@ impl Library {
             }
             let destination_relative = destination_directory.join(filename);
             let destination = root.path().join(&destination_relative);
+            self.require_path_root_mutation(&destination)?;
             require_destination_absent(&output_root, &destination)?;
             let before = std::fs::metadata(&candidate.source)?;
             let digests = digest_file(&candidate.source)?;
@@ -274,12 +270,14 @@ impl Library {
             "relationship": relationship,
             "profile": profile,
         });
-        let preview = json!({
-            "file_count": files.len(),
-            "byte_count": byte_count,
-            "kinds": files.iter().map(|file| file.kind).collect::<Vec<_>>(),
-            "no_clobber": true,
-        });
+        let preview = ancillary_preview(
+            root_id,
+            root.path(),
+            parent_asset_id,
+            relationship,
+            &files,
+            byte_count,
+        );
         let total = u64::try_from(files.len())
             .map_err(|error| Error::Import(format!("ancillary plan is too large: {error}")))?;
         let id =
@@ -296,24 +294,48 @@ impl Library {
     }
 
     pub fn approve_ancillary_import(&self, plan: &AncillaryImportPlan) -> Result<()> {
+        self.require_ancillary_review(plan)?;
         self.approve_durable_plan(plan.id())
+    }
+
+    fn require_ancillary_review(&self, plan: &AncillaryImportPlan) -> Result<DurablePlan> {
+        let preview = ancillary_preview(
+            &plan.root_id,
+            &plan.root_path,
+            plan.parent_asset_id.as_deref(),
+            &plan.relationship,
+            &plan.files,
+            plan.byte_count,
+        );
+        let saved = self.durable_plan(plan.id())?;
+        if saved.preview() != &preview {
+            return Err(Error::Operation(
+                "ancillary review evidence is incomplete or changed. Create and approve a new plan"
+                    .into(),
+            ));
+        }
+        // The execution payload binds every plan field. Request-only options remain in saved planning data.
+        self.require_saved_plan(
+            plan.id(),
+            PlanKind::AncillaryImport,
+            saved.request(),
+            &preview,
+        )
     }
 
     pub fn execute_ancillary_import(
         &mut self,
         plan: &AncillaryImportPlan,
     ) -> Result<AncillaryImportReceipt> {
-        self.start_durable_plan(plan.id())?;
+        self.require_ancillary_review(plan)?.require_approved()?;
         let root_record = self.library_root(&plan.root_id)?;
-        if root_record.path() != plan.root_path || root_record.state() != RootState::Online {
-            return Err(self.fail_ancillary(
-                plan.id(),
-                Error::Root("ancillary root changed after preview".into()),
-            ));
+        root_record.require_safe_mutation()?;
+        if root_record.path() != plan.root_path {
+            return Err(Error::Root("ancillary root changed after preview".into()));
         }
-        root_record.capabilities().require_safe_mutation()?;
         let root = AnchoredRoot::open(&plan.root_path)?;
         for file in &plan.files {
+            self.require_path_root_mutation(&file.destination)?;
             revalidate_source(file)?;
             require_destination_absent(&root, &file.destination)?;
         }
@@ -335,6 +357,15 @@ impl Library {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        if let Err(error) = self.start_durable_plan(plan.id()) {
+            if self
+                .durable_plan(plan.id())
+                .is_ok_and(|stored| stored.state() == PlanState::Running)
+            {
+                return Err(self.fail_ancillary(plan.id(), error));
+            }
+            return Err(error);
+        }
         let operation = match self.create_operation_for_plan(
             OperationKind::AncillaryCopy,
             &journals,
@@ -515,6 +546,30 @@ impl Library {
     }
 }
 
+fn ancillary_preview(
+    root_id: &RootId,
+    root_path: &Path,
+    parent_asset_id: Option<&str>,
+    relationship: &str,
+    files: &[PlannedAncillary],
+    byte_count: u64,
+) -> serde_json::Value {
+    json!({
+        "file_count": files.len(),
+        "byte_count": byte_count,
+        "kinds": files.iter().map(|file| file.kind).collect::<Vec<_>>(),
+        "no_clobber": true,
+        "execution": {
+            "root_id": root_id,
+            "root_path": root_path,
+            "parent_asset_id": parent_asset_id,
+            "relationship": relationship,
+            "files": files,
+            "byte_count": byte_count,
+        },
+    })
+}
+
 fn revalidate_source(file: &PlannedAncillary) -> Result<()> {
     let before = std::fs::metadata(&file.source)?;
     if file_identity(&before) != file.source_identity || before.len() != file.byte_size {
@@ -555,7 +610,7 @@ fn sibling_stage(destination: &Path, transfer: uuid::Uuid) -> Result<PathBuf> {
     let mut staged = std::ffi::OsString::from(".");
     staged.push(name);
     staged.push(format!(".rsbts-{transfer}.ancillary-stage"));
-    Ok(destination.with_file_name(staged))
+    Ok(crate::fsops::bounded_sibling_path(destination, staged))
 }
 
 fn validate_relationship(value: &str) -> Result<()> {
@@ -609,6 +664,280 @@ mod tests {
     use super::*;
     use crate::fixity::{FixityMode, FixityResultState};
 
+    fn planned_ancillary_fixture(directory: &Path) -> Result<(Library, AncillaryImportPlan)> {
+        let source = directory.join("disc.cue");
+        std::fs::write(&source, b"FILE track.flac WAVE")?;
+        let root = directory.join("library");
+        std::fs::create_dir(&root)?;
+        let library = Library::open_in_memory()?;
+        let root_id = library.register_root(&root)?.id().clone();
+        let plan = library.plan_ancillary_import(
+            &root_id,
+            Path::new("Artist/Album"),
+            &[AncillaryCandidate::from_path(&source)?],
+            None,
+            "release-ancillary",
+            NamingProfile::Portable,
+        )?;
+        Ok((library, plan))
+    }
+
+    fn approved_ancillary_fixture(directory: &Path) -> Result<(Library, AncillaryImportPlan)> {
+        let (library, plan) = planned_ancillary_fixture(directory)?;
+        library.approve_ancillary_import(&plan)?;
+        Ok((library, plan))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn typed_approval_rejects_changed_ancillary_content() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let (library, plan) = planned_ancillary_fixture(temporary.path())?;
+        let events = serde_json::to_value(library.plan_events(plan.id())?)?;
+        let mut serialized = serde_json::to_value(&plan)?;
+        serialized["files"][0]["destination_relative"] = json!("Unreviewed/disc.cue");
+        serialized["files"][0]["destination"] = json!(plan.root_path.join("Unreviewed/disc.cue"));
+        let changed: AncillaryImportPlan = serde_json::from_value(serialized)?;
+
+        assert!(
+            library.approve_ancillary_import(&changed).is_err(),
+            "changed ancillary review approved a different saved plan"
+        );
+        assert_eq!(library.durable_plan(plan.id())?.state(), PlanState::Planned);
+        assert_eq!(
+            serde_json::to_value(library.plan_events(plan.id())?)?,
+            events
+        );
+        assert!(!changed.files[0].destination.exists());
+        library.approve_ancillary_import(&plan)?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn changed_ancillary_plan_cannot_reuse_approval() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let (mut library, plan) = approved_ancillary_fixture(temporary.path())?;
+        let mut serialized = serde_json::to_value(&plan)?;
+        serialized["files"][0]["destination_relative"] = json!("Unreviewed/disc.cue");
+        serialized["files"][0]["destination"] = json!(plan.root_path.join("Unreviewed/disc.cue"));
+        let changed: AncillaryImportPlan = serde_json::from_value(serialized)?;
+
+        assert!(
+            library.execute_ancillary_import(&changed).is_err(),
+            "an edited ancillary plan reused approval"
+        );
+        assert!(!changed.files[0].destination.exists());
+        assert_eq!(
+            library.durable_plan(plan.id())?.state(),
+            PlanState::Approved
+        );
+        library.execute_ancillary_import(&plan)?;
+        assert!(plan.files[0].destination.exists());
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn ancillary_import_rejects_approval_from_another_plan_kind() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let (mut library, plan) = approved_ancillary_fixture(temporary.path())?;
+        let saved = library.durable_plan(plan.id())?;
+        let audit = library.create_durable_plan(
+            PlanKind::Audit,
+            saved.request(),
+            saved.preview(),
+            Some(1),
+        )?;
+        library.approve_durable_plan(&audit)?;
+        let mut serialized = serde_json::to_value(&plan)?;
+        serialized["id"] = json!(audit);
+        let changed: AncillaryImportPlan = serde_json::from_value(serialized)?;
+
+        assert!(
+            library.execute_ancillary_import(&changed).is_err(),
+            "an audit approval permitted ancillary import"
+        );
+        assert!(!plan.files[0].destination.exists());
+        assert_eq!(library.durable_plan(&audit)?.state(), PlanState::Approved);
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn ancillary_import_requires_complete_saved_review() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let (mut library, plan) = approved_ancillary_fixture(temporary.path())?;
+        library.conn.execute("UPDATE durable_plans SET preview_json = json_remove(preview_json, '$.execution') WHERE id = ?1", [plan.id().as_str()])?;
+
+        let result = library.execute_ancillary_import(&plan);
+        assert!(
+            result.is_err(),
+            "ancillary import accepted incomplete older review evidence"
+        );
+        assert!(result
+            .err()
+            .is_some_and(|error| error.to_string().contains("new plan")));
+        assert!(!plan.files[0].destination.exists());
+        assert_eq!(
+            library.durable_plan(plan.id())?.state(),
+            PlanState::Approved
+        );
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn ancillary_pre_journal_errors_preserve_approved_state() -> Result<()> {
+        for case in ["changed-source", "late-collision", "missing-root"] {
+            let temporary = tempfile::tempdir()?;
+            let (mut library, plan) = approved_ancillary_fixture(temporary.path())?;
+            match case {
+                "changed-source" => std::fs::write(&plan.files[0].source, b"changed source")?,
+                "late-collision" => {
+                    std::fs::create_dir_all(
+                        plan.files[0].destination.parent().ok_or_else(|| {
+                            Error::Import("test destination has no parent".into())
+                        })?,
+                    )?;
+                    std::fs::write(&plan.files[0].destination, b"preserve collision")?;
+                }
+                _ => std::fs::remove_dir(&plan.root_path)?,
+            }
+            let source = std::fs::read(&plan.files[0].source)?;
+
+            assert!(library.execute_ancillary_import(&plan).is_err());
+            assert_eq!(
+                library.durable_plan(plan.id())?.state(),
+                PlanState::Approved,
+                "{case} left the plan running"
+            );
+            assert_eq!(std::fs::read(&plan.files[0].source)?, source);
+            if case == "late-collision" {
+                assert_eq!(
+                    std::fs::read(&plan.files[0].destination)?,
+                    b"preserve collision"
+                );
+            }
+            let journals: u64 =
+                library
+                    .conn
+                    .query_row("SELECT COUNT(*) FROM operation_journal", [], |row| {
+                        row.get(0)
+                    })?;
+            assert_eq!(journals, 0);
+            assert_eq!(
+                library.recover_pending()?.unresolved,
+                [] as [std::string::String; 0]
+            );
+            assert_eq!(
+                library.recover_pending()?.unresolved,
+                [] as [std::string::String; 0]
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn ancillary_start_errors_do_not_leave_running_plans() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let (mut library, plan) = approved_ancillary_fixture(temporary.path())?;
+        let (result, hits) =
+            crate::failpoints::run_failing(0, || library.execute_ancillary_import(&plan));
+        assert!(result.is_err());
+        assert_eq!(hits.first(), Some(&"db.plan-transition"));
+        assert_eq!(
+            library.durable_plan(plan.id())?.state(),
+            PlanState::Failed,
+            "a committed start error left the plan running"
+        );
+        assert!(!plan.files[0].destination.exists());
+        assert_eq!(
+            library.recover_pending()?.unresolved,
+            [] as [std::string::String; 0]
+        );
+        assert_eq!(
+            library.recover_pending()?.unresolved,
+            [] as [std::string::String; 0]
+        );
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn ancillary_planning_rejects_disabled_child_roots() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let (library, plan) = approved_ancillary_fixture(temporary.path())?;
+        let nested = library.register_root(
+            plan.files[0]
+                .destination
+                .parent()
+                .ok_or_else(|| Error::Import("test destination has no parent".into()))?,
+        )?;
+        library.set_root_state(nested.id(), crate::roots::RootState::Offline)?;
+        let before: u64 =
+            library
+                .conn
+                .query_row("SELECT COUNT(*) FROM durable_plans", [], |row| row.get(0))?;
+
+        assert!(
+            library
+                .plan_ancillary_import(
+                    &plan.root_id,
+                    Path::new("Artist/Album"),
+                    &[AncillaryCandidate::from_path(&plan.files[0].source)?],
+                    None,
+                    "release-ancillary",
+                    NamingProfile::Portable,
+                )
+                .is_err(),
+            "ancillary planning accepted a disabled child root"
+        );
+        let after: u64 =
+            library
+                .conn
+                .query_row("SELECT COUNT(*) FROM durable_plans", [], |row| row.get(0))?;
+        assert_eq!(after, before);
+        assert!(!plan.files[0].destination.exists());
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn ancillary_execution_rejects_disabled_child_roots() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let (mut library, plan) = approved_ancillary_fixture(temporary.path())?;
+        let nested = library.register_root(
+            plan.files[0]
+                .destination
+                .parent()
+                .ok_or_else(|| Error::Import("test destination has no parent".into()))?,
+        )?;
+        library.set_root_state(nested.id(), crate::roots::RootState::Offline)?;
+
+        assert!(
+            library.execute_ancillary_import(&plan).is_err(),
+            "ancillary execution wrote into a disabled child root"
+        );
+        assert_eq!(
+            library.durable_plan(plan.id())?.state(),
+            PlanState::Approved
+        );
+        assert!(!plan.files[0].destination.exists());
+        let journals: u64 =
+            library
+                .conn
+                .query_row("SELECT COUNT(*) FROM operation_journal", [], |row| {
+                    row.get(0)
+                })?;
+        assert_eq!(journals, 0);
+        library.set_root_state(nested.id(), crate::roots::RootState::Online)?;
+        library.execute_ancillary_import(&plan)?;
+        assert!(plan.files[0].destination.exists());
+        Ok(())
+    }
+
     #[test]
     fn ancillary_scan_classifies_known_files_and_retains_unknown_files() -> Result<()> {
         let temporary = tempfile::tempdir()?;
@@ -616,7 +945,7 @@ mod tests {
         std::fs::write(temporary.path().join("rip.log"), b"Exact Audio Copy")?;
         std::fs::write(temporary.path().join("notes.xyz"), b"notes")?;
         let scan = scan_ancillary_paths(&[temporary.path().to_path_buf()], false);
-        assert!(scan.issues().is_empty());
+        assert_eq!(scan.issues(), [] as [String; 0]);
         assert_eq!(scan.candidates().len(), 3);
         assert!(scan
             .candidates()

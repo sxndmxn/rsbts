@@ -29,6 +29,41 @@ derived from [media-library-research.md](docs/media-library-research.md).
 - Mutating selections are bounded to 9,999 rows. Lists, histories, schedules,
   fixity work, and results use explicit limits or keyset pages.
 
+Purge checks file identity after acquisition and again before deletion.
+Changed files remain available for recovery review.
+Recovery keeps one parent directory handle while it acquires, checks, and
+deletes a retained file. Missing retained files receive completed cleanup
+records. Files restored during rollback remain eligible for a later purge.
+
+Successful recovery updates the journal and linked active plan in one transaction.
+Committed work completes the plan. Rolled-back work fails the plan.
+Recovery preserves terminal plans and their existing events.
+Uncertain file ownership leaves the operation pending for review.
+
+Database symbolic links use the resolved database path for locking and writes.
+On Unix, rsbts rejects database files with multiple hard links.
+
+Registered roots must be online for import, move, tag, artwork, path, ancillary,
+removal, and purge file changes.
+Catalog-only import and removal remain available when a root is offline.
+Purge checks the retained file's original root policy.
+Import, move, and ancillary operations check each destination for disabled child roots.
+Equivalent root paths reuse the saved identity and policy.
+
+Root paths containing `..` fail before directory creation.
+Moves require source files to match their stored verification evidence.
+Unverified or replaced files require review and explicit verification before a move.
+
+Tag, artwork, path, ancillary, removal, manifest, and restore execution must
+match the saved approved plan.
+Changes to the reviewed plan require a new preview and approval.
+Previously saved plans with incomplete approval evidence also require a new
+preview and approval.
+Typed approval methods check the complete saved request and preview.
+
+Dry-run snapshots remain read-only after in-memory migration.
+They cannot create durable plans or run recovery.
+
 ## Install
 
 Rust 1.89 or newer is required. Dependency resolution is locked.
@@ -101,10 +136,13 @@ field-level evidence, contradictory evidence, candidate completeness, and
 abstention reasons. Incomplete result sets and single candidates never receive
 synthetic uniqueness evidence.
 
-Unattended fuzzy exact-release acceptance is disabled unless a checked
-evaluation attestation proves zero false accepts in at least 30,000 independent,
-release-stratified hard negatives. Acoustic fingerprints produce recording
-candidates only.
+Unattended fuzzy exact-release acceptance remains disabled in the CLI.
+The library requires a checked evaluation attestation for any future unattended path.
+An attestation records zero false accepts across at least 30,000 independent cases from balanced release groups.
+Each case compares different editions within one release group.
+JSON loading checks constructor rules, report consistency, policy version, and acceptance rules.
+Callers must verify the underlying evaluation data.
+Acoustic fingerprints produce recording candidates only.
 
 For unattended imports, `--yes` accepts provider metadata only when every
 source track carries the same embedded release ID, the provider resolves that
@@ -112,6 +150,26 @@ exact ID, and all structural confidence gates pass. Everything else is skipped
 with exit status 2 and a `requires-review` reason. Use `--existing-tags`
 (`--as-is`) with `--yes` to explicitly import scanned embedded metadata instead;
 the same selection policy applies during `--dry-run`.
+Existing-tag imports skip online metadata lookups during preview and execution.
+Unreadable files with recognized audio extensions produce scan warnings and exit status 2.
+This also applies to unreadable files supplied as explicit paths.
+Updates retain the catalog title when the file has no title tag.
+Internal temporary and quarantine names remain within the 255-byte filename limit.
+Tag writes preserve display artist credits separately from native artist lists.
+
+Exact-release confidence compares source label, catalog number, country, and medium
+with candidate facts. Candidate metadata availability alone earns no credit.
+Label and catalog checks include repeated native values.
+Missing candidate facts remain unknown.
+Conflicting identifiers or edition facts require review, even with a shared release ID.
+Non-finite provider scores always reject unattended acceptance.
+Release-ID checks include extended metadata and supported legacy aliases.
+Equivalent MusicBrainz UUID spellings represent the same identity.
+
+Provider selection keeps changed artist credits and years consistent with later tag writes.
+Unchanged credits retain their separate values. Missing provider years preserve known dates.
+Selected identifiers replace older identifiers from the same provider and identity type.
+Other provider evidence remains stored.
 
 Provider responses are cached as licensed raw snapshots. Canonical values are
 materialized from immutable claims by an explicit resolution policy; manual
@@ -137,15 +195,56 @@ rsbts rm --delete --yes 'artist:=Beatles'
 rsbts purge --dry-run --older-than-days 30
 ```
 
-Filters support literal substring `field:value`, exact `field:=value`, SQLite
-glob `field::pattern`, ranges, `^` negation, relative added dates such as
-`added:-7d`, and `+`/`-` sort suffixes. Values are bound SQL parameters. Empty
-or malformed mutating queries are rejected before database open or recovery.
+`update` replaces the catalog's native tag snapshot and preserves unrelated custom fields.
+Absent native fields clear stale native values.
+`update` does not adopt new external identifiers from tags.
+Changes to identity fields can clear associated catalog identifiers.
+`modify` keeps artist, album artist, genre, and year consistent with later tag writes.
 
-`--output json` and `--output jsonl` cover import/matching, audit, provider
-refresh, tag projection, path projection, removal, plans, fixity, integrity,
-lists, and statistics. A machine-readable mutation requires `--dry-run` or an
-explicit non-interactive approval.
+Filters support literal substrings `field:value`, exact values `field:=value`,
+regular expressions `field::pattern`, SQLite globs `field:~pattern`, and ranges.
+They also support `^` negation, relative added dates such as `added:-7d`, and
+`+`/`-` sort suffixes. Separate alternative filter groups with `,`.
+Values are bound SQL parameters. Empty or malformed mutating queries fail
+before database open or recovery.
+
+Quoted query values preserve literal backslashes. Use `\"` for a quoted
+double quote and `\\` for a backslash.
+
+Exact and range filters compare numeric custom fields as numbers.
+The same filters retain text comparison for custom fields stored as strings.
+
+For `rm`, `modify`, `write`, and `move`, an explicit query must contain a filter.
+Sort terms alone fail before database open or recovery. Use `--all` to select
+every item for `write` or `move`.
+
+Track listings apply sort terms before `--limit`. The default limit is 1,000
+rows. The allowed range is 1 to 100,000 rows. Invalid relative dates, purge
+ages, and list limits fail before database open or recovery.
+
+Track and album JSON and JSONL listings include stored extended metadata.
+This includes original dates, separate artist lists, provider identifiers, and custom fields.
+Each imported album group stores release metadata shared by all its tracks.
+Tracks retain individual values when album values conflict or are missing.
+Per-disc track totals and recording identifiers remain attached to tracks.
+
+Write and move plans reject selections above 9,999 rows before reading media
+files. Narrow the query to select fewer rows.
+Purge plans reject selections above 9,999 retained files.
+
+Use `--output json` or `--output jsonl` for machine output.
+Both formats cover import, matching, audit, provider refresh, tag projection,
+path projection, removal, purge, plans, fixity, integrity, lists, and statistics.
+Commands with confirmation prompts require `--dry-run` or explicit
+non-interactive approval in these formats.
+
+`modify`, `update`, and `verify` also support both formats. Each emits one
+result object. `update` includes failure details for each affected item.
+`verify` includes skipped items and their reasons.
+
+For `write`, `move`, and `purge`, JSON emits one object. JSONL emits a preview
+and, after execution, a result. Dry runs and empty selections emit only the
+preview.
 
 Exit status is 0 for success, 2 for a completed result containing issues or
 partial work, and 1 for validation or fatal runtime failure. Clap uses status 2
@@ -173,6 +272,14 @@ Each `fixity run` invocation handles one bounded page. Repeat until `complete`
 is true; interruption resumes from the durable cursor. Persistent schedules and
 auditable history are available through `fixity schedule`, `fixity due`,
 `fixity schedules`, `fixity enable`, and `fixity history`.
+Invalid schedule intervals fail before database open. Invalid stored intervals
+return an error without creating partial plans.
+Fixity execution checks the saved mode, asset count, and schedule before each page.
+Completed and cancelled plans reject further execution without changing history.
+
+`plan events` returns at most 512 events by default. Use `--limit` to select
+between 1 and 4,096 events. Pass the last returned sequence to
+`--after-sequence` for the next page.
 
 Full SQLite integrity checking is intentionally explicit:
 
@@ -182,6 +289,16 @@ rsbts integrity
 
 Library APIs also provide SHA-256 manifests, BagIt-compatible export,
 manifest verification, and an exercised, journaled restore workflow.
+
+Restore history links new runs to their operation IDs.
+Recovery finishes the matching running record in the journal's completion transaction.
+Automatic history repair applies to newly created runs.
+
+`verify_sha256_manifest` checks GNU SHA-256 records against file bytes.
+Both GNU mode flags use raw bytes without text conversion.
+`verify_bagit_manifest` checks BagIt payload manifests and decodes their filename
+escapes. Exports preserve spaces, percent signs, line breaks, and Unix
+backslashes in filenames. Empty roots can export empty manifests and bags.
 
 ## Projections and media
 
@@ -203,6 +320,15 @@ Explicit tag writes retain the prior file as a verified original. Managed-file
 moves update the root-relative asset identity and both digests in the same
 catalog transaction; recovery never deletes a source whose identity changed.
 
+Tag reads retain supported repeated values, calendar dates, totals, release facts,
+classical fields, identifiers, and ReplayGain text.
+Empty tags and zero dates, positions, or totals represent unknown values.
+Repeated scalar tags are accepted when their values agree. Conflicting values still require review.
+Field support varies by format. See the [tag capability limits](docs/tag-capabilities.md).
+
+Name shortening preserves path safety and portable filename rules.
+Collision checks treat equivalent Unicode names and case variants as equal.
+
 Capability contract version 2 covers:
 
 - FLAC
@@ -213,9 +339,9 @@ Capability contract version 2 covers:
 - WAV/BWF and AIFF PCM
 - WavPack, Monkey's Audio/APE, and Musepack
 
-Every advertised container/codec/tag tuple is exercised against every tag
-profile for native writing, multivalue behavior, artwork, unknown preservation,
-and audio-essence integrity. See [tag-capabilities.md](docs/tag-capabilities.md).
+Tests run each advertised format combination through every tag profile.
+The tests check each test file's metadata, artwork, unknown fields, and audio preservation.
+See [tag-capabilities.md](docs/tag-capabilities.md) for field and format limits.
 Unsupported files remain opaque catalog assets and are never rewritten through
 an assumed dialect.
 

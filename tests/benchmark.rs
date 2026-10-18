@@ -44,6 +44,29 @@ fn measured_process(
         .ok_or_else(|| io::Error::other("benchmark requires at least one iteration").into())
 }
 
+fn validate_list_rows(
+    executable: &Path,
+    arguments: &[OsString],
+    expected: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let output = Command::new(executable).args(arguments).output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "listing validation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ))
+        .into());
+    }
+    let actual = u64::try_from(std::str::from_utf8(&output.stdout)?.lines().count())?;
+    if actual != expected {
+        return Err(io::Error::other(format!(
+            "listing returned {actual} rows; expected {expected}"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
 fn report(name: &str, duration: Duration, iterations: usize) -> io::Result<()> {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
@@ -118,10 +141,10 @@ fn fresh_process_catalog_workloads() -> Result<(), Box<dyn std::error::Error>> {
         .map(|value| value.parse::<u64>())
         .transpose()?
         .unwrap_or(100_000);
-    if item_count == 0 {
+    if item_count == 0 || item_count > 100_000 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "RSBTS_BENCH_ITEMS must be positive",
+            "RSBTS_BENCH_ITEMS must be between 1 and 100000",
         )
         .into());
     }
@@ -134,7 +157,7 @@ fn fresh_process_catalog_workloads() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = config_path.as_os_str().to_os_string();
     let workloads = [
-        ("version", vec![OsString::from("--version")]),
+        ("version", vec![OsString::from("--version")], None),
         (
             "stats",
             vec![
@@ -142,6 +165,7 @@ fn fresh_process_catalog_workloads() -> Result<(), Box<dyn std::error::Error>> {
                 config.clone(),
                 OsString::from("stats"),
             ],
+            None,
         ),
         (
             "exact-query",
@@ -151,13 +175,24 @@ fn fresh_process_catalog_workloads() -> Result<(), Box<dyn std::error::Error>> {
                 OsString::from("ls"),
                 OsString::from("artist:=\"Artist 42\""),
             ],
+            Some(item_count / 1_000 + u64::from(item_count % 1_000 >= 42)),
         ),
         (
             "full-list",
-            vec![OsString::from("--config"), config, OsString::from("ls")],
+            vec![
+                OsString::from("--config"),
+                config,
+                OsString::from("ls"),
+                OsString::from("--limit"),
+                OsString::from(item_count.to_string()),
+            ],
+            Some(item_count),
         ),
     ];
-    for (name, arguments) in workloads {
+    for (name, arguments, expected_rows) in workloads {
+        if let Some(expected_rows) = expected_rows {
+            validate_list_rows(rsbts, &arguments, expected_rows)?;
+        }
         report(
             &format!("rsbts {name}"),
             measured_process(rsbts, &arguments, iterations)?,

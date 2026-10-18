@@ -11,7 +11,7 @@ use crate::asset::digest_reader;
 use crate::db::{file_identity, JournalFile, Library, OperationKind};
 use crate::fsops::AnchoredRoot;
 use crate::naming::{collision_key, sanitize_relative_path, NamingProfile};
-use crate::operations::{PlanId, PlanKind, PlanState};
+use crate::operations::{DurablePlan, PlanId, PlanKind, PlanState};
 use crate::roots::{RootCapabilities, RootId};
 use crate::{Error, Result};
 
@@ -217,6 +217,9 @@ impl Library {
                         "entry_identity": entry_identity,
                         "blake3": blake3,
                         "sha256": sha256,
+                        "root_id": root_id,
+                        "root_path": root_path,
+                        "role": role,
                     }))?
                 ],
             )?;
@@ -244,6 +247,7 @@ impl Library {
     }
 
     pub fn approve_path_projection(&self, plan: &PathProjectionPlan) -> Result<()> {
+        self.require_path_projection_review(plan)?;
         self.approve_durable_plan(plan.id())?;
         self.conn.execute(
             "UPDATE projection_plans SET approved_at = ?2 WHERE id = ?1",
@@ -252,10 +256,88 @@ impl Library {
         Ok(())
     }
 
+    fn require_path_projection_review(&self, plan: &PathProjectionPlan) -> Result<DurablePlan> {
+        let saved = self.require_saved_plan(
+            plan.id(),
+            PlanKind::PathProjection,
+            &json!({
+                "asset_id": plan.asset_id,
+                "destination_relative": plan.destination_relative,
+                "profile": plan.profile,
+            }),
+            &json!({
+                "source": plan.source,
+                "destination": plan.destination,
+                "byte_size": plan.byte_size,
+                "blake3": plan.blake3,
+                "sha256": plan.sha256,
+                "no_clobber": true,
+            }),
+        )?;
+        self.require_projection_step(
+            plan.id(),
+            &plan.asset_id,
+            &json!({"relative_path": plan.source_relative}),
+            &json!({"relative_path": plan.destination_relative}),
+            &json!({
+                "entry_identity": plan.entry_identity,
+                "blake3": plan.blake3,
+                "sha256": plan.sha256,
+                "root_id": plan.root_id,
+                "root_path": plan.root_path,
+                "role": plan.role,
+            }),
+        )?;
+        Ok(saved)
+    }
+
+    fn require_path_projection_root(&self, plan: &PathProjectionPlan) -> Result<()> {
+        let root_record = self.library_root(&plan.root_id)?;
+        root_record.require_safe_mutation()?;
+        if root_record.path() != plan.root_path
+            || plan.root_path.join(&plan.source_relative) != plan.source
+            || plan.root_path.join(&plan.destination_relative) != plan.destination
+        {
+            return Err(Error::Root(
+                "path projection root path changed after preview".into(),
+            ));
+        }
+        let matches = self.conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM assets
+                WHERE id = ?1 AND root_id = ?2 AND relative_path = ?3
+                  AND absolute_path = ?4 AND role = ?5 AND managed = 1
+                  AND verification_state = 'verified')",
+            params![
+                plan.asset_id,
+                plan.root_id.as_str(),
+                path_text(&plan.source_relative)?,
+                path_text(&plan.source)?,
+                plan.role,
+            ],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !matches {
+            return Err(Error::Operation(
+                "asset root, path, or role changed after path projection preview".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn execute_path_projection(
         &mut self,
         plan: &PathProjectionPlan,
     ) -> Result<PathProjectionReceipt> {
+        self.require_path_projection_review(plan)?
+            .require_approved()?;
+        self.require_path_projection_root(plan)?;
+        reject_collision_key(
+            &self.conn,
+            plan.root_id.as_str(),
+            &plan.asset_id,
+            &plan.destination_relative,
+        )?;
         self.start_durable_plan(plan.id())?;
         let root = AnchoredRoot::open(&plan.root_path)?;
         if let Err(error) = revalidate(
@@ -528,7 +610,7 @@ fn sibling_path(source: &Path, plan_id: &PlanId) -> Result<PathBuf> {
     let mut staged = std::ffi::OsString::from(".");
     staged.push(name);
     staged.push(format!(".rsbts-{}.path-original", plan_id.as_str()));
-    Ok(source.with_file_name(staged))
+    Ok(crate::fsops::bounded_sibling_path(source, staged))
 }
 
 fn path_text(path: &Path) -> Result<&str> {
@@ -540,6 +622,7 @@ fn path_text(path: &Path) -> Result<&str> {
 mod tests {
     use super::*;
     use crate::failpoints;
+    use crate::roots::RootState;
 
     fn library_with_asset(root: &Path, relative: &Path) -> Result<(Library, String)> {
         let path = root.join(relative);
@@ -612,6 +695,312 @@ mod tests {
         )?;
         assert_eq!(stored, "new/file.cue");
         Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn root_policy_blocks_path_execution_after_approval() -> Result<()> {
+        for state in [RootState::Offline, RootState::ReadOnly, RootState::Degraded] {
+            let temporary = tempfile::tempdir()?;
+            let root = temporary.path().join("library");
+            std::fs::create_dir(&root)?;
+            let (mut library, asset_id) = library_with_asset(&root, Path::new("old/file.cue"))?;
+            let registered = library.register_root(&root)?;
+            let plan = library.plan_path_projection(
+                &asset_id,
+                Path::new("new/file.cue"),
+                NamingProfile::Portable,
+            )?;
+            library.approve_path_projection(&plan)?;
+            library.set_root_state(registered.id(), state)?;
+
+            assert!(
+                library.execute_path_projection(&plan).is_err(),
+                "path execution ignored {state:?} root policy"
+            );
+            assert_eq!(std::fs::read(plan.source())?, b"path projection bytes");
+            assert!(!plan.destination().exists());
+            assert!(!root.join("new").exists());
+            assert_eq!(
+                library.durable_plan(plan.id())?.state(),
+                PlanState::Approved
+            );
+            library.set_root_state(registered.id(), RootState::Online)?;
+            library.execute_path_projection(&plan)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn root_policy_blocks_path_execution_after_root_path_changes() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("library");
+        std::fs::create_dir(&root)?;
+        let (mut library, asset_id) = library_with_asset(&root, Path::new("old/file.cue"))?;
+        let registered = library.register_root(&root)?;
+        let plan = library.plan_path_projection(
+            &asset_id,
+            Path::new("new/file.cue"),
+            NamingProfile::Portable,
+        )?;
+        library.approve_path_projection(&plan)?;
+        library.conn.execute(
+            "UPDATE library_roots SET path = ?1 WHERE id = ?2",
+            params![
+                path_text(&temporary.path().join("replacement"))?,
+                registered.id().as_str()
+            ],
+        )?;
+
+        assert!(
+            library.execute_path_projection(&plan).is_err(),
+            "path execution ignored the changed root path"
+        );
+        assert_eq!(std::fs::read(plan.source())?, b"path projection bytes");
+        assert!(!plan.destination().exists());
+        assert_eq!(
+            library.durable_plan(plan.id())?.state(),
+            PlanState::Approved
+        );
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn path_execution_rechecks_collisions_created_by_another_plan() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("library");
+        std::fs::create_dir(&root)?;
+        let (mut library, first_id) = library_with_asset(&root, Path::new("old/first.cue"))?;
+        let second_id = uuid::Uuid::new_v4().to_string();
+        let second_source = root.join("old/second.cue");
+        std::fs::write(&second_source, b"path projection bytes")?;
+        library.conn.execute(
+            "INSERT INTO assets
+             (id, root_id, relative_path, absolute_path, role, managed,
+              verification_state, byte_size, blake3, sha256, entry_identity,
+              projection_state, first_seen_at, last_verified_at)
+             SELECT ?1, root_id, 'old/second.cue', ?2, role, managed,
+                    verification_state, byte_size, blake3, sha256, ?3,
+                    projection_state, first_seen_at, last_verified_at
+             FROM assets WHERE id = ?4",
+            params![
+                second_id,
+                path_text(&second_source)?,
+                file_identity(&std::fs::metadata(&second_source)?),
+                first_id
+            ],
+        )?;
+        let first = library.plan_path_projection(
+            &first_id,
+            Path::new("new/Track.cue"),
+            NamingProfile::Portable,
+        )?;
+        let second = library.plan_path_projection(
+            &second_id,
+            Path::new("new/track.cue"),
+            NamingProfile::Portable,
+        )?;
+        library.approve_path_projection(&first)?;
+        library.approve_path_projection(&second)?;
+        library.execute_path_projection(&first)?;
+
+        assert!(
+            library.execute_path_projection(&second).is_err(),
+            "path execution ignored the new case-folded collision"
+        );
+        assert_eq!(std::fs::read(&second_source)?, b"path projection bytes");
+        assert!(!second.destination().exists());
+        assert_eq!(
+            library.durable_plan(second.id())?.state(),
+            PlanState::Approved
+        );
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn changed_path_plan_cannot_reuse_approval() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("library");
+        std::fs::create_dir(&root)?;
+        let (mut library, asset_id) = library_with_asset(&root, Path::new("old/file.cue"))?;
+        let plan = library.plan_path_projection(
+            &asset_id,
+            Path::new("reviewed/file.cue"),
+            NamingProfile::Portable,
+        )?;
+        library.approve_path_projection(&plan)?;
+        let mut serialized = serde_json::to_value(&plan)?;
+        serialized["destination_relative"] = json!("unreviewed/file.cue");
+        serialized["destination"] = json!(root.join("unreviewed/file.cue"));
+        let changed: PathProjectionPlan = serde_json::from_value(serialized)?;
+
+        assert!(
+            library.execute_path_projection(&changed).is_err(),
+            "an edited path plan reused approval"
+        );
+        assert_eq!(std::fs::read(plan.source())?, b"path projection bytes");
+        assert!(!changed.destination().exists());
+        assert_eq!(
+            library.durable_plan(plan.id())?.state(),
+            PlanState::Approved
+        );
+        library.execute_path_projection(&plan)?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn typed_approval_rejects_changed_path_content() -> Result<()> {
+        require_changed_path_approval(false)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn typed_approval_rejects_changed_path_evidence() -> Result<()> {
+        require_changed_path_approval(true)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn require_changed_path_approval(change_evidence: bool) -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("library");
+        std::fs::create_dir(&root)?;
+        let (library, asset_id) = library_with_asset(&root, Path::new("old/file.cue"))?;
+        let plan = library.plan_path_projection(
+            &asset_id,
+            Path::new("reviewed/file.cue"),
+            NamingProfile::Portable,
+        )?;
+        let events = serde_json::to_value(library.plan_events(plan.id())?)?;
+        let mut serialized = serde_json::to_value(&plan)?;
+        if change_evidence {
+            serialized["entry_identity"] = json!("unreviewed entry identity");
+        } else {
+            serialized["destination_relative"] = json!("unreviewed/file.cue");
+            serialized["destination"] = json!(root.join("unreviewed/file.cue"));
+        }
+        let changed: PathProjectionPlan = serde_json::from_value(serialized)?;
+
+        assert!(
+            library.approve_path_projection(&changed).is_err(),
+            "changed path review approved a different saved plan: evidence={change_evidence}"
+        );
+        assert_eq!(library.durable_plan(plan.id())?.state(), PlanState::Planned);
+        assert_eq!(
+            serde_json::to_value(library.plan_events(plan.id())?)?,
+            events
+        );
+        assert_eq!(std::fs::read(plan.source())?, b"path projection bytes");
+        assert!(!plan.destination().exists());
+        library.approve_path_projection(&plan)?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn changed_path_evidence_cannot_start_execution() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("library");
+        std::fs::create_dir(&root)?;
+        let (mut library, asset_id) = library_with_asset(&root, Path::new("old/file.cue"))?;
+        let plan = library.plan_path_projection(
+            &asset_id,
+            Path::new("reviewed/file.cue"),
+            NamingProfile::Portable,
+        )?;
+        library.approve_path_projection(&plan)?;
+        std::fs::rename(plan.source(), root.join("retained-original.cue"))?;
+        std::fs::write(plan.source(), b"path projection bytes")?;
+        let mut serialized = serde_json::to_value(&plan)?;
+        serialized["entry_identity"] = json!(file_identity(&std::fs::metadata(plan.source())?));
+        let changed: PathProjectionPlan = serde_json::from_value(serialized)?;
+
+        assert!(library.execute_path_projection(&changed).is_err());
+        assert_eq!(
+            library.durable_plan(plan.id())?.state(),
+            PlanState::Approved,
+            "edited evidence started execution"
+        );
+        assert_eq!(std::fs::read(plan.source())?, b"path projection bytes");
+        assert!(!plan.destination().exists());
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn path_execution_rechecks_reviewed_root_identity_in_plan() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("library");
+        std::fs::create_dir(&root)?;
+        let (mut library, asset_id) = library_with_asset(&root, Path::new("old/file.cue"))?;
+        let plan = library.plan_path_projection(
+            &asset_id,
+            Path::new("new/file.cue"),
+            NamingProfile::Portable,
+        )?;
+        library.approve_path_projection(&plan)?;
+        let alias_id = equivalent_stored_root(&library, &plan.root_id, &root)?;
+        library.set_root_state(&plan.root_id, RootState::Offline)?;
+        let mut serialized = serde_json::to_value(&plan)?;
+        serialized["root_id"] = json!(alias_id);
+        let changed: PathProjectionPlan = serde_json::from_value(serialized)?;
+
+        assert!(library.execute_path_projection(&changed).is_err());
+        assert_eq!(
+            library.durable_plan(plan.id())?.state(),
+            PlanState::Approved,
+            "a substituted root ID started an unreviewed path move"
+        );
+        assert_eq!(std::fs::read(plan.source())?, b"path projection bytes");
+        assert!(!plan.destination().exists());
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn path_execution_rechecks_reviewed_root_identity_in_catalog() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("library");
+        std::fs::create_dir(&root)?;
+        let (mut library, asset_id) = library_with_asset(&root, Path::new("old/file.cue"))?;
+        let plan = library.plan_path_projection(
+            &asset_id,
+            Path::new("new/file.cue"),
+            NamingProfile::Portable,
+        )?;
+        library.approve_path_projection(&plan)?;
+        let alias_id = equivalent_stored_root(&library, &plan.root_id, &root)?;
+        library.set_root_state(&alias_id, RootState::Offline)?;
+        library.conn.execute(
+            "UPDATE assets SET root_id = ?2 WHERE id = ?1",
+            params![asset_id, alias_id.as_str()],
+        )?;
+
+        assert!(library.execute_path_projection(&plan).is_err());
+        assert_eq!(
+            library.durable_plan(plan.id())?.state(),
+            PlanState::Approved,
+            "a changed catalog root started an unreviewed path move"
+        );
+        assert_eq!(std::fs::read(plan.source())?, b"path projection bytes");
+        assert!(!plan.destination().exists());
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn equivalent_stored_root(library: &Library, id: &RootId, path: &Path) -> Result<RootId> {
+        let alias = RootId::new();
+        library.conn.execute(
+            "INSERT INTO library_roots
+             (id, path, state, capabilities_json, created_at, updated_at)
+             SELECT ?2, ?3, state, capabilities_json, created_at, updated_at
+             FROM library_roots WHERE id = ?1",
+            params![id.as_str(), alias.as_str(), path_text(&path.join("."))?],
+        )?;
+        Ok(alias)
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]

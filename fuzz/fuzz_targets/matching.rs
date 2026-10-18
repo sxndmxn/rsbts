@@ -37,7 +37,10 @@ fuzz_target!(|data: &[u8]| {
         .map(|index| ProviderTrack {
             external_id: format!("recording-{index}"),
             release_track_external_id: Some(format!("track-{index}")),
-            title: format!("track-{}", data.get(count + index + 1).copied().unwrap_or(0)),
+            title: format!(
+                "track-{}",
+                data.get(count + index + 1).copied().unwrap_or(0)
+            ),
             artist: "Artist".into(),
             number: u32::try_from(index + 1).ok(),
             printed_position: Some((index + 1).to_string()),

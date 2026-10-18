@@ -12,7 +12,7 @@ use crate::db::{file_identity, file_object_identity, JournalFile, Library, Opera
 use crate::failpoints;
 use crate::fsops::AnchoredRoot;
 use crate::media::{decoded_audio_essence_hash_from_file, probe_media_from_file, MediaDescriptor};
-use crate::operations::{PlanId, PlanKind, PlanState};
+use crate::operations::{DurablePlan, PlanId, PlanKind, PlanState};
 use crate::tags::{
     read_tag_snapshot_from_file, rewrite_tags, validate_materialized_snapshot, CanonicalTags,
     TagProfile, TagSnapshot,
@@ -136,6 +136,7 @@ impl Library {
                 "asset {asset_id} is not a verified managed regular audio asset"
             )));
         }
+        self.require_asset_root_mutation(&asset_id)?;
         let parent = anchored_parent(&path)?;
         let root = AnchoredRoot::open(parent)?;
         let metadata = root.entry_metadata(&path)?;
@@ -196,6 +197,7 @@ impl Library {
                         "source_identity": observed_identity,
                         "blake3": digests.blake3(),
                         "sha256": digests.sha256(),
+                        "byte_size": digests.byte_size(),
                         "audio_essence_hash": essence,
                     }))?
                 ],
@@ -221,6 +223,7 @@ impl Library {
 
     /// Record explicit approval without starting filesystem execution.
     pub fn approve_tag_projection(&self, plan: &TagProjectionPlan) -> Result<()> {
+        self.require_tag_projection_review(plan)?;
         self.approve_durable_plan(plan.id())?;
         let changed = self.conn.execute(
             "UPDATE projection_plans SET approved_at = ?2 WHERE id = ?1 AND approved_at IS NULL",
@@ -233,6 +236,37 @@ impl Library {
                 "tag projection was already approved or is unknown".into(),
             ))
         }
+    }
+
+    fn require_tag_projection_review(&self, plan: &TagProjectionPlan) -> Result<DurablePlan> {
+        let request = serde_json::to_value(&plan.tags)?;
+        let saved = self.require_saved_plan(
+            plan.id(),
+            PlanKind::TagProjection,
+            &request,
+            &json!({
+                "asset_id": plan.asset_id,
+                "path": plan.path,
+                "profile": plan.profile,
+                "policy_version": plan.profile.policy_version(),
+                "before": plan.before,
+                "after": plan.tags,
+            }),
+        )?;
+        self.require_projection_step(
+            plan.id(),
+            &plan.asset_id,
+            &serde_json::to_value(&plan.before)?,
+            &request,
+            &json!({
+                "source_identity": plan.source_identity,
+                "blake3": plan.source_blake3,
+                "sha256": plan.source_sha256,
+                "byte_size": plan.source_size,
+                "audio_essence_hash": plan.audio_essence_hash,
+            }),
+        )?;
+        Ok(saved)
     }
 }
 
@@ -247,11 +281,10 @@ impl<'a> TagProjectionExecutor<'a> {
 
     /// Execute an approved tag projection, retaining the verified original.
     pub fn execute(&mut self, plan: &TagProjectionPlan) -> Result<TagProjectionReceipt> {
-        if self.library.durable_plan(plan.id())?.state() != PlanState::Approved {
-            return Err(Error::Operation(
-                "tag projection must be explicitly approved before execution".into(),
-            ));
-        }
+        self.library
+            .require_tag_projection_review(plan)?
+            .require_approved()?;
+        self.library.require_asset_root_mutation(&plan.asset_id)?;
         if let Err(error) = self.library.start_durable_plan(plan.id()) {
             if self
                 .library
@@ -336,6 +369,12 @@ impl<'a> TagProjectionExecutor<'a> {
                 return Err(error);
             }
         };
+        if let Err(error) = self
+            .library
+            .bind_operation_asset(&operation_id, 1, &plan.asset_id)
+        {
+            return Err(self.rollback_failed(plan.id(), &operation_id, error));
+        }
         match self.execute_journaled(&root, plan, &operation_id, &rewrite, &original) {
             Ok(receipt) => Ok(receipt),
             Err(error) => Err(self.rollback_failed(plan.id(), &operation_id, error)),
@@ -581,7 +620,7 @@ fn sibling_path(path: &Path, operation: uuid::Uuid, role: &str) -> Result<PathBu
     let mut staged = std::ffi::OsString::from(".");
     staged.push(name);
     staged.push(format!(".rsbts-{operation}.{role}"));
-    Ok(path.with_file_name(staged))
+    Ok(crate::fsops::bounded_sibling_path(path, staged))
 }
 
 #[cfg(test)]
@@ -593,6 +632,7 @@ mod tests {
     use lofty::probe::Probe;
     use lofty::tag::{ItemKey, Tag};
 
+    use crate::roots::RootState;
     use crate::{Album, AudioFormat, Item};
 
     fn wav(samples: &[i16]) -> Vec<u8> {
@@ -731,6 +771,256 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
+    fn changed_tag_plan_cannot_reuse_approval() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("track.wav");
+        let original = wav(&[1, 2, 3, 4]);
+        std::fs::write(&path, &original)?;
+        let (mut library, item_id) = managed_library(&path)?;
+        let tags = CanonicalTags::new(
+            "Reviewed",
+            vec!["Artist".into()],
+            "Album",
+            vec!["Artist".into()],
+        )?;
+        let plan = library.plan_tag_projection(item_id, tags, TagProfile::PortablePlayer)?;
+        library.approve_tag_projection(&plan)?;
+        let mut serialized = serde_json::to_value(&plan)?;
+        serialized["tags"]["title"] = json!("Unreviewed");
+        let changed: TagProjectionPlan = serde_json::from_value(serialized)?;
+
+        assert!(
+            TagProjectionExecutor::new(&mut library)
+                .execute(&changed)
+                .is_err(),
+            "an edited tag plan reused approval"
+        );
+        assert_eq!(std::fs::read(&path)?, original);
+        assert_eq!(
+            library.durable_plan(plan.id())?.state(),
+            PlanState::Approved
+        );
+        TagProjectionExecutor::new(&mut library).execute(&plan)?;
+        assert_eq!(crate::tags::read_tags(&path)?.title, "Reviewed");
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn typed_approval_rejects_changed_tag_content() -> Result<()> {
+        require_changed_tag_approval(false)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn typed_approval_rejects_changed_tag_evidence() -> Result<()> {
+        require_changed_tag_approval(true)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn require_changed_tag_approval(change_evidence: bool) -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("track.wav");
+        let original = wav(&[1, 2, 3, 4]);
+        std::fs::write(&path, &original)?;
+        let (library, item_id) = managed_library(&path)?;
+        let tags = CanonicalTags::new(
+            "Reviewed",
+            vec!["Artist".into()],
+            "Album",
+            vec!["Artist".into()],
+        )?;
+        let plan = library.plan_tag_projection(item_id, tags, TagProfile::PortablePlayer)?;
+        let events = serde_json::to_value(library.plan_events(plan.id())?)?;
+        let mut serialized = serde_json::to_value(&plan)?;
+        if change_evidence {
+            serialized["source_size"] = json!(0);
+        } else {
+            serialized["tags"]["title"] = json!("Unreviewed");
+        }
+        let changed: TagProjectionPlan = serde_json::from_value(serialized)?;
+
+        assert!(
+            library.approve_tag_projection(&changed).is_err(),
+            "changed tag review approved a different saved plan: evidence={change_evidence}"
+        );
+        assert_eq!(library.durable_plan(plan.id())?.state(), PlanState::Planned);
+        assert_eq!(
+            serde_json::to_value(library.plan_events(plan.id())?)?,
+            events
+        );
+        assert_eq!(std::fs::read(&path)?, original);
+        library.approve_tag_projection(&plan)?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn root_policy_blocks_tag_planning() -> Result<()> {
+        for state in [RootState::Offline, RootState::ReadOnly, RootState::Degraded] {
+            let temporary = tempfile::tempdir()?;
+            let path = temporary.path().join("track.wav");
+            std::fs::write(&path, wav(&[1, 2, 3, 4]))?;
+            let (library, item_id) = managed_library(&path)?;
+            let root = library.register_root(temporary.path())?;
+            library.conn.execute(
+                "UPDATE assets SET root_id = ?1, relative_path = 'track.wav'",
+                [root.id().as_str()],
+            )?;
+            library.set_root_state(root.id(), state)?;
+            let tags = CanonicalTags::new(
+                "Reviewed",
+                vec!["Artist".into()],
+                "Album",
+                vec!["Artist".into()],
+            )?;
+
+            assert!(
+                library
+                    .plan_tag_projection(item_id, tags, TagProfile::PortablePlayer)
+                    .is_err(),
+                "tag planning ignored {state:?} root policy"
+            );
+            let plans: u64 =
+                library
+                    .conn
+                    .query_row("SELECT COUNT(*) FROM durable_plans", [], |row| row.get(0))?;
+            assert_eq!(plans, 0);
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn root_policy_blocks_tag_execution_after_approval() -> Result<()> {
+        for state in [RootState::Offline, RootState::ReadOnly, RootState::Degraded] {
+            let temporary = tempfile::tempdir()?;
+            let path = temporary.path().join("track.wav");
+            let original = wav(&[1, 2, 3, 4]);
+            std::fs::write(&path, &original)?;
+            let (mut library, item_id) = managed_library(&path)?;
+            let root = library.register_root(temporary.path())?;
+            library.conn.execute(
+                "UPDATE assets SET root_id = ?1, relative_path = 'track.wav'",
+                [root.id().as_str()],
+            )?;
+            let tags = CanonicalTags::new(
+                "Reviewed",
+                vec!["Artist".into()],
+                "Album",
+                vec!["Artist".into()],
+            )?;
+            let plan = library.plan_tag_projection(item_id, tags, TagProfile::PortablePlayer)?;
+            library.approve_tag_projection(&plan)?;
+            library.set_root_state(root.id(), state)?;
+
+            assert!(
+                TagProjectionExecutor::new(&mut library)
+                    .execute(&plan)
+                    .is_err(),
+                "tag execution ignored {state:?} root policy"
+            );
+            assert_eq!(std::fs::read(&path)?, original);
+            assert_eq!(
+                library.durable_plan(plan.id())?.state(),
+                PlanState::Approved
+            );
+            library.set_root_state(root.id(), RootState::Online)?;
+            TagProjectionExecutor::new(&mut library).execute(&plan)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn purge_of_legacy_tag_journals_honors_root_policy() -> Result<()> {
+        use crate::remove::{PurgeExecutor, PurgePlan};
+
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("track.wav");
+        let original = wav(&[1, 2, 3, 4]);
+        std::fs::write(&path, &original)?;
+        let (mut library, item_id) = managed_library(&path)?;
+        let root = library.register_root(temporary.path())?;
+        library.conn.execute(
+            "UPDATE assets SET root_id = ?1, relative_path = 'track.wav'",
+            [root.id().as_str()],
+        )?;
+        let tags = CanonicalTags::new(
+            "Reviewed",
+            vec!["Artist".into()],
+            "Album",
+            vec!["Artist".into()],
+        )?;
+        let plan = library.plan_tag_projection(item_id, tags, TagProfile::PortablePlayer)?;
+        library.approve_tag_projection(&plan)?;
+        let receipt = TagProjectionExecutor::new(&mut library).execute(&plan)?;
+        library.conn.execute(
+            "UPDATE operation_files SET asset_id = NULL, root_id = NULL WHERE role = 'tag-original'",
+            [],
+        )?;
+        let purge = PurgePlan::build(&library, 0)?.approve(&library)?;
+        assert_eq!(purge.len(), 1);
+        library.set_root_state(root.id(), RootState::Offline)?;
+
+        assert!(
+            PurgeExecutor::new(&mut library).execute(&purge).is_err(),
+            "purge ignored policy for an older tag journal"
+        );
+        assert_eq!(std::fs::read(receipt.retained_original())?, original);
+        library.set_root_state(root.id(), RootState::Online)?;
+        let available = PurgePlan::build(&library, 0)?.approve(&library)?;
+        assert_eq!(available.len(), 1);
+        let result = PurgeExecutor::new(&mut library).execute(&available);
+        assert!(
+            result.is_ok(),
+            "older tag journal lost its root-policy fallback: {result:?}"
+        );
+        assert_eq!(result?.purged_files, 1);
+        assert!(!receipt.retained_original().exists());
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn tag_projection_rejects_approval_from_another_plan_kind() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("track.wav");
+        let original = wav(&[1, 2, 3, 4]);
+        std::fs::write(&path, &original)?;
+        let (mut library, item_id) = managed_library(&path)?;
+        let tags = CanonicalTags::new(
+            "Reviewed",
+            vec!["Artist".into()],
+            "Album",
+            vec!["Artist".into()],
+        )?;
+        let plan = library.plan_tag_projection(item_id, tags, TagProfile::PortablePlayer)?;
+        let reviewed = library.durable_plan(plan.id())?;
+        let audit = library.create_durable_plan(
+            PlanKind::Audit,
+            reviewed.request(),
+            reviewed.preview(),
+            Some(1),
+        )?;
+        library.approve_durable_plan(&audit)?;
+        let mut serialized = serde_json::to_value(&plan)?;
+        serialized["plan_id"] = json!(audit);
+        let changed: TagProjectionPlan = serde_json::from_value(serialized)?;
+
+        assert!(
+            TagProjectionExecutor::new(&mut library)
+                .execute(&changed)
+                .is_err(),
+            "an audit approval permitted tag changes"
+        );
+        assert_eq!(std::fs::read(&path)?, original);
+        assert_eq!(library.durable_plan(&audit)?.state(), PlanState::Approved);
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
     fn source_replacement_after_preview_is_preserved() -> Result<()> {
         let temporary = tempfile::tempdir()?;
         let path = temporary.path().join("track.wav");
@@ -785,7 +1075,10 @@ mod tests {
             };
             let recovery = library.recover_pending()?;
             assert!(recovery.unresolved.is_empty(), "{recovery:?}");
-            assert!(library.recover_pending()?.unresolved.is_empty());
+            assert_eq!(
+                library.recover_pending()?.unresolved,
+                [] as [std::string::String; 0]
+            );
 
             let current = std::fs::read(&path)?;
             let mut retained_original = current == original;
@@ -798,7 +1091,7 @@ mod tests {
                 }
             }
             assert!(retained_original, "original bytes were not retained");
-            assert!(library.audit()?.issues().is_empty());
+            assert_eq!(library.audit()?.issues(), []);
             assert!(matches!(
                 library.durable_plan(plan.id())?.state(),
                 PlanState::Complete | PlanState::Failed

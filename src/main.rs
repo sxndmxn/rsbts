@@ -50,7 +50,7 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
 
-        /// Import using scanned embedded metadata instead of provider metadata
+        /// Import scanned embedded metadata without online lookups
         #[arg(long, visible_alias = "as-is")]
         existing_tags: bool,
 
@@ -273,10 +273,24 @@ enum OutputFormat {
 
 #[derive(Subcommand)]
 enum PlanCommand {
-    Status { id: String },
-    Events { id: String },
-    Cancel { id: String },
-    Resume { id: String },
+    Status {
+        id: String,
+    },
+    Events {
+        id: String,
+        /// Return events after this sequence number
+        #[arg(long)]
+        after_sequence: Option<u64>,
+        /// Maximum events to return, from 1 through 4096
+        #[arg(long, default_value_t = 512)]
+        limit: u32,
+    },
+    Cancel {
+        id: String,
+    },
+    Resume {
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]

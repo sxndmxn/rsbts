@@ -14,7 +14,7 @@ use crate::db::{file_identity, file_object_identity, JournalFile, Library, Opera
 use crate::failpoints;
 use crate::fsops::AnchoredRoot;
 use crate::media::{decoded_audio_essence_hash_from_file, probe_media_from_file, MediaDescriptor};
-use crate::operations::{append_plan_event, PlanId, PlanKind, PlanState};
+use crate::operations::{append_plan_event, DurablePlan, PlanId, PlanKind, PlanState};
 use crate::roots::RootId;
 use crate::tags::{
     embedded_picture_sha256s_from_file, read_tag_snapshot_from_file, rewrite_embedded_front,
@@ -37,7 +37,7 @@ pub struct EmbeddedArtworkPlan {
     original: Option<OriginalArtwork>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct OriginalArtwork {
     asset_id: String,
     path: PathBuf,
@@ -174,6 +174,7 @@ impl Library {
                 "embedded artwork requires a verified managed audio asset".into(),
             ));
         }
+        self.require_asset_root_mutation(audio_asset_id)?;
         let audio_size = require_evidence(audio_size, "audio size")?;
         let audio_blake3 = require_evidence(audio_blake3, "audio BLAKE3")?;
         let audio_sha256 = require_evidence(audio_sha256, "audio SHA-256")?;
@@ -245,6 +246,7 @@ impl Library {
                     "entry_identity": audio_identity,
                     "blake3": audio_blake3,
                     "sha256": audio_sha256,
+                    "byte_size": audio_size,
                     "audio_essence": audio_essence,
                 }))?,
             ],
@@ -264,6 +266,8 @@ impl Library {
     }
 
     pub fn approve_embedded_front_artwork(&self, plan: &EmbeddedArtworkPlan) -> Result<()> {
+        self.require_embedded_artwork_review(plan)?;
+        self.require_original_artwork_review(plan.original.as_ref())?;
         self.approve_durable_plan(plan.id())?;
         let changed = self.conn.execute(
             "UPDATE projection_plans SET approved_at = ?2
@@ -277,6 +281,50 @@ impl Library {
                 "artwork projection is unknown or already approved".into(),
             ))
         }
+    }
+
+    fn require_embedded_artwork_review(&self, plan: &EmbeddedArtworkPlan) -> Result<DurablePlan> {
+        let preview = json!({
+            "audio_path": plan.audio_path,
+            "before_picture_count": plan.before.picture_count(),
+            "action": if plan.original.is_some() { "replace" } else { "remove" },
+            "source_sha256": plan.original.as_ref().map(|value| value.sha256.as_str()),
+        });
+        let saved = self.require_saved_plan(
+            plan.id(),
+            PlanKind::ArtworkProjection,
+            &json!({
+                "audio_asset_id": plan.audio_asset_id,
+                "original_artwork_asset_id": plan.original.as_ref().map(|value| value.asset_id.as_str()),
+                "projection": "embedded-front",
+            }),
+            &preview,
+        )?;
+        self.require_projection_step(
+            plan.id(),
+            &plan.audio_asset_id,
+            &serde_json::to_value(&plan.before)?,
+            &preview,
+            &json!({
+                "entry_identity": plan.audio_identity,
+                "blake3": plan.audio_blake3,
+                "sha256": plan.audio_sha256,
+                "byte_size": plan.audio_size,
+                "audio_essence": plan.audio_essence,
+            }),
+        )?;
+        Ok(saved)
+    }
+
+    fn require_original_artwork_review(&self, original: Option<&OriginalArtwork>) -> Result<()> {
+        if let Some(original) = original {
+            if self.load_original_artwork(&original.asset_id)? != *original {
+                return Err(Error::Artwork(
+                    "artwork source does not match its reviewed asset".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn load_original_artwork(&self, asset_id: &str) -> Result<OriginalArtwork> {
@@ -378,7 +426,7 @@ impl Library {
         }
         let target_root_id = RootId::parse(root_id)?;
         let root_record = self.library_root(&target_root_id)?;
-        root_record.capabilities().require_safe_mutation()?;
+        root_record.require_safe_mutation()?;
         let root_path = root_record.path().to_path_buf();
         if root_path.join(&target_relative_path) != target_path {
             return Err(Error::Artwork(
@@ -452,6 +500,10 @@ impl Library {
                     "entry_identity": target_identity,
                     "blake3": target_blake3,
                     "sha256": target_sha256,
+                    "byte_size": target_size,
+                    "root_id": target_root_id,
+                    "root_path": root_path,
+                    "relative_path": target_relative_path,
                 }))?,
             ],
         )?;
@@ -474,6 +526,8 @@ impl Library {
     }
 
     pub fn approve_external_artwork(&self, plan: &ExternalArtworkPlan) -> Result<()> {
+        self.require_external_artwork_review(plan)?;
+        self.require_original_artwork_review(plan.original.as_ref())?;
         self.approve_durable_plan(plan.id())?;
         let changed = self.conn.execute(
             "UPDATE projection_plans SET approved_at = ?2
@@ -488,6 +542,78 @@ impl Library {
             ))
         }
     }
+
+    fn require_external_artwork_review(&self, plan: &ExternalArtworkPlan) -> Result<DurablePlan> {
+        let preview = json!({
+            "target_path": plan.target_path,
+            "action": if plan.original.is_some() { "replace" } else { "remove" },
+            "source_sha256": plan.original.as_ref().map(|value| value.sha256.as_str()),
+            "role": plan.target_artwork_role,
+        });
+        let saved = self.require_saved_plan(
+            plan.id(),
+            PlanKind::ArtworkProjection,
+            &json!({
+                "target_asset_id": plan.target_asset_id,
+                "original_artwork_asset_id": plan.original.as_ref().map(|value| value.asset_id.as_str()),
+                "projection": "external-artwork",
+            }),
+            &preview,
+        )?;
+        self.require_projection_step(
+            plan.id(),
+            &plan.target_asset_id,
+            &json!({
+                "path": plan.target_path,
+                "mime": plan.target_mime,
+                "sha256": plan.target_sha256,
+            }),
+            &preview,
+            &json!({
+                "entry_identity": plan.target_identity,
+                "blake3": plan.target_blake3,
+                "sha256": plan.target_sha256,
+                "byte_size": plan.target_size,
+                "root_id": plan.target_root_id,
+                "root_path": plan.root_path,
+                "relative_path": plan.target_relative_path,
+            }),
+        )?;
+        Ok(saved)
+    }
+
+    fn require_external_artwork_root(&self, plan: &ExternalArtworkPlan) -> Result<()> {
+        let (root_id, relative, absolute) = self.conn.query_row(
+            "SELECT root_id, relative_path, absolute_path FROM assets
+             WHERE id = ?1 AND managed = 1 AND verification_state = 'verified'",
+            [plan.target_asset_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    PathBuf::from(row.get::<_, String>(1)?),
+                    PathBuf::from(row.get::<_, String>(2)?),
+                ))
+            },
+        )?;
+        if RootId::parse(root_id)? != plan.target_root_id
+            || relative != plan.target_relative_path
+            || absolute != plan.target_path
+        {
+            return Err(Error::Artwork(
+                "external artwork asset root or path changed after preview".into(),
+            ));
+        }
+        let root_record = self.library_root(&plan.target_root_id)?;
+        root_record.require_safe_mutation()?;
+        if root_record.path() != plan.root_path
+            || plan.root_path.join(&plan.target_relative_path) != plan.target_path
+        {
+            return Err(Error::Artwork(
+                "external artwork root path changed after preview".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 pub struct EmbeddedArtworkExecutor<'a> {
@@ -500,11 +626,13 @@ impl<'a> EmbeddedArtworkExecutor<'a> {
     }
 
     pub fn execute(&mut self, plan: &EmbeddedArtworkPlan) -> Result<EmbeddedArtworkReceipt> {
-        if self.library.durable_plan(plan.id())?.state() != PlanState::Approved {
-            return Err(Error::Artwork(
-                "artwork projection must be approved before execution".into(),
-            ));
-        }
+        self.library
+            .require_embedded_artwork_review(plan)?
+            .require_approved()?;
+        self.library
+            .require_asset_root_mutation(&plan.audio_asset_id)?;
+        self.library
+            .require_original_artwork_review(plan.original.as_ref())?;
         if let Err(error) = self.library.start_durable_plan(plan.id()) {
             if self
                 .library
@@ -840,19 +968,13 @@ impl<'a> ExternalArtworkExecutor<'a> {
     }
 
     pub fn execute(&mut self, plan: &ExternalArtworkPlan) -> Result<ExternalArtworkReceipt> {
-        if self.library.durable_plan(plan.id())?.state() != PlanState::Approved {
-            return Err(Error::Artwork(
-                "external artwork projection must be approved before execution".into(),
-            ));
-        }
+        self.library
+            .require_external_artwork_review(plan)?
+            .require_approved()?;
+        self.library.require_external_artwork_root(plan)?;
+        self.library
+            .require_original_artwork_review(plan.original.as_ref())?;
         revalidate_external_plan(plan)?;
-        let root_record = self.library.library_root(&plan.target_root_id)?;
-        root_record.capabilities().require_safe_mutation()?;
-        if root_record.path() != plan.root_path {
-            return Err(Error::Artwork(
-                "external artwork root path changed after preview".into(),
-            ));
-        }
         let root = AnchoredRoot::open(&plan.root_path)?;
         if let Err(error) = self.library.start_durable_plan(plan.id()) {
             if self
@@ -1340,7 +1462,7 @@ fn sibling_path(path: &Path, operation: uuid::Uuid, role: &str) -> Result<PathBu
     let mut staged = std::ffi::OsString::from(".");
     staged.push(name);
     staged.push(format!(".rsbts-{operation}.{role}"));
-    Ok(path.with_file_name(staged))
+    Ok(crate::fsops::bounded_sibling_path(path, staged))
 }
 
 #[cfg(test)]
@@ -1351,6 +1473,7 @@ mod tests {
     use image::{DynamicImage, ImageBuffer, ImageFormat, Rgb};
 
     use super::*;
+    use crate::roots::RootState;
     use crate::{Album, AudioFormat, Item};
 
     fn wav(samples: &[i16]) -> Vec<u8> {
@@ -1624,6 +1747,383 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
+    fn root_policy_blocks_external_artwork_planning() -> Result<()> {
+        for state in [RootState::Offline, RootState::ReadOnly, RootState::Degraded] {
+            let temporary = tempfile::tempdir()?;
+            let audio = temporary.path().join("track.wav");
+            let original = temporary.path().join("original.png");
+            let cover = temporary.path().join("cover.png");
+            std::fs::write(&audio, wav(&[1, 2, 3, 4]))?;
+            std::fs::write(&original, png()?)?;
+            std::fs::write(&cover, png_color([9, 7, 5])?)?;
+            let (library, _audio_id, original_id) = managed_library(&audio, &original)?;
+            let target_id = add_external_artwork(&library, &cover)?;
+            let root = library.register_root(temporary.path())?;
+            library.set_root_state(root.id(), state)?;
+
+            assert!(
+                library
+                    .plan_external_artwork(&target_id, Some(&original_id))
+                    .is_err(),
+                "external artwork planning ignored {state:?} root policy"
+            );
+            let plans: u64 =
+                library
+                    .conn
+                    .query_row("SELECT COUNT(*) FROM durable_plans", [], |row| row.get(0))?;
+            assert_eq!(plans, 0);
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn root_policy_blocks_external_artwork_execution_after_approval() -> Result<()> {
+        for state in [RootState::Offline, RootState::ReadOnly, RootState::Degraded] {
+            let temporary = tempfile::tempdir()?;
+            let audio = temporary.path().join("track.wav");
+            let original = temporary.path().join("original.png");
+            let cover = temporary.path().join("cover.png");
+            let previous = png_color([9, 7, 5])?;
+            std::fs::write(&audio, wav(&[1, 2, 3, 4]))?;
+            std::fs::write(&original, png()?)?;
+            std::fs::write(&cover, &previous)?;
+            let (mut library, _audio_id, original_id) = managed_library(&audio, &original)?;
+            let target_id = add_external_artwork(&library, &cover)?;
+            let root = library.register_root(temporary.path())?;
+            let plan = library.plan_external_artwork(&target_id, Some(&original_id))?;
+            library.approve_external_artwork(&plan)?;
+            library.set_root_state(root.id(), state)?;
+
+            assert!(
+                ExternalArtworkExecutor::new(&mut library)
+                    .execute(&plan)
+                    .is_err(),
+                "external artwork execution ignored {state:?} root policy"
+            );
+            assert_eq!(std::fs::read(&cover)?, previous);
+            assert_eq!(
+                library.durable_plan(plan.id())?.state(),
+                PlanState::Approved
+            );
+            library.set_root_state(root.id(), RootState::Online)?;
+            ExternalArtworkExecutor::new(&mut library).execute(&plan)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn root_policy_blocks_embedded_artwork_planning() -> Result<()> {
+        for state in [RootState::Offline, RootState::ReadOnly, RootState::Degraded] {
+            let temporary = tempfile::tempdir()?;
+            let audio = temporary.path().join("track.wav");
+            let original = temporary.path().join("original.png");
+            std::fs::write(&audio, wav(&[1, 2, 3, 4]))?;
+            std::fs::write(&original, png()?)?;
+            let (library, audio_id, original_id) = managed_library(&audio, &original)?;
+            let root = library.register_root(temporary.path())?;
+            library.set_root_state(root.id(), state)?;
+
+            assert!(
+                library
+                    .plan_embedded_front_artwork(&audio_id, Some(&original_id))
+                    .is_err(),
+                "embedded artwork planning ignored {state:?} root policy"
+            );
+            let plans: u64 =
+                library
+                    .conn
+                    .query_row("SELECT COUNT(*) FROM durable_plans", [], |row| row.get(0))?;
+            assert_eq!(plans, 0);
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn root_policy_blocks_embedded_artwork_execution_after_approval() -> Result<()> {
+        for state in [RootState::Offline, RootState::ReadOnly, RootState::Degraded] {
+            let temporary = tempfile::tempdir()?;
+            let audio = temporary.path().join("track.wav");
+            let original = temporary.path().join("original.png");
+            let source_audio = wav(&[1, 2, 3, 4]);
+            std::fs::write(&audio, &source_audio)?;
+            std::fs::write(&original, png()?)?;
+            let (mut library, audio_id, original_id) = managed_library(&audio, &original)?;
+            let root = library.register_root(temporary.path())?;
+            let plan = library.plan_embedded_front_artwork(&audio_id, Some(&original_id))?;
+            library.approve_embedded_front_artwork(&plan)?;
+            library.set_root_state(root.id(), state)?;
+
+            assert!(
+                EmbeddedArtworkExecutor::new(&mut library)
+                    .execute(&plan)
+                    .is_err(),
+                "embedded artwork execution ignored {state:?} root policy"
+            );
+            assert_eq!(std::fs::read(&audio)?, source_audio);
+            assert_eq!(
+                library.durable_plan(plan.id())?.state(),
+                PlanState::Approved
+            );
+            library.set_root_state(root.id(), RootState::Online)?;
+            EmbeddedArtworkExecutor::new(&mut library).execute(&plan)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn changed_embedded_artwork_plan_cannot_reuse_approval() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let audio = temporary.path().join("track.wav");
+        let original = temporary.path().join("original.png");
+        let source_audio = wav(&[1, 2, 3, 4]);
+        std::fs::write(&audio, &source_audio)?;
+        std::fs::write(&original, png()?)?;
+        let (mut library, audio_id, original_id) = managed_library(&audio, &original)?;
+        let plan = library.plan_embedded_front_artwork(&audio_id, Some(&original_id))?;
+        library.approve_embedded_front_artwork(&plan)?;
+        let mut serialized = serde_json::to_value(&plan)?;
+        serialized["original"] = serde_json::Value::Null;
+        let changed: EmbeddedArtworkPlan = serde_json::from_value(serialized)?;
+
+        assert!(
+            EmbeddedArtworkExecutor::new(&mut library)
+                .execute(&changed)
+                .is_err(),
+            "an edited embedded artwork plan reused approval"
+        );
+        assert_eq!(std::fs::read(&audio)?, source_audio);
+        assert_eq!(
+            library.durable_plan(plan.id())?.state(),
+            PlanState::Approved
+        );
+        EmbeddedArtworkExecutor::new(&mut library).execute(&plan)?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn changed_external_artwork_plan_cannot_reuse_approval() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let audio = temporary.path().join("track.wav");
+        let original = temporary.path().join("original.png");
+        let cover = temporary.path().join("cover.png");
+        let previous = png_color([9, 7, 5])?;
+        std::fs::write(&audio, wav(&[1, 2, 3, 4]))?;
+        std::fs::write(&original, png()?)?;
+        std::fs::write(&cover, &previous)?;
+        let (mut library, _audio_id, original_id) = managed_library(&audio, &original)?;
+        let target_id = add_external_artwork(&library, &cover)?;
+        let plan = library.plan_external_artwork(&target_id, Some(&original_id))?;
+        library.approve_external_artwork(&plan)?;
+        let mut serialized = serde_json::to_value(&plan)?;
+        serialized["original"] = serde_json::Value::Null;
+        let changed: ExternalArtworkPlan = serde_json::from_value(serialized)?;
+
+        assert!(
+            ExternalArtworkExecutor::new(&mut library)
+                .execute(&changed)
+                .is_err(),
+            "an edited external artwork plan reused approval"
+        );
+        assert_eq!(std::fs::read(&cover)?, previous);
+        assert_eq!(
+            library.durable_plan(plan.id())?.state(),
+            PlanState::Approved
+        );
+        ExternalArtworkExecutor::new(&mut library).execute(&plan)?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn typed_approval_rejects_changed_embedded_artwork_content() -> Result<()> {
+        require_changed_embedded_artwork_approval(false)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn typed_approval_rejects_changed_embedded_artwork_evidence() -> Result<()> {
+        require_changed_embedded_artwork_approval(true)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn typed_approval_rejects_changed_embedded_artwork_source() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let audio = temporary.path().join("track.wav");
+        let original = temporary.path().join("original.png");
+        std::fs::write(&audio, wav(&[1, 2, 3, 4]))?;
+        std::fs::write(&original, png()?)?;
+        let (library, audio_id, original_id) = managed_library(&audio, &original)?;
+        let plan = library.plan_embedded_front_artwork(&audio_id, Some(&original_id))?;
+        let mut serialized = serde_json::to_value(&plan)?;
+        serialized["original"]["path"] = json!(temporary.path().join("unreviewed.png"));
+        let changed: EmbeddedArtworkPlan = serde_json::from_value(serialized)?;
+
+        assert!(
+            library.approve_embedded_front_artwork(&changed).is_err(),
+            "changed artwork source approved a different embedded plan"
+        );
+        assert_eq!(library.durable_plan(plan.id())?.state(), PlanState::Planned);
+        library.approve_embedded_front_artwork(&plan)?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn require_changed_embedded_artwork_approval(change_evidence: bool) -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let audio = temporary.path().join("track.wav");
+        let original = temporary.path().join("original.png");
+        let source_audio = wav(&[1, 2, 3, 4]);
+        std::fs::write(&audio, &source_audio)?;
+        std::fs::write(&original, png()?)?;
+        let (library, audio_id, original_id) = managed_library(&audio, &original)?;
+        let plan = library.plan_embedded_front_artwork(&audio_id, Some(&original_id))?;
+        let events = serde_json::to_value(library.plan_events(plan.id())?)?;
+        let mut serialized = serde_json::to_value(&plan)?;
+        if change_evidence {
+            serialized["audio_size"] = json!(0);
+        } else {
+            serialized["original"] = serde_json::Value::Null;
+        }
+        let changed: EmbeddedArtworkPlan = serde_json::from_value(serialized)?;
+
+        assert!(
+            library.approve_embedded_front_artwork(&changed).is_err(),
+            "changed embedded artwork review approved a different plan: evidence={change_evidence}"
+        );
+        assert_eq!(library.durable_plan(plan.id())?.state(), PlanState::Planned);
+        assert_eq!(
+            serde_json::to_value(library.plan_events(plan.id())?)?,
+            events
+        );
+        assert_eq!(std::fs::read(&audio)?, source_audio);
+        library.approve_embedded_front_artwork(&plan)?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn typed_approval_rejects_changed_external_artwork_content() -> Result<()> {
+        require_changed_external_artwork_approval(false)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn typed_approval_rejects_changed_external_artwork_evidence() -> Result<()> {
+        require_changed_external_artwork_approval(true)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn typed_approval_rejects_changed_external_artwork_source() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let audio = temporary.path().join("track.wav");
+        let original = temporary.path().join("original.png");
+        let cover = temporary.path().join("cover.png");
+        std::fs::write(&audio, wav(&[1, 2, 3, 4]))?;
+        std::fs::write(&original, png()?)?;
+        std::fs::write(&cover, png_color([9, 7, 5])?)?;
+        let (library, _audio_id, original_id) = managed_library(&audio, &original)?;
+        let target_id = add_external_artwork(&library, &cover)?;
+        let plan = library.plan_external_artwork(&target_id, Some(&original_id))?;
+        let mut serialized = serde_json::to_value(&plan)?;
+        serialized["original"]["path"] = json!(temporary.path().join("unreviewed.png"));
+        let changed: ExternalArtworkPlan = serde_json::from_value(serialized)?;
+
+        assert!(
+            library.approve_external_artwork(&changed).is_err(),
+            "changed artwork source approved a different external plan"
+        );
+        assert_eq!(library.durable_plan(plan.id())?.state(), PlanState::Planned);
+        library.approve_external_artwork(&plan)?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn require_changed_external_artwork_approval(change_evidence: bool) -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let audio = temporary.path().join("track.wav");
+        let original = temporary.path().join("original.png");
+        let cover = temporary.path().join("cover.png");
+        let previous = png_color([9, 7, 5])?;
+        std::fs::write(&audio, wav(&[1, 2, 3, 4]))?;
+        std::fs::write(&original, png()?)?;
+        std::fs::write(&cover, &previous)?;
+        let (library, _audio_id, original_id) = managed_library(&audio, &original)?;
+        let target_id = add_external_artwork(&library, &cover)?;
+        let plan = library.plan_external_artwork(&target_id, Some(&original_id))?;
+        let events = serde_json::to_value(library.plan_events(plan.id())?)?;
+        let mut serialized = serde_json::to_value(&plan)?;
+        if change_evidence {
+            serialized["target_size"] = json!(0);
+        } else {
+            serialized["original"] = serde_json::Value::Null;
+        }
+        let changed: ExternalArtworkPlan = serde_json::from_value(serialized)?;
+
+        assert!(
+            library.approve_external_artwork(&changed).is_err(),
+            "changed external artwork review approved a different plan: evidence={change_evidence}"
+        );
+        assert_eq!(library.durable_plan(plan.id())?.state(), PlanState::Planned);
+        assert_eq!(
+            serde_json::to_value(library.plan_events(plan.id())?)?,
+            events
+        );
+        assert_eq!(std::fs::read(&cover)?, previous);
+        library.approve_external_artwork(&plan)?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn external_artwork_rejects_an_ancestor_root_substitution() -> Result<()> {
+        for state in [RootState::Offline, RootState::Online] {
+            let temporary = tempfile::tempdir()?;
+            let root = temporary.path().join("library");
+            std::fs::create_dir(&root)?;
+            let audio = root.join("track.wav");
+            let original = root.join("original.png");
+            let cover = root.join("cover.png");
+            let previous = png_color([9, 7, 5])?;
+            std::fs::write(&audio, wav(&[1, 2, 3, 4]))?;
+            std::fs::write(&original, png()?)?;
+            std::fs::write(&cover, &previous)?;
+            let (mut library, _audio_id, original_id) = managed_library(&audio, &original)?;
+            let target_id = add_external_artwork(&library, &cover)?;
+            let actual = library.register_root(&root)?;
+            let ancestor = library.register_root(temporary.path())?;
+            let plan = library.plan_external_artwork(&target_id, Some(&original_id))?;
+            library.approve_external_artwork(&plan)?;
+            library.set_root_state(actual.id(), state)?;
+            let mut serialized = serde_json::to_value(&plan)?;
+            serialized["target_root_id"] = json!(ancestor.id());
+            serialized["root_path"] = json!(temporary.path());
+            serialized["target_relative_path"] = json!("library/cover.png");
+            let changed: ExternalArtworkPlan = serde_json::from_value(serialized)?;
+
+            assert!(
+                ExternalArtworkExecutor::new(&mut library)
+                    .execute(&changed)
+                    .is_err(),
+                "an ancestor root bypassed {state:?} target policy and saved review"
+            );
+            assert_eq!(std::fs::read(&cover)?, previous);
+            assert_eq!(
+                library.durable_plan(plan.id())?.state(),
+                PlanState::Approved
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
     fn embedded_front_replace_and_remove_are_approved_journaled_projections() -> Result<()> {
         let temporary = tempfile::tempdir()?;
         let audio = temporary.path().join("track.wav");
@@ -1694,7 +2194,10 @@ mod tests {
             };
             let recovery = library.recover_pending()?;
             assert!(recovery.unresolved.is_empty(), "{recovery:?}");
-            assert!(library.recover_pending()?.unresolved.is_empty());
+            assert_eq!(
+                library.recover_pending()?.unresolved,
+                [] as [std::string::String; 0]
+            );
 
             let current = std::fs::read(&audio)?;
             let mut original_retained = current == original_audio;
@@ -1723,7 +2226,7 @@ mod tests {
         }
 
         let hits = one(None)?;
-        assert!(!hits.is_empty());
+        assert_ne!(hits, [] as [&str; 0]);
         for index in 0..hits.len() {
             one(Some(index))?;
         }
@@ -1757,7 +2260,10 @@ mod tests {
             };
             let recovery = library.recover_pending()?;
             assert!(recovery.unresolved.is_empty(), "{recovery:?}");
-            assert!(library.recover_pending()?.unresolved.is_empty());
+            assert_eq!(
+                library.recover_pending()?.unresolved,
+                [] as [std::string::String; 0]
+            );
 
             let mut previous_retained = cover.exists() && std::fs::read(&cover)? == previous;
             for entry in std::fs::read_dir(temporary.path())? {
@@ -1786,7 +2292,7 @@ mod tests {
         }
 
         let hits = one(None)?;
-        assert!(!hits.is_empty());
+        assert_ne!(hits, [] as [&str; 0]);
         for index in 0..hits.len() {
             one(Some(index))?;
         }
