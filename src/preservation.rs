@@ -1504,7 +1504,10 @@ mod tests {
             "restore run has no stable operation link"
         );
         assert!(restore_run_state(&library, &run_id)?.1.is_some());
-        assert!(library.recover_pending()?.recovered_operations.is_empty());
+        assert_eq!(
+            library.recover_pending()?.recovered_operations,
+            [] as [std::string::String; 0]
+        );
         Ok(())
     }
 
@@ -1528,7 +1531,10 @@ mod tests {
             );
             assert!(after.1.is_some());
             let events = serde_json::to_value(library.plan_events(plan.id())?)?;
-            assert!(library.recover_pending()?.recovered_operations.is_empty());
+            assert_eq!(
+                library.recover_pending()?.recovered_operations,
+                [] as [std::string::String; 0]
+            );
             assert_eq!(restore_run_state(&library, &operation)?, after);
             assert_eq!(
                 serde_json::to_value(library.plan_events(plan.id())?)?,
@@ -1626,7 +1632,10 @@ mod tests {
                 "failed"
             };
             assert_eq!(restore_run_state(&library, &operation)?.0, expected);
-            assert!(library.recover_pending()?.recovered_operations.is_empty());
+            assert_eq!(
+                library.recover_pending()?.recovered_operations,
+                [] as [std::string::String; 0]
+            );
         }
         Ok(())
     }
@@ -2314,7 +2323,7 @@ mod tests {
             assert_eq!(plan.asset_count(), 0);
             library.approve_manifest(&plan)?;
             let receipt = library.execute_manifest(&plan)?;
-            assert!(std::fs::read(receipt.path())?.is_empty());
+            assert_eq!(std::fs::read(receipt.path())?, [] as [u8; 0]);
             if format == ManifestFormat::BagIt {
                 assert!(
                     output.join("data").is_dir(),
@@ -2409,7 +2418,7 @@ mod tests {
         library.approve_manifest(&plan)?;
         let (recorded, boundaries) = failpoints::run_recording(|| library.execute_manifest(&plan));
         recorded?;
-        assert!(!boundaries.is_empty());
+        assert_ne!(boundaries, [] as [&str; 0]);
 
         for fail_at in 0..boundaries.len() {
             let temporary = tempfile::tempdir()?;

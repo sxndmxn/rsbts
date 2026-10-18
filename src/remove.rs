@@ -1220,7 +1220,10 @@ mod tests {
             };
             let recovery = library.recover_pending()?;
             assert!(recovery.unresolved.is_empty(), "{recovery:?}");
-            assert!(library.recover_pending()?.unresolved.is_empty());
+            assert_eq!(
+                library.recover_pending()?.unresolved,
+                [] as [std::string::String; 0]
+            );
 
             let mut copies = 0;
             for entry in std::fs::read_dir(temporary.path())? {
@@ -1430,7 +1433,10 @@ mod tests {
         std::fs::rename(&journal.source, &journal.staged)?;
         library.set_file_state(&operation, 0, "quarantined")?;
 
-        assert!(library.recover_pending()?.unresolved.is_empty());
+        assert_eq!(
+            library.recover_pending()?.unresolved,
+            [] as [std::string::String; 0]
+        );
         assert_eq!(std::fs::read(&journal.source)?, b"audio");
         assert_eq!(library.durable_plan(plan_id)?.state(), PlanState::Failed);
         assert_eq!(PurgePlan::build(&library, 0)?.len(), 1);
@@ -1461,7 +1467,10 @@ mod tests {
         assert_eq!(report.already_missing, 1);
         assert_eq!(report.purged_files, 0);
         assert!(PurgePlan::build(&library, 0)?.is_empty());
-        assert!(library.recover_pending()?.unresolved.is_empty());
+        assert_eq!(
+            library.recover_pending()?.unresolved,
+            [] as [std::string::String; 0]
+        );
         assert!(PurgePlan::build(&library, 0)?.is_empty());
         Ok(())
     }
@@ -1502,7 +1511,10 @@ mod tests {
         assert_eq!(library.durable_plan(plan_id)?.state(), PlanState::Complete);
         assert!(PurgePlan::build(&library, 0)?.is_empty());
         assert!(purge.paths().all(|path| !path.exists()));
-        assert!(library.recover_pending()?.unresolved.is_empty());
+        assert_eq!(
+            library.recover_pending()?.unresolved,
+            [] as [std::string::String; 0]
+        );
         assert!(PurgePlan::build(&library, 0)?.is_empty());
         Ok(())
     }
@@ -1531,7 +1543,10 @@ mod tests {
         assert_eq!(library.durable_plan(plan_id)?.state(), PlanState::Failed);
         assert!(library.durable_plan(plan_id)?.error().is_some());
         assert_eq!(std::fs::read(&purge.files[0].file.staged)?, b"audio");
-        assert!(library.recover_pending()?.unresolved.is_empty());
+        assert_eq!(
+            library.recover_pending()?.unresolved,
+            [] as [std::string::String; 0]
+        );
         assert_eq!(PurgePlan::build(&library, 0)?.len(), 1);
         Ok(())
     }
@@ -1561,7 +1576,10 @@ mod tests {
         assert!(library.durable_plan(plan_id)?.error().is_some());
         assert_eq!(std::fs::read(quarantined)?, b"replacement");
         assert_eq!(std::fs::read(preserved)?, b"audio");
-        assert!(library.recover_pending()?.unresolved.is_empty());
+        assert_eq!(
+            library.recover_pending()?.unresolved,
+            [] as [std::string::String; 0]
+        );
         assert_eq!(library.durable_plan(plan_id)?.state(), PlanState::Failed);
         Ok(())
     }
@@ -1668,7 +1686,10 @@ mod tests {
         );
         assert!(!retained.is_symlink());
         assert_eq!(std::fs::read(&target)?, b"audio");
-        assert!(library.recover_pending()?.unresolved.is_empty());
+        assert_eq!(
+            library.recover_pending()?.unresolved,
+            [] as [std::string::String; 0]
+        );
         assert_eq!(std::fs::read(target)?, b"audio");
         Ok(())
     }
@@ -1727,7 +1748,7 @@ mod tests {
         assert!(!track.exists());
         assert!(!artwork.exists());
         assert_eq!(PurgePlan::build(&library, 0)?.len(), 2);
-        assert!(library.audit()?.issues().is_empty());
+        assert_eq!(library.audit()?.issues(), []);
         Ok(())
     }
 

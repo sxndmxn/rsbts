@@ -502,7 +502,7 @@ mod tests {
         assert!(!source.exists());
         assert_eq!(std::fs::read(&destination)?, b"audio");
         assert_eq!(library.query_items(&Query::all())?[0].path, destination);
-        assert!(library.audit()?.issues().is_empty());
+        assert_eq!(library.audit()?.issues(), []);
         Ok(())
     }
 }

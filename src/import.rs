@@ -3925,7 +3925,10 @@ mod tests {
 
             let recovery = library.recover_pending()?;
             assert!(recovery.unresolved.is_empty(), "{recovery:?}");
-            assert!(library.recover_pending()?.unresolved.is_empty());
+            assert_eq!(
+                library.recover_pending()?.unresolved,
+                [] as [std::string::String; 0]
+            );
             assert_eq!(std::fs::read(&source)?, b"unowned source bytes");
             let items = library.query_items(&crate::query::Query::all())?;
             if destination.exists() {

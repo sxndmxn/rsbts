@@ -97,8 +97,8 @@ fn assert_album_scope(album: &Album) {
         metadata.track_total, None,
         "a per-disc total became an album total"
     );
-    assert!(metadata.artists.is_empty());
-    assert!(metadata.composers.is_empty());
+    assert_eq!(metadata.artists, [] as [std::string::String; 0]);
+    assert_eq!(metadata.composers, [] as [std::string::String; 0]);
     assert_eq!(metadata.external_ids.len(), 3);
     for (kind, value) in [
         ("release", RELEASE_ID),
@@ -182,8 +182,8 @@ fn assert_imported_metadata(
             assert_eq!(album.extended.original_date, PartialDate::default());
         }
         if album.album == "Conflict" {
-            assert!(album.extended.album_artists.is_empty());
-            assert!(album.extended.genres.is_empty());
+            assert_eq!(album.extended.album_artists, [] as [std::string::String; 0]);
+            assert_eq!(album.extended.genres, [] as [std::string::String; 0]);
         }
     }
     for item in items {

@@ -1671,7 +1671,7 @@ mod tests {
             library.durable_plan(plans[0].id())?.state(),
             PlanState::Approved
         );
-        assert!(library.plan_due_fixity(now, 10)?.is_empty());
+        assert_eq!(library.plan_due_fixity(now, 10)?, [] as [FixityPlan; 0]);
 
         let progress = library.run_fixity_page(&plans[0], 10)?;
         assert!(progress.complete());

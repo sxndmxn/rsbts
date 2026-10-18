@@ -702,7 +702,7 @@ mod tests {
         assert_eq!(flexible_query_ids("flex.rating:=2")?, [1, 4, 11]);
         assert_eq!(flexible_query_ids("flex.rating:=2.5")?, [2, 12]);
         assert_eq!(flexible_query_ids("flex.rating:=2broken")?, [9]);
-        assert!(flexible_query_ids("flex.rating:=1")?.is_empty());
+        assert_eq!(flexible_query_ids("flex.rating:=1")?, [] as [i64; 0]);
         assert_eq!(flexible_query_ids("flex.rating:=0")?, [10]);
         assert_eq!(
             flexible_query_ids("flex.rating:=9223372036854775807")?,

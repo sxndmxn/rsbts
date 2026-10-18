@@ -4353,7 +4353,10 @@ mod tests {
             crate::operations::PlanState::Failed
         );
         assert_eq!(library.plan_events(&plan)?.len(), events + 1);
-        assert!(library.recover_pending()?.recovered_operations.is_empty());
+        assert_eq!(
+            library.recover_pending()?.recovered_operations,
+            [] as [std::string::String; 0]
+        );
         assert_eq!(library.plan_events(&plan)?.len(), events + 1);
         Ok(())
     }
@@ -4370,7 +4373,10 @@ mod tests {
                 assert_eq!(durable.state(), crate::operations::PlanState::Complete);
                 assert_eq!(durable.progress(), (total.unwrap_or(2), total));
                 assert_eq!(library.plan_events(&plan)?.len(), events + 1);
-                assert!(library.recover_pending()?.recovered_operations.is_empty());
+                assert_eq!(
+                    library.recover_pending()?.recovered_operations,
+                    [] as [std::string::String; 0]
+                );
                 assert_eq!(library.plan_events(&plan)?.len(), events + 1);
             }
         }
@@ -4388,7 +4394,10 @@ mod tests {
                 let before = serde_json::to_value(library.durable_plan(&plan)?)?;
                 let events = serde_json::to_value(library.plan_events(&plan)?)?;
                 assert_eq!(library.recover_pending()?.recovered_operations, [operation]);
-                assert!(library.recover_pending()?.recovered_operations.is_empty());
+                assert_eq!(
+                    library.recover_pending()?.recovered_operations,
+                    [] as [std::string::String; 0]
+                );
                 assert_eq!(serde_json::to_value(library.durable_plan(&plan)?)?, before);
                 assert_eq!(serde_json::to_value(library.plan_events(&plan)?)?, events);
             }
@@ -4457,7 +4466,10 @@ mod tests {
             };
             assert_eq!(library.durable_plan(&plan)?.state(), expected);
             assert_eq!(library.plan_events(&plan)?.len(), events + 1);
-            assert!(library.recover_pending()?.recovered_operations.is_empty());
+            assert_eq!(
+                library.recover_pending()?.recovered_operations,
+                [] as [std::string::String; 0]
+            );
             assert_eq!(library.plan_events(&plan)?.len(), events + 1);
         }
         Ok(())
@@ -5171,7 +5183,7 @@ mod tests {
         library.set_file_state(&operation, 0, "staged")?;
         library.set_operation_state(&operation, "failed", None)?;
         let report = library.recover_pending()?;
-        assert!(report.unresolved.is_empty());
+        assert_eq!(report.unresolved, [] as [std::string::String; 0]);
         assert!(!staged.exists());
         assert!(destination.exists());
         Ok(())
@@ -5436,7 +5448,10 @@ mod tests {
         std::fs::rename(&staged, &acquired)?;
 
         for _ in 0..2 {
-            assert!(library.recover_pending()?.unresolved.is_empty());
+            assert_eq!(
+                library.recover_pending()?.unresolved,
+                [] as [std::string::String; 0]
+            );
             assert!(!acquired.exists(), "rollback abandoned an acquired file");
             assert!(!staged.exists());
         }
@@ -5472,7 +5487,7 @@ mod tests {
         library.set_file_state(&operation, 0, "staged")?;
         library.set_operation_state(&operation, "failed", None)?;
         let report = library.recover_pending()?;
-        assert!(report.unresolved.is_empty());
+        assert_eq!(report.unresolved, [] as [std::string::String; 0]);
         assert!(!staged.exists());
         assert!(!destination.exists());
         Ok(())
@@ -5794,7 +5809,10 @@ mod tests {
         result?;
         library.complete_operation(&operation)?;
         for _ in 0..2 {
-            assert!(library.recover_pending()?.unresolved.is_empty());
+            assert_eq!(
+                library.recover_pending()?.unresolved,
+                [] as [std::string::String; 0]
+            );
             assert_eq!(std::fs::read(&staged)?, b"replacement");
         }
         Ok(())
@@ -5872,7 +5890,10 @@ mod tests {
         std::fs::rename(&staged, &acquired)?;
 
         for _ in 0..2 {
-            assert!(library.recover_pending()?.unresolved.is_empty());
+            assert_eq!(
+                library.recover_pending()?.unresolved,
+                [] as [std::string::String; 0]
+            );
             assert!(
                 !acquired.exists(),
                 "purge recovery abandoned its acquired file"
@@ -6001,10 +6022,10 @@ mod tests {
         item.title = "Changed".into();
         item.year = Some(2024);
         library.update_items(&[(id, item)])?;
-        assert!(library.query_items(&Query::all())?[0]
-            .extended
-            .external_ids
-            .is_empty());
+        assert_eq!(
+            library.query_items(&Query::all())?[0].extended.external_ids,
+            [] as [ExternalId; 0]
+        );
         Ok(())
     }
 
@@ -6067,8 +6088,11 @@ mod tests {
             &["albumartist=".into(), "genre=".into(), "year=".into()],
         )?;
         let cleared = library.query_items(&Query::all())?.remove(0);
-        assert!(cleared.extended.album_artists.is_empty());
-        assert!(cleared.extended.genres.is_empty());
+        assert_eq!(
+            cleared.extended.album_artists,
+            [] as [std::string::String; 0]
+        );
+        assert_eq!(cleared.extended.genres, [] as [std::string::String; 0]);
         assert_eq!(cleared.extended.date, crate::PartialDate::default());
         Ok(())
     }
@@ -6235,7 +6259,7 @@ mod tests {
 
         let report = library.recover_pending()?;
 
-        assert!(report.unresolved.is_empty());
+        assert_eq!(report.unresolved, [] as [std::string::String; 0]);
         assert!(source.is_symlink());
         assert_eq!(std::fs::read_link(&source)?, missing_target);
         assert!(!staged.is_symlink());

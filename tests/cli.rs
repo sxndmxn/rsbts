@@ -74,10 +74,11 @@ fn parse_json_document(output: &Output) -> Result<serde_json::Value, Box<dyn std
 #[test]
 fn existing_tags_import_skips_provider_lookups() -> Result<(), Box<dyn std::error::Error>> {
     let temporary = tempfile::tempdir()?;
-    let config = temporary.path().join("config.toml");
-    let database = temporary.path().join("library.db");
-    let organized = temporary.path().join("organized");
-    let source = temporary.path().join("track.mp3");
+    let directory = temporary.path().canonicalize()?;
+    let config = directory.join("config.toml");
+    let database = directory.join("library.db");
+    let organized = directory.join("organized");
+    let source = directory.join("track.mp3");
     let mut original = std::fs::read(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/formats/mp3.mp3"),
     )?;
@@ -91,11 +92,23 @@ fn existing_tags_import_skips_provider_lookups() -> Result<(), Box<dyn std::erro
         &config,
         "[library]\ndirectory = 'organized'\ndatabase = 'library.db'\n[musicbrainz]\nmax_retries = 0\n",
     )?;
+    let action = if cfg!(any(target_os = "linux", target_os = "android")) {
+        "--copy"
+    } else {
+        "--in-place"
+    };
     for approval in ["--dry-run", "--yes"] {
         let output = Command::new(env!("CARGO_BIN_EXE_rsbts"))
             .args(["--config"])
             .arg(&config)
-            .args(["--output", "json", "import", "--existing-tags", approval])
+            .args([
+                "--output",
+                "json",
+                "import",
+                "--existing-tags",
+                action,
+                approval,
+            ])
             .arg(&source)
             .env("HTTP_PROXY", "http://127.0.0.1:0")
             .env("HTTPS_PROXY", "http://127.0.0.1:0")
@@ -152,9 +165,10 @@ fn import_reports_unreadable_audio_instead_of_silently_skipping(
         .ok_or("missing scan issues")?;
     assert_eq!(issues.len(), 2, "{result}");
     for name in ["unsupported.wma", "damaged.MP3"] {
+        let expected = input.join(name).canonicalize()?;
         assert!(issues
             .iter()
-            .any(|issue| issue["path"] == input.join(name).to_string_lossy().as_ref()));
+            .any(|issue| issue["path"] == expected.to_string_lossy().as_ref()));
     }
     assert!(!temporary.path().join("library.db").exists());
     assert!(!temporary.path().join("organized").exists());

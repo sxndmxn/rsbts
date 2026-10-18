@@ -2194,7 +2194,10 @@ mod tests {
             };
             let recovery = library.recover_pending()?;
             assert!(recovery.unresolved.is_empty(), "{recovery:?}");
-            assert!(library.recover_pending()?.unresolved.is_empty());
+            assert_eq!(
+                library.recover_pending()?.unresolved,
+                [] as [std::string::String; 0]
+            );
 
             let current = std::fs::read(&audio)?;
             let mut original_retained = current == original_audio;
@@ -2223,7 +2226,7 @@ mod tests {
         }
 
         let hits = one(None)?;
-        assert!(!hits.is_empty());
+        assert_ne!(hits, [] as [&str; 0]);
         for index in 0..hits.len() {
             one(Some(index))?;
         }
@@ -2257,7 +2260,10 @@ mod tests {
             };
             let recovery = library.recover_pending()?;
             assert!(recovery.unresolved.is_empty(), "{recovery:?}");
-            assert!(library.recover_pending()?.unresolved.is_empty());
+            assert_eq!(
+                library.recover_pending()?.unresolved,
+                [] as [std::string::String; 0]
+            );
 
             let mut previous_retained = cover.exists() && std::fs::read(&cover)? == previous;
             for entry in std::fs::read_dir(temporary.path())? {
@@ -2286,7 +2292,7 @@ mod tests {
         }
 
         let hits = one(None)?;
-        assert!(!hits.is_empty());
+        assert_ne!(hits, [] as [&str; 0]);
         for index in 0..hits.len() {
             one(Some(index))?;
         }

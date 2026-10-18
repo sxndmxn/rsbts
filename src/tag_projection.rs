@@ -1075,7 +1075,10 @@ mod tests {
             };
             let recovery = library.recover_pending()?;
             assert!(recovery.unresolved.is_empty(), "{recovery:?}");
-            assert!(library.recover_pending()?.unresolved.is_empty());
+            assert_eq!(
+                library.recover_pending()?.unresolved,
+                [] as [std::string::String; 0]
+            );
 
             let current = std::fs::read(&path)?;
             let mut retained_original = current == original;
@@ -1088,7 +1091,7 @@ mod tests {
                 }
             }
             assert!(retained_original, "original bytes were not retained");
-            assert!(library.audit()?.issues().is_empty());
+            assert_eq!(library.audit()?.issues(), []);
             assert!(matches!(
                 library.durable_plan(plan.id())?.state(),
                 PlanState::Complete | PlanState::Failed

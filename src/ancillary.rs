@@ -826,8 +826,14 @@ mod tests {
                         row.get(0)
                     })?;
             assert_eq!(journals, 0);
-            assert!(library.recover_pending()?.unresolved.is_empty());
-            assert!(library.recover_pending()?.unresolved.is_empty());
+            assert_eq!(
+                library.recover_pending()?.unresolved,
+                [] as [std::string::String; 0]
+            );
+            assert_eq!(
+                library.recover_pending()?.unresolved,
+                [] as [std::string::String; 0]
+            );
         }
         Ok(())
     }
@@ -847,8 +853,14 @@ mod tests {
             "a committed start error left the plan running"
         );
         assert!(!plan.files[0].destination.exists());
-        assert!(library.recover_pending()?.unresolved.is_empty());
-        assert!(library.recover_pending()?.unresolved.is_empty());
+        assert_eq!(
+            library.recover_pending()?.unresolved,
+            [] as [std::string::String; 0]
+        );
+        assert_eq!(
+            library.recover_pending()?.unresolved,
+            [] as [std::string::String; 0]
+        );
         Ok(())
     }
 
@@ -933,7 +945,7 @@ mod tests {
         std::fs::write(temporary.path().join("rip.log"), b"Exact Audio Copy")?;
         std::fs::write(temporary.path().join("notes.xyz"), b"notes")?;
         let scan = scan_ancillary_paths(&[temporary.path().to_path_buf()], false);
-        assert!(scan.issues().is_empty());
+        assert_eq!(scan.issues(), [] as [String; 0]);
         assert_eq!(scan.candidates().len(), 3);
         assert!(scan
             .candidates()
