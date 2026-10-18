@@ -20,11 +20,28 @@ pub enum ProviderEntityKind {
 }
 
 /// A validated, provider- and entity-typed external identifier.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProviderEntityId {
     provider: String,
     kind: ProviderEntityKind,
     value: String,
+}
+
+impl<'de> Deserialize<'de> for ProviderEntityId {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct UncheckedProviderEntityId {
+            provider: String,
+            kind: ProviderEntityKind,
+            value: String,
+        }
+
+        let id = UncheckedProviderEntityId::deserialize(deserializer)?;
+        Self::new(id.provider, id.kind, id.value).map_err(serde::de::Error::custom)
+    }
 }
 
 impl ProviderEntityId {
@@ -301,5 +318,43 @@ pub trait MetadataProvider: Send + Sync {
                 .map(|artwork| vec![artwork])
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_id_deserialization_enforces_constructor_limits() -> Result<()> {
+        for (provider, value) in [
+            (String::new(), "123".into()),
+            ("   ".into(), "123".into()),
+            ("bad\nprovider".into(), "123".into()),
+            ("x".repeat(129), "123".into()),
+            ("discogs".into(), String::new()),
+            ("discogs".into(), "   ".into()),
+            ("discogs".into(), "bad\nid".into()),
+            ("discogs".into(), "x".repeat(513)),
+        ] {
+            assert!(ProviderEntityId::new(&provider, ProviderEntityKind::Release, &value).is_err());
+            assert!(
+                serde_json::from_value::<ProviderEntityId>(serde_json::json!({
+                    "provider": provider,
+                    "kind": ProviderEntityKind::Release,
+                    "value": value,
+                }))
+                .is_err(),
+                "constructor-invalid provider ID passed JSON validation"
+            );
+        }
+        let valid = ProviderEntityId::new(
+            "x".repeat(128),
+            ProviderEntityKind::Release,
+            "y".repeat(512),
+        )?;
+        let encoded = serde_json::to_value(&valid)?;
+        assert_eq!(serde_json::from_value::<ProviderEntityId>(encoded)?, valid);
+        Ok(())
     }
 }

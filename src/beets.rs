@@ -455,34 +455,34 @@ fn resolve_path(value: &Value, music_directory: Option<&Path>) -> Result<PathBuf
     }
 }
 
-fn read_yaml(path: &Path) -> Result<serde_yaml::Value> {
+fn read_yaml(path: &Path) -> Result<serde_json::Value> {
     let content = std::fs::read_to_string(path)?;
-    serde_yaml::from_str(&content)
+    serde_saphyr::from_str(&content)
         .map_err(|error| Error::Config(format!("invalid Beets YAML: {error}")))
 }
 
-fn configured_music_directory(value: &serde_yaml::Value) -> Option<PathBuf> {
+fn configured_music_directory(value: &serde_json::Value) -> Option<PathBuf> {
     value
         .get("directory")
-        .and_then(serde_yaml::Value::as_str)
+        .and_then(serde_json::Value::as_str)
         .map(PathBuf::from)
 }
 
-fn translate_yaml(yaml: &serde_yaml::Value, config: &mut Config, warnings: &mut Vec<String>) {
+fn translate_yaml(yaml: &serde_json::Value, config: &mut Config, warnings: &mut Vec<String>) {
     if let Some(import) = yaml.get("import") {
         config.import.action = if import
             .get("move")
-            .and_then(serde_yaml::Value::as_bool)
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false)
         {
             Action::Move
         } else if import
             .get("link")
-            .and_then(serde_yaml::Value::as_bool)
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false)
         {
             Action::Link
-        } else if import.get("copy").and_then(serde_yaml::Value::as_bool) == Some(false) {
+        } else if import.get("copy").and_then(serde_json::Value::as_bool) == Some(false) {
             Action::InPlace
         } else {
             Action::Copy
@@ -491,7 +491,7 @@ fn translate_yaml(yaml: &serde_yaml::Value, config: &mut Config, warnings: &mut 
     if let Some(format) = yaml
         .get("paths")
         .and_then(|paths| paths.get("default"))
-        .and_then(serde_yaml::Value::as_str)
+        .and_then(serde_json::Value::as_str)
     {
         if crate::pathformat::validate_template(format).is_ok() {
             config.paths.format = format.to_string();
@@ -724,7 +724,7 @@ mod tests {
         drop(connection);
 
         let config_path = temporary.path().join("config.yaml");
-        let yaml = serde_yaml::to_string(&serde_json::json!({
+        let yaml = serde_json::to_string(&serde_json::json!({
             "directory": music_directory,
             "plugins": ["fetchart"],
             "import": {"copy": false},

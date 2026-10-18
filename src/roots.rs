@@ -23,9 +23,9 @@ impl RootId {
 
     pub fn parse(value: impl Into<String>) -> Result<Self> {
         let value = value.into();
-        Uuid::parse_str(&value)
+        let id = Uuid::parse_str(&value)
             .map_err(|error| Error::Root(format!("invalid root ID: {error}")))?;
-        Ok(Self(value.to_ascii_lowercase()))
+        Ok(Self(id.to_string()))
     }
 
     #[must_use]
@@ -118,9 +118,7 @@ pub struct RootCapabilities {
 impl RootCapabilities {
     /// Inspect the root or its nearest existing ancestor without writing to it.
     pub fn detect(root: &Path) -> Result<Self> {
-        if !root.is_absolute() {
-            return Err(Error::Root("library root must be absolute".into()));
-        }
+        crate::fsops::validate_absolute_root_path(root)?;
         let existing = nearest_existing_ancestor(root)?;
         let metadata = std::fs::symlink_metadata(&existing)?;
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -194,6 +192,17 @@ pub struct LibraryRoot {
 }
 
 impl LibraryRoot {
+    /// Require online policy and safe filesystem capabilities for file changes.
+    pub fn require_safe_mutation(&self) -> Result<()> {
+        if self.state != RootState::Online {
+            return Err(Error::Root(
+                "library root must be online for file changes".into(),
+            ));
+        }
+        crate::fsops::validate_absolute_root_path(&self.path)?;
+        self.capabilities.require_safe_mutation()
+    }
+
     #[must_use]
     pub const fn id(&self) -> &RootId {
         &self.id
@@ -216,19 +225,81 @@ impl LibraryRoot {
 }
 
 impl Library {
+    /// Check saved root policy while preserving unregistered legacy assets.
+    pub(crate) fn require_root_mutation(&self, root_id: &str) -> Result<()> {
+        let id = RootId::parse(root_id)?;
+        if id.as_str() == "00000000-0000-0000-0000-000000000000" {
+            let state = self.conn.query_row(
+                "SELECT state FROM library_roots WHERE id = ?1",
+                [id.as_str()],
+                |row| row.get::<_, String>(0),
+            )?;
+            if state == "legacy" {
+                return Ok(());
+            }
+        }
+        self.library_root(&id)?.require_safe_mutation()
+    }
+
+    /// Check the saved policy for an asset's registered root.
+    pub(crate) fn require_asset_root_mutation(&self, asset_id: &str) -> Result<()> {
+        let root_id = self.conn.query_row(
+            "SELECT root_id FROM assets WHERE id = ?1",
+            [asset_id],
+            |row| row.get::<_, String>(0),
+        )?;
+        self.require_root_mutation(&root_id)
+    }
+
+    /// Check the nearest registered root for a file or directory.
+    pub(crate) fn require_path_root_mutation(&self, path: &Path) -> Result<()> {
+        if let Some(root) = self.registered_root_for_path(path)? {
+            return root.require_safe_mutation();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn registered_root_for_path(&self, path: &Path) -> Result<Option<LibraryRoot>> {
+        root_path_text(path)?;
+        let mut statement = self
+            .conn
+            .prepare("SELECT id, path FROM library_roots WHERE state != 'legacy'")?;
+        let mut rows = statement.query([])?;
+        let mut found: Option<(usize, String)> = None;
+        let mut ambiguous = false;
+        while let Some(row) = rows.next()? {
+            let stored = PathBuf::from(row.get::<_, String>(1)?);
+            crate::fsops::validate_absolute_root_path(&stored)?;
+            if !path.starts_with(&stored) {
+                continue;
+            }
+            let depth = stored.components().count();
+            match &found {
+                Some((existing_depth, _id)) if *existing_depth > depth => {}
+                Some((existing_depth, _id)) if *existing_depth == depth => ambiguous = true,
+                _ => {
+                    found = Some((depth, row.get(0)?));
+                    ambiguous = false;
+                }
+            }
+        }
+        if ambiguous {
+            return Err(Error::Root(
+                "multiple roots use the same path. Review the root records".into(),
+            ));
+        }
+        found
+            .map(|(_depth, id)| self.library_root(&RootId::parse(id)?))
+            .transpose()
+    }
+
     /// Register a stable root UUID without claiming ownership of any files.
     pub fn register_root(&self, path: &Path) -> Result<LibraryRoot> {
         let path_text = root_path_text(path)?;
-        if let Some(id) = self
-            .conn
-            .query_row(
-                "SELECT id FROM library_roots WHERE path = ?1 AND state != 'legacy'",
-                [path_text],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-        {
-            return self.library_root(&RootId::parse(id)?);
+        if let Some(root) = self.registered_root_for_path(path)? {
+            if root.path() == path {
+                return Ok(root);
+            }
         }
         let capabilities = RootCapabilities::detect(path)?;
         let id = RootId::new();
@@ -353,9 +424,7 @@ impl Library {
 }
 
 fn root_path_text(path: &Path) -> Result<&str> {
-    if !path.is_absolute() {
-        return Err(Error::Root("library root path must be absolute".into()));
-    }
+    crate::fsops::validate_absolute_root_path(path)?;
     path.to_str()
         .ok_or_else(|| Error::Root("library root path must be valid UTF-8".into()))
 }
@@ -430,6 +499,106 @@ const fn platform_has_safe_resolution() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alternate_root_id_forms_find_the_stored_root() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let library = Library::open_in_memory()?;
+        let root = library.register_root(temporary.path())?;
+        let uuid =
+            Uuid::parse_str(root.id().as_str()).map_err(|error| Error::Root(error.to_string()))?;
+        for value in [
+            uuid.simple().to_string(),
+            uuid.braced().to_string(),
+            uuid.urn().to_string(),
+            root.id().as_str().to_ascii_uppercase(),
+        ] {
+            let parsed = RootId::parse(&value)?;
+            let found = library.library_root(&parsed);
+            assert!(found.is_ok(), "{value} missed the stored root: {found:?}");
+            assert_eq!(&parsed, root.id());
+            assert_eq!(
+                &serde_json::from_value::<RootId>(serde_json::json!(value))?,
+                root.id()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn equivalent_root_spellings_reuse_identity() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("library");
+        std::fs::create_dir(&path)?;
+        let library = Library::open_in_memory()?;
+        let root = library.register_root(&path)?;
+        for alias in [
+            PathBuf::from(format!("{}/", path.display())),
+            temporary.path().join(".").join("library"),
+        ] {
+            assert_eq!(
+                library.register_root(&alias)?.id(),
+                root.id(),
+                "equivalent path created another root: {}",
+                alias.display()
+            );
+        }
+        assert_eq!(library.library_roots_page(None, 10)?.len(), 1);
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn equivalent_root_spellings_preserve_saved_policy() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("library");
+        std::fs::create_dir(&path)?;
+        let library = Library::open_in_memory()?;
+        let root = library.register_root(&path)?;
+        library.set_root_state(root.id(), RootState::Offline)?;
+        for alias in [
+            PathBuf::from(format!("{}/", path.display())),
+            temporary.path().join(".").join("library"),
+        ] {
+            assert!(
+                library.require_path_root_mutation(&alias).is_err(),
+                "equivalent path bypassed saved root policy: {}",
+                alias.display()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn root_registration_rejects_parent_components() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        std::fs::create_dir(temporary.path().join("intermediate"))?;
+        std::fs::create_dir(temporary.path().join("library"))?;
+        let alias = temporary.path().join("intermediate/../library");
+        let library = Library::open_in_memory()?;
+        assert!(
+            library.register_root(&alias).is_err(),
+            "root registration accepted parent components"
+        );
+        assert!(library.library_roots_page(None, 10)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn root_policy_lookup_rejects_parent_components() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        std::fs::create_dir(temporary.path().join("intermediate"))?;
+        std::fs::create_dir(temporary.path().join("library"))?;
+        let alias = temporary.path().join("intermediate/../library");
+        let library = Library::open_in_memory()?;
+        let root = library.register_root(&temporary.path().join("library"))?;
+        library.set_root_state(root.id(), RootState::Offline)?;
+        assert!(
+            library.require_path_root_mutation(&alias).is_err(),
+            "parent components bypassed root policy lookup"
+        );
+        Ok(())
+    }
 
     #[test]
     fn local_root_exposes_a_serializable_capability_profile() -> Result<()> {

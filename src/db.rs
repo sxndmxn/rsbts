@@ -9,7 +9,7 @@ use rusqlite::types::{Type, Value};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Transaction};
 
 use crate::artwork::ArtworkAssetMetadata;
-use crate::asset::digest_file;
+use crate::asset::{digest_file, digest_reader};
 use crate::failpoints;
 use crate::fsops::AnchoredRoot;
 use crate::lease::CollectionLease;
@@ -22,6 +22,11 @@ use crate::{
     validate_album_metadata, validate_item_metadata, Album, AudioFormat, Error, ExtendedMetadata,
     ExternalId, FlexibleValue, Item, Result,
 };
+
+#[cfg(test)]
+thread_local! {
+    static REGEXP_COMPILATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 pub struct Library {
     pub(crate) conn: Connection,
@@ -339,10 +344,11 @@ impl Library {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let lease = CollectionLease::acquire_exclusive(path)?;
-        let mut conn = Connection::open(path)?;
+        let database = database_path_for_write(path)?;
+        let lease = CollectionLease::acquire_exclusive(&database)?;
+        let mut conn = Connection::open(&database)?;
         configure_connection(&conn)?;
-        let migration_report = migrations::run_migrations(&mut conn, Some(path))?;
+        let migration_report = migrations::run_migrations(&mut conn, Some(&database))?;
         let needs_size_backfill = migration_report.from_version < 2;
         let mut library = Self {
             conn,
@@ -356,10 +362,9 @@ impl Library {
         Ok(library)
     }
 
-    /// Open an in-memory snapshot without changing the source database.
+    /// Open a read-only view without changing the source database.
     ///
-    /// A missing source is represented by an empty, migrated in-memory database. Existing legacy
-    /// schemas are migrated only inside the snapshot, which makes this suitable for dry runs.
+    /// Missing and legacy databases use in-memory views. Setup finishes before writes are disabled.
     /// A current schema is opened read-only without copying the database.
     pub fn open_snapshot(path: &Path) -> Result<Self> {
         if path.exists() || path.is_symlink() {
@@ -392,12 +397,14 @@ impl Library {
             if needs_size_backfill {
                 library.backfill_file_sizes()?;
             }
+            library.conn.pragma_update(None, "query_only", true)?;
             return Ok(library);
         }
 
         let mut conn = Connection::open_in_memory()?;
         configure_connection(&conn)?;
         let migration_report = migrations::run_migrations(&mut conn, None)?;
+        conn.pragma_update(None, "query_only", true)?;
         Ok(Self {
             conn,
             path: None,
@@ -746,34 +753,7 @@ impl Library {
         for operation in operations {
             match recover_operation(&operation) {
                 Ok(()) => {
-                    if operation.kind == OperationKind::PurgeDelete {
-                        if matches!(operation.state.as_str(), "db-committed" | "cleanup-pending") {
-                            self.finalize_purge_history(&operation)?;
-                        } else if let Some(plan_id) = &operation.plan_id {
-                            let plan_id = PlanId::parse(plan_id.clone())?;
-                            let transaction = self.conn.unchecked_transaction()?;
-                            let changed = transaction.execute(
-                                "UPDATE durable_plans
-                                 SET state = 'failed', error = 'purge rolled back during recovery',
-                                     updated_at = ?2, completed_at = ?2
-                                 WHERE id = ?1 AND state IN ('approved', 'running', 'paused')",
-                                params![plan_id.as_str(), Utc::now().to_rfc3339()],
-                            )?;
-                            if changed == 1 {
-                                append_plan_event(
-                                    &transaction,
-                                    &plan_id,
-                                    "failed",
-                                    &serde_json::json!({
-                                        "error": "purge rolled back during recovery",
-                                        "recovered_operation": operation.id,
-                                    }),
-                                )?;
-                            }
-                            transaction.commit()?;
-                        }
-                    }
-                    self.complete_operation(&operation.id)?;
+                    self.finish_recovered_operation(&operation)?;
                     report.recovered_operations.push(operation.id);
                 }
                 Err(error) => {
@@ -793,12 +773,34 @@ impl Library {
             .query_map(params_from_iter(compiled.parameters.iter()), row_to_item)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(stmt);
-        for item in &mut items {
-            if let Some(id) = item.id {
-                item.extended = load_extended_metadata(&self.conn, "item", id)?;
-            }
-        }
+        hydrate_items(&self.conn, &mut items)?;
         Ok(items)
+    }
+
+    /// Stream at most `limit` items with complete metadata in query order.
+    pub fn visit_items(
+        &self,
+        query: &Query,
+        limit: u32,
+        mut visitor: impl FnMut(Item) -> Result<()>,
+    ) -> Result<()> {
+        if limit == 0 || limit > 100_000 {
+            return Err(Error::Query(
+                "list limit must be between 1 and 100000".into(),
+            ));
+        }
+        let mut compiled = query.compile();
+        compiled.sql.push_str(", id ASC LIMIT ?");
+        compiled.parameters.push(Value::Integer(i64::from(limit)));
+        let mut statement = self.conn.prepare(&compiled.sql)?;
+        let rows =
+            statement.query_map(params_from_iter(compiled.parameters.iter()), row_to_item)?;
+        for row in rows {
+            let mut item = row?;
+            hydrate_items(&self.conn, std::slice::from_mut(&mut item))?;
+            visitor(item)?;
+        }
+        Ok(())
     }
 
     /// Collect a deliberately bounded selection for an atomic mutating command.
@@ -811,16 +813,20 @@ impl Library {
                 "bounded selection maximum must be between 1 and 9999".into(),
             ));
         }
-        let items = self.query_items_page(query, None, maximum + 1)?;
+        let mut items = self.query_items_page(query, None, maximum + 1)?;
         if items.len() > maximum as usize {
             return Err(Error::Query(format!(
                 "selection exceeds the atomic command limit of {maximum} items; narrow the query"
             )));
         }
+        hydrate_items(&self.conn, &mut items)?;
         Ok(items)
     }
 
-    /// Read a stable keyset page ordered by item ID.
+    /// Read a compact keyset page ordered by item ID.
+    ///
+    /// Extended metadata is not loaded. Use [`Self::query_items`] or
+    /// [`Self::query_items_bounded`] for complete metadata.
     pub fn query_items_page(
         &self,
         query: &Query,
@@ -898,7 +904,7 @@ impl Library {
             ));
         }
         let after_id = after_id.unwrap_or(0);
-        let albums = if let Some(search) = search {
+        let mut albums = if let Some(search) = search {
             let pattern = format!("%{}%", escape_like(search));
             let mut statement = self.conn.prepare(
                 "SELECT * FROM albums
@@ -919,6 +925,7 @@ impl Library {
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             page
         };
+        hydrate_albums(&self.conn, &mut albums)?;
         Ok(albums)
     }
 
@@ -1018,6 +1025,7 @@ impl Library {
         }
         for (_id, item) in items {
             validate_item_metadata(item)?;
+            validate_metadata_positions(item.track, item.disc, &item.extended)?;
         }
         let ids = items.iter().map(|(id, _item)| *id).collect::<Vec<_>>();
         if ids.iter().collect::<HashSet<_>>().len() != ids.len() {
@@ -1105,6 +1113,7 @@ impl Library {
                 track_identity_changed,
                 release_identity_changed,
             )?;
+            save_tag_metadata_snapshot(&transaction, *id, &item.extended)?;
         }
         reconcile_album_membership(&transaction, &ids)?;
         transaction.commit()?;
@@ -1193,6 +1202,7 @@ impl Library {
                 invalidates_track_identity,
                 invalidate_release_ids,
             )?;
+            synchronize_modified_metadata(&transaction, *id, &modifications)?;
         }
         if modifications.iter().any(|modification| {
             matches!(
@@ -1370,7 +1380,7 @@ impl Library {
                     a.sha256, a.entry_identity, a.verification_state, a.managed
              FROM assets a
              JOIN album_assets aa ON aa.asset_id = a.id
-             WHERE aa.album_id = ?1 ORDER BY a.id",
+             WHERE aa.album_id = ?1 AND a.role = 'artwork' ORDER BY a.id",
         )?;
         let rows = statement.query_map([album_id], |row| {
             Ok((
@@ -1419,6 +1429,7 @@ impl Library {
         &self,
         completed_before: DateTime<Utc>,
     ) -> Result<Vec<RetainedJournalFile>> {
+        const MAXIMUM: usize = 9_999;
         let mut statement = self.conn.prepare(
             "SELECT oj.id, of.ordinal, of.source_path, of.staged_path,
                     of.destination_path, of.content_hash, of.sha256, of.source_identity,
@@ -1430,17 +1441,17 @@ impl Library {
                    oj.kind = 'remove-delete'
                    OR (oj.kind = 'tag-write' AND of.role = 'tag-original')
                )
-               AND NOT EXISTS (
-                   SELECT 1 FROM operation_journal purge
+               AND of.staged_path NOT IN (
+                   SELECT purge_file.source_path FROM operation_journal purge
                    JOIN operation_files purge_file ON purge_file.operation_id = purge.id
                    WHERE purge.kind = 'purge-delete'
-                     AND purge_file.source_path = of.staged_path
+                     AND purge.state != 'complete'
                )
                AND oj.completed_at <= ?1
-             ORDER BY oj.completed_at, oj.id, of.ordinal",
+             ORDER BY oj.completed_at, oj.id, of.ordinal LIMIT ?2",
         )?;
         let files = statement
-            .query_map([completed_before.to_rfc3339()], |row| {
+            .query_map(params![completed_before.to_rfc3339(), MAXIMUM + 1], |row| {
                 Ok(RetainedJournalFile {
                     operation_id: row.get(0)?,
                     ordinal: row.get(1)?,
@@ -1458,7 +1469,120 @@ impl Library {
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        if files.len() > MAXIMUM {
+            return Err(Error::Query(format!(
+                "purge selection exceeds the atomic command limit of {MAXIMUM} files"
+            )));
+        }
         Ok(files)
+    }
+
+    pub(crate) fn require_retained_root_mutation(&self, entry: &RetainedJournalFile) -> Result<()> {
+        let (root_id, asset_id, kind, plan_id, decision) = self.conn.query_row(
+            "SELECT of.root_id, of.asset_id, oj.kind, oj.plan_id, oj.decision_json
+             FROM operation_files of JOIN operation_journal oj ON oj.id = of.operation_id
+             WHERE of.operation_id = ?1 AND of.ordinal = ?2",
+            params![entry.operation_id, entry.ordinal],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )?;
+        if let Some(root_id) = root_id {
+            return self.require_root_mutation(&root_id);
+        }
+        if let Some(asset_id) = asset_id {
+            let (root_id, source) = self.conn.query_row(
+                "SELECT root_id, absolute_path FROM assets WHERE id = ?1",
+                [&asset_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?;
+            if root_id == "00000000-0000-0000-0000-000000000000"
+                || Path::new(&source) == entry.file.source
+            {
+                return self.require_root_mutation(&root_id);
+            }
+            return Err(unknown_retained_root(&entry.file));
+        }
+        if kind == "tag-write" && entry.file.role == "tag-original" {
+            if let (Some(plan_id), Some(decision)) = (plan_id, decision) {
+                let decision: serde_json::Value = serde_json::from_str(&decision)?;
+                if let Some(asset_id) = decision.get("asset_id").and_then(serde_json::Value::as_str)
+                {
+                    let root_id = self
+                        .conn
+                        .query_row(
+                            "SELECT a.root_id FROM assets a
+                         JOIN asset_projection_steps step ON step.asset_id = a.id
+                         JOIN durable_plans reviewed ON reviewed.id = step.plan_id
+                         JOIN operation_files rewrite ON rewrite.operation_id = ?4
+                           AND rewrite.role = 'tag-rewrite'
+                         WHERE a.id = ?1 AND step.plan_id = ?2 AND a.absolute_path = ?3
+                           AND reviewed.kind = 'tag-projection' AND step.state = 'published'
+                           AND json_extract(reviewed.preview_json, '$.asset_id') = a.id
+                           AND json_extract(reviewed.preview_json, '$.path') = ?3
+                           AND rewrite.source_path = ?3 AND rewrite.destination_path = ?3
+                           AND rewrite.source_identity = ?5
+                           AND json_extract(step.evidence_json, '$.retained_original') = 1
+                           AND json_extract(step.evidence_json, '$.entry_identity') = rewrite.owned_identity
+                           AND json_extract(step.evidence_json, '$.blake3') = rewrite.content_hash
+                           AND json_extract(step.evidence_json, '$.sha256') = rewrite.sha256",
+                            params![
+                                asset_id,
+                                plan_id,
+                                path_to_storage(&entry.file.source)?,
+                                entry.operation_id,
+                                entry.file.source_identity
+                            ],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()?;
+                    if let Some(root_id) = root_id {
+                        return self.require_root_mutation(&root_id);
+                    }
+                }
+            }
+        }
+        self.require_older_retained_root_mutation(&entry.file)
+    }
+
+    fn require_older_retained_root_mutation(&self, file: &JournalFile) -> Result<()> {
+        let asset = self.conn.query_row(
+            "SELECT root_id, entry_identity, blake3, sha256 FROM assets WHERE absolute_path = ?1",
+            [path_to_storage(&file.source)?],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?)),
+        ).optional()?;
+        if let Some((root_id, identity, blake3, sha256)) = asset {
+            if root_id == "00000000-0000-0000-0000-000000000000"
+                || (identity.is_some()
+                    && identity == file.source_identity
+                    && blake3.is_some()
+                    && blake3 == file.content_hash
+                    && file
+                        .sha256
+                        .as_ref()
+                        .is_none_or(|hash| Some(hash) == sha256.as_ref()))
+            {
+                return self.require_root_mutation(&root_id);
+            }
+            return Err(unknown_retained_root(file));
+        }
+        let mut roots = self
+            .conn
+            .prepare("SELECT path FROM library_roots WHERE state != 'legacy'")?;
+        let paths = roots.query_map([], |row| row.get::<_, String>(0))?;
+        for path in paths {
+            if file.source.starts_with(path?) {
+                return Err(unknown_retained_root(file));
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn create_operation(
@@ -1588,6 +1712,29 @@ impl Library {
         )?;
         require_journal_row(changed, "operation file state")?;
         failpoints::hit("db.operation-file-state")
+    }
+
+    pub(crate) fn bind_operation_asset(
+        &self,
+        operation_id: &str,
+        ordinal: usize,
+        asset_id: &str,
+    ) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE operation_files
+             SET asset_id = ?3, root_id = (SELECT root_id FROM assets WHERE id = ?3)
+             WHERE operation_id = ?1 AND ordinal = ?2
+               AND EXISTS (
+                   SELECT 1 FROM assets a
+                   WHERE a.id = ?3 AND a.absolute_path = operation_files.source_path
+                     AND a.entry_identity = operation_files.source_identity
+                     AND a.blake3 = operation_files.content_hash
+                     AND (operation_files.sha256 IS NULL OR a.sha256 = operation_files.sha256)
+               )",
+            params![operation_id, ordinal, asset_id],
+        )?;
+        require_journal_row(changed, "operation file asset binding")?;
+        failpoints::hit("db.operation-file-asset")
     }
 
     pub(crate) fn set_staged_file_identity(
@@ -1937,35 +2084,71 @@ impl Library {
         Ok(operations)
     }
 
-    fn finalize_purge_history(&self, operation: &PendingOperation) -> Result<()> {
+    fn finish_recovered_operation(&self, operation: &PendingOperation) -> Result<()> {
+        let committed = matches!(operation.state.as_str(), "db-committed" | "cleanup-pending");
+        let now = Utc::now().to_rfc3339();
         let transaction = self.conn.unchecked_transaction()?;
-        for file in &operation.files {
+        if operation.kind == OperationKind::PurgeDelete && committed {
+            for file in &operation.files {
+                transaction.execute(
+                    "UPDATE operation_files SET state = 'purged'
+                     WHERE staged_path = ?1 AND operation_id != ?2 AND state = 'quarantined'",
+                    params![path_to_storage(&file.source)?, operation.id],
+                )?;
+            }
+        }
+        if operation.kind == OperationKind::RestoreCopy {
             transaction.execute(
-                "UPDATE operation_files SET state = 'purged'
-                 WHERE staged_path = ?1 AND operation_id != ?2 AND state = 'quarantined'",
-                params![path_to_storage(&file.source)?, operation.id],
+                "UPDATE backup_restore_runs SET state = ?2, completed_at = ?3
+                 WHERE id = ?1 AND state = 'running'",
+                params![
+                    operation.id,
+                    if committed { "complete" } else { "failed" },
+                    now
+                ],
             )?;
         }
         if let Some(plan_id) = &operation.plan_id {
             let plan_id = PlanId::parse(plan_id.clone())?;
+            let outcome = if committed { "complete" } else { "failed" };
+            let error = (!committed).then(|| {
+                let kind = if operation.kind == OperationKind::PurgeDelete {
+                    "purge"
+                } else {
+                    operation.kind.as_str()
+                };
+                format!("{kind} rolled back during recovery")
+            });
             let changed = transaction.execute(
                 "UPDATE durable_plans
-                 SET state = 'complete', progress_current = progress_total,
-                     updated_at = ?2, completed_at = ?2
-                 WHERE id = ?1 AND state IN ('approved', 'running', 'paused')",
-                params![plan_id.as_str(), Utc::now().to_rfc3339()],
+                 SET state = ?2,
+                     progress_current = CASE WHEN ?2 = 'complete'
+                         THEN COALESCE(progress_total, progress_current) ELSE progress_current END,
+                     error = ?3, updated_at = ?4, completed_at = ?4
+                 WHERE id = ?1 AND state IN ('planned', 'approved', 'running', 'paused')",
+                params![plan_id.as_str(), outcome, error, now],
             )?;
             if changed == 1 {
                 append_plan_event(
                     &transaction,
                     &plan_id,
-                    "complete",
-                    &serde_json::json!({"recovered_operation": operation.id}),
+                    outcome,
+                    &serde_json::json!({
+                        "error": error,
+                        "recovered_operation": operation.id,
+                    }),
                 )?;
             }
         }
+        let changed = transaction.execute(
+            "UPDATE operation_journal
+             SET state = 'complete', updated_at = ?1, completed_at = ?1, error = NULL
+             WHERE id = ?2 AND state != 'complete'",
+            params![now, operation.id],
+        )?;
+        require_journal_row(changed, "recovered operation completion")?;
         transaction.commit()?;
-        Ok(())
+        failpoints::hit("db.operation-complete")
     }
 
     fn backfill_file_sizes(&mut self) -> Result<()> {
@@ -2166,14 +2349,14 @@ fn invalidate_external_ids(
         transaction.execute(
             "DELETE FROM library_external_ids
              WHERE entity_type = 'item' AND entity_id = ?1
-               AND kind IN ('recording', 'release_track')",
+               AND kind IN ('recording', 'track', 'release_track', 'release-track')",
             [item_id],
         )?;
     }
     if release_identity {
         transaction.execute(
             "DELETE FROM library_external_ids
-             WHERE entity_type = 'item' AND entity_id = ?1 AND kind = 'release'",
+             WHERE entity_type = 'item' AND entity_id = ?1 AND kind IN ('release', 'legacy')",
             [item_id],
         )?;
     }
@@ -2198,6 +2381,50 @@ fn cleanup_orphan_metadata(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+fn database_path_for_write(path: &Path) -> Result<PathBuf> {
+    let database = match std::fs::canonicalize(path) {
+        Ok(database) => database,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(path) {
+                Ok(_) => {
+                    return Err(Error::Lease(format!(
+                        "database path cannot resolve to an existing file: {}: {error}",
+                        path.display()
+                    )));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let name = path.file_name().ok_or_else(|| {
+                Error::Lease(format!("database path has no filename: {}", path.display()))
+            })?;
+            std::fs::canonicalize(parent)?.join(name)
+        }
+        Err(error) => return Err(error.into()),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        match std::fs::metadata(&database) {
+            Ok(metadata) if metadata.is_file() && metadata.nlink() > 1 => {
+                return Err(Error::Lease(format!(
+                    "database has multiple hard links. Use a separate database copy: {}",
+                    database.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(database)
+}
+
 fn configure_connection(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.busy_timeout(Duration::from_secs(5))?;
@@ -2208,9 +2435,12 @@ fn configure_connection(conn: &Connection) -> Result<()> {
         |context| {
             let pattern = context.get::<String>(0)?;
             let value = context.get::<Option<String>>(1)?;
-            regex::Regex::new(&pattern)
-                .map(|expression| value.is_some_and(|value| expression.is_match(&value)))
-                .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))
+            let expression = context.get_or_create_aux(0, |_value| {
+                #[cfg(test)]
+                REGEXP_COMPILATIONS.with(|count| count.set(count.get() + 1));
+                regex::Regex::new(&pattern)
+            })?;
+            Ok(value.is_some_and(|value| expression.is_match(&value)))
         },
     )?;
     Ok(())
@@ -2345,10 +2575,100 @@ fn insert_item(transaction: &Transaction<'_>, item: &Item, album_id: Option<i64>
     Ok(id)
 }
 
+fn hydrate_items(conn: &Connection, items: &mut [Item]) -> Result<()> {
+    for item in items {
+        if let Some(id) = item.id {
+            item.extended = load_extended_metadata(conn, "item", id)?;
+        }
+    }
+    Ok(())
+}
+
 fn hydrate_albums(conn: &Connection, albums: &mut [Album]) -> Result<()> {
     for album in albums {
         if let Some(id) = album.id {
             album.extended = load_extended_metadata(conn, "album", id)?;
+        }
+    }
+    Ok(())
+}
+
+fn save_tag_metadata_snapshot(
+    transaction: &Transaction<'_>,
+    id: i64,
+    incoming: &ExtendedMetadata,
+) -> Result<()> {
+    let stored = load_extended_metadata(transaction, "item", id)?;
+    let mut metadata = incoming.clone();
+    for (field, value) in stored.flexible_fields {
+        if !crate::tags::is_native_flexible_field(&field) {
+            metadata.flexible_fields.entry(field).or_insert(value);
+        }
+    }
+    // Tag refresh preserves the catalog's ID policy after identity invalidation.
+    metadata.external_ids = stored.external_ids;
+    save_extended_metadata(transaction, "item", id, &metadata)
+}
+
+fn synchronize_modified_metadata(
+    transaction: &Transaction<'_>,
+    id: i64,
+    modifications: &[Modification],
+) -> Result<()> {
+    let (artist, albumartist, genre, year, track, disc) = transaction.query_row(
+        "SELECT artist, albumartist, genre, year, track, disc FROM items WHERE id = ?1",
+        [id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<i32>>(3)?,
+                row.get::<_, Option<u32>>(4)?,
+                row.get::<_, Option<u32>>(5)?,
+            ))
+        },
+    )?;
+    let changed = |column| modifications.iter().any(|change| change.column == column);
+    let mut metadata = load_extended_metadata(transaction, "item", id)?;
+    if changed("artist") {
+        metadata.artists = vec![artist];
+    }
+    if changed("albumartist") || changed("artist") && albumartist.is_none() {
+        metadata.album_artists = albumartist.into_iter().collect();
+    }
+    if changed("genre") {
+        metadata.genres = genre.into_iter().collect();
+    }
+    if changed("year") {
+        metadata.date = crate::PartialDate {
+            year,
+            month: None,
+            day: None,
+        };
+    }
+    validate_metadata_positions(track, disc, &metadata)?;
+    save_extended_metadata(transaction, "item", id, &metadata)
+}
+
+fn validate_metadata_positions(
+    track: Option<u32>,
+    disc: Option<u32>,
+    metadata: &ExtendedMetadata,
+) -> Result<()> {
+    for (name, position, total) in [
+        ("track", track, metadata.track_total),
+        ("disc", disc, metadata.disc_total),
+    ] {
+        if position == Some(0)
+            || total == Some(0)
+            || position
+                .zip(total)
+                .is_some_and(|(position, total)| position > total)
+        {
+            return Err(Error::Import(format!(
+                "{name} position and total must be positive, and position must not exceed total"
+            )));
         }
     }
     Ok(())
@@ -3289,6 +3609,13 @@ fn require_journal_row(changed: usize, action: &str) -> Result<()> {
     }
 }
 
+fn unknown_retained_root(file: &JournalFile) -> Error {
+    Error::Root(format!(
+        "retained file has no verified root record: {}. Preserve it and review its operation journal",
+        file.staged.display()
+    ))
+}
+
 fn escape_like(value: &str) -> String {
     value
         .replace('!', "!!")
@@ -3351,7 +3678,9 @@ fn recover_operation(operation: &PendingOperation) -> Result<()> {
                     verify_owned(&file.staged, file)?;
                 }
             }
-            (OperationKind::PurgeDelete, true) => remove_if_owned(&file.staged, file)?,
+            (OperationKind::PurgeDelete, true) => {
+                cleanup_purge_file(&operation.id, ordinal, file)?;
+            }
             (
                 OperationKind::ManifestWrite
                 | OperationKind::RestoreCopy
@@ -3447,7 +3776,7 @@ fn move_cleanup_path(source: &Path, operation_id: &str, ordinal: usize) -> Resul
     let mut quarantine_name = std::ffi::OsString::from(".");
     quarantine_name.push(name);
     quarantine_name.push(format!(".rsbts-{operation_id}-{ordinal}.move"));
-    Ok(source.with_file_name(quarantine_name))
+    Ok(crate::fsops::bounded_sibling_path(source, quarantine_name))
 }
 
 fn restore_quarantined(file: &JournalFile) -> Result<()> {
@@ -3456,6 +3785,8 @@ fn restore_quarantined(file: &JournalFile) -> Result<()> {
     }
     if file.source.exists() || file.source.is_symlink() {
         if same_entry(&file.source, &file.staged)? {
+            verify_source_identity(&file.staged, file)?;
+            verify_owned(&file.staged, file)?;
             remove_file_synced(&file.staged)?;
             return Ok(());
         }
@@ -3471,11 +3802,148 @@ fn restore_quarantined(file: &JournalFile) -> Result<()> {
 }
 
 fn remove_if_owned(path: &Path, file: &JournalFile) -> Result<()> {
-    if !path.exists() && !path.is_symlink() {
+    remove_if_owned_with(path, file, |_path| Ok(()))
+}
+
+fn remove_if_owned_with(
+    path: &Path,
+    file: &JournalFile,
+    before_verification: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
+    let acquired = owned_cleanup_path(path, file)?;
+    cleanup_owned_path_with(path, &acquired, file, before_verification)
+}
+
+fn owned_cleanup_path(path: &Path, file: &JournalFile) -> Result<PathBuf> {
+    let evidence = serde_json::to_vec(&(path, &file.source, &file.staged, &file.destination))?;
+    let token = blake3::hash(&evidence).to_hex();
+    // Journal paths identify the same cleanup name after interruption.
+    Ok(path.with_file_name(format!(".rsbts-{token}.recovery")))
+}
+
+fn cleanup_purge_file(operation_id: &str, ordinal: usize, file: &JournalFile) -> Result<()> {
+    cleanup_purge_file_with(operation_id, ordinal, file, |_path| Ok(()))
+}
+
+fn cleanup_purge_file_with(
+    operation_id: &str,
+    ordinal: usize,
+    file: &JournalFile,
+    before_verification: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
+    let acquired = purge_cleanup_path(operation_id, ordinal, &file.staged)?;
+    cleanup_owned_path_with(&file.staged, &acquired, file, before_verification)
+}
+
+fn cleanup_owned_path_with(
+    path: &Path,
+    acquired: &Path,
+    file: &JournalFile,
+    before_verification: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
+    if !journal_entry_exists(path)? && !journal_entry_exists(acquired)? {
         return Ok(());
     }
-    verify_owned(path, file)?;
-    remove_file_synced(path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::Recovery("journal recovery path has no anchored parent".into()))?;
+    let root = match AnchoredRoot::open(parent) {
+        Ok(root) => root,
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let newly_acquired = if anchored_entry_exists(&root, acquired)? {
+        if anchored_entry_exists(&root, path)? {
+            return Err(Error::Recovery(format!(
+                "journal recovery found both {} and {}; preserving both",
+                path.display(),
+                acquired.display()
+            )));
+        }
+        false
+    } else {
+        if !anchored_entry_exists(&root, path)? {
+            return Ok(());
+        }
+        root.rename_noreplace(path, acquired)?;
+        true
+    };
+    before_verification(acquired)?;
+    if let Err(error) = verify_owned_anchored(&root, acquired, file) {
+        if newly_acquired {
+            if let Err(restore) = root.rename_noreplace(acquired, path) {
+                return Err(Error::Recovery(format!(
+                    "{error}; acquired journal file remains at {}; safe restore failed: {restore}",
+                    acquired.display()
+                )));
+            }
+        }
+        return Err(error);
+    }
+    root.remove_file(acquired)
+}
+
+fn journal_entry_exists(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn purge_cleanup_path(operation_id: &str, ordinal: usize, staged: &Path) -> Result<PathBuf> {
+    let operation = uuid::Uuid::parse_str(operation_id)
+        .map_err(|error| Error::Recovery(format!("invalid purge operation ID: {error}")))?;
+    // Durable journal fields produce the same acquisition name after interruption.
+    Ok(staged.with_file_name(format!(".rsbts-{operation}-{ordinal}.purge-cleanup")))
+}
+
+fn anchored_entry_exists(root: &AnchoredRoot, path: &Path) -> Result<bool> {
+    match root.entry_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn verify_owned_anchored(root: &AnchoredRoot, path: &Path, file: &JournalFile) -> Result<()> {
+    let expected_identity = file.owned_identity.as_deref().ok_or_else(|| {
+        Error::Recovery(format!(
+            "journal has no owned-file identity for {}; preserving it",
+            path.display()
+        ))
+    })?;
+    let expected_hash = file.content_hash.as_deref().ok_or_else(|| {
+        Error::Recovery(format!(
+            "journal has no ownership hash for {}",
+            path.display()
+        ))
+    })?;
+    let before = root.entry_metadata(path)?;
+    if file_identity(&before) != expected_identity
+        || before.file_type().is_symlink() != (file.role == "symlink")
+    {
+        return Err(Error::Recovery(format!(
+            "refusing to touch replaced journal path {}",
+            path.display()
+        )));
+    }
+    let matches = if file.role == "symlink" {
+        hash_os_string(&root.read_link(path)?) == expected_hash && file.sha256.is_none()
+    } else {
+        let digests = digest_reader(root.open_file(path)?)?;
+        digests.blake3() == expected_hash
+            && file
+                .sha256
+                .as_deref()
+                .is_none_or(|hash| hash == digests.sha256())
+    };
+    if !matches || file_identity(&root.entry_metadata(path)?) != expected_identity {
+        return Err(Error::Recovery(format!(
+            "refusing to touch changed journal path {}",
+            path.display()
+        )));
+    }
     Ok(())
 }
 
@@ -3495,11 +3963,20 @@ fn remove_link_if_owned(path: &Path, file: &JournalFile) -> Result<()> {
 }
 
 fn rollback_regular_import(file: &JournalFile) -> Result<()> {
-    rollback_import_paths(file, remove_if_owned)
+    rollback_import_paths(file, remove_if_owned, |path| {
+        let acquired = owned_cleanup_path(path, file)?;
+        if journal_entry_exists(&acquired)? {
+            Ok(Some(acquired))
+        } else {
+            Ok(journal_entry_exists(path)?.then(|| path.to_path_buf()))
+        }
+    })
 }
 
 fn rollback_link_import(file: &JournalFile) -> Result<()> {
-    rollback_import_paths(file, remove_link_if_owned)
+    rollback_import_paths(file, remove_link_if_owned, |path| {
+        Ok(journal_entry_exists(path)?.then(|| path.to_path_buf()))
+    })
 }
 
 fn recover_path_projection(file: &JournalFile, committed: bool) -> Result<()> {
@@ -3553,23 +4030,59 @@ fn common_path_ancestor(left: &Path, right: &Path) -> Result<PathBuf> {
 fn rollback_import_paths(
     file: &JournalFile,
     remove_owned: fn(&Path, &JournalFile) -> Result<()>,
+    find_entry: impl Fn(&Path) -> Result<Option<PathBuf>>,
 ) -> Result<()> {
-    let staged_exists = file.staged.exists() || file.staged.is_symlink();
-    let destination_exists = file.destination.exists() || file.destination.is_symlink();
     if file.state == "prepared" {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if file.owned_identity.is_none()
+            && file
+                .staged
+                .file_name()
+                .is_some_and(|name| name.as_encoded_bytes().len() > 255)
+        {
+            // Older versions could journal a sibling name that the filesystem cannot create.
+            // Check the leaf relative to an open parent, so a long full path is not mistaken for absence.
+            let parent = file
+                .staged
+                .parent()
+                .ok_or_else(|| Error::Recovery("prepared import stage has no parent".into()))?;
+            let root = match AnchoredRoot::open(parent) {
+                Ok(root) => root,
+                Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
+            let impossible_name = matches!(
+                root.entry_metadata(&file.staged),
+                Err(Error::Io(error))
+                    if error.raw_os_error() == Some(rustix::io::Errno::NAMETOOLONG.raw_os_error())
+            );
+            if impossible_name
+                && !anchored_entry_exists(&root, &owned_cleanup_path(&file.staged, file)?)?
+            {
+                return Ok(());
+            }
+        }
         return remove_owned(&file.staged, file);
     }
     if file.state == "acquired" {
         return remove_if_entry_owned(&file.staged, file);
     }
-    if staged_exists && destination_exists && !same_entry(&file.staged, &file.destination)? {
+    let staged = find_entry(&file.staged)?;
+    let destination = find_entry(&file.destination)?;
+    let collision = match (&staged, &destination) {
+        (Some(staged), Some(destination)) => !same_entry(staged, destination)?,
+        _ => false,
+    };
+    if collision {
         // A no-clobber finalization failed because another file won the destination.
         return remove_owned(&file.staged, file);
     }
-    if destination_exists {
+    if destination.is_some() {
         remove_owned(&file.destination, file)?;
     }
-    if staged_exists {
+    if staged.is_some() {
         remove_owned(&file.staged, file)?;
     }
     Ok(())
@@ -3803,6 +4316,222 @@ mod tests {
         TRACED_SQL.with(|statements| std::mem::take(&mut *statements.borrow_mut()))
     }
 
+    fn recovery_plan_fixture(
+        kind: OperationKind,
+        state: &str,
+        total: Option<u64>,
+    ) -> Result<(Library, PlanId, String)> {
+        let library = Library::open_in_memory()?;
+        let plan_kind = if kind == OperationKind::PurgeDelete {
+            crate::operations::PlanKind::Purge
+        } else {
+            crate::operations::PlanKind::TagProjection
+        };
+        let plan = library.create_durable_plan(
+            plan_kind,
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+            total,
+        )?;
+        library.approve_durable_plan(&plan)?;
+        library.start_durable_plan(&plan)?;
+        library.update_plan_progress(&plan, 2, None)?;
+        let operation = library.create_operation_for_plan(kind, &[], Some(plan.as_str()), None)?;
+        library.set_operation_state(&operation, state, None)?;
+        Ok((library, plan, operation))
+    }
+
+    #[test]
+    fn recovery_finishes_rollback_plans_once() -> Result<()> {
+        let (mut library, plan, operation) =
+            recovery_plan_fixture(OperationKind::TagWrite, "prepared", Some(3))?;
+        let events = library.plan_events(&plan)?.len();
+        let report = library.recover_pending()?;
+        assert_eq!(report.recovered_operations, [operation]);
+        assert_eq!(
+            library.durable_plan(&plan)?.state(),
+            crate::operations::PlanState::Failed
+        );
+        assert_eq!(library.plan_events(&plan)?.len(), events + 1);
+        assert!(library.recover_pending()?.recovered_operations.is_empty());
+        assert_eq!(library.plan_events(&plan)?.len(), events + 1);
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_finishes_committed_plans_and_progress() -> Result<()> {
+        for state in ["db-committed", "cleanup-pending"] {
+            for total in [Some(3), None] {
+                let (mut library, plan, operation) =
+                    recovery_plan_fixture(OperationKind::TagWrite, state, total)?;
+                let events = library.plan_events(&plan)?.len();
+                assert_eq!(library.recover_pending()?.recovered_operations, [operation]);
+                let durable = library.durable_plan(&plan)?;
+                assert_eq!(durable.state(), crate::operations::PlanState::Complete);
+                assert_eq!(durable.progress(), (total.unwrap_or(2), total));
+                assert_eq!(library.plan_events(&plan)?.len(), events + 1);
+                assert!(library.recover_pending()?.recovered_operations.is_empty());
+                assert_eq!(library.plan_events(&plan)?.len(), events + 1);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_preserves_terminal_plans_and_events() -> Result<()> {
+        use crate::operations::PlanState;
+        for outcome in [PlanState::Complete, PlanState::Failed, PlanState::Cancelled] {
+            for state in ["prepared", "db-committed"] {
+                let (mut library, plan, operation) =
+                    recovery_plan_fixture(OperationKind::PurgeDelete, state, Some(3))?;
+                library.finish_durable_plan(&plan, outcome, Some("original terminal result"))?;
+                let before = serde_json::to_value(library.durable_plan(&plan)?)?;
+                let events = serde_json::to_value(library.plan_events(&plan)?)?;
+                assert_eq!(library.recover_pending()?.recovered_operations, [operation]);
+                assert!(library.recover_pending()?.recovered_operations.is_empty());
+                assert_eq!(serde_json::to_value(library.durable_plan(&plan)?)?, before);
+                assert_eq!(serde_json::to_value(library.plan_events(&plan)?)?, events);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_completion_rolls_back_plan_and_history_on_journal_error() -> Result<()> {
+        use crate::operations::PlanState;
+        for state in ["prepared", "db-committed"] {
+            let temporary = tempfile::tempdir()?;
+            let (mut library, plan, operation) =
+                recovery_plan_fixture(OperationKind::PurgeDelete, state, Some(3))?;
+            let original = JournalFile {
+                source: temporary.path().join("source"),
+                staged: temporary.path().join("retained"),
+                destination: temporary.path().join("source"),
+                content_hash: None,
+                sha256: None,
+                source_identity: None,
+                owned_identity: None,
+                role: "track".into(),
+                state: "quarantined".into(),
+            };
+            let origin = library
+                .create_operation(OperationKind::RemoveDelete, std::slice::from_ref(&original))?;
+            library.set_file_state(&origin, 0, "quarantined")?;
+            library.complete_operation(&origin)?;
+            let purge = JournalFile {
+                source: original.staged.clone(),
+                staged: temporary.path().join("purge"),
+                destination: original.staged,
+                role: "purge-retained-file".into(),
+                ..original
+            };
+            library.append_operation_file(&operation, &purge)?;
+            let events = library.plan_events(&plan)?.len();
+            library.conn.execute_batch(
+                "CREATE TEMP TRIGGER reject_recovery_completion
+                 BEFORE UPDATE OF state ON operation_journal WHEN NEW.state = 'complete'
+                 BEGIN SELECT RAISE(ABORT, 'journal completion blocked'); END;",
+            )?;
+            assert!(library.recover_pending().is_err());
+            assert_eq!(
+                library.durable_plan(&plan)?.state(),
+                PlanState::Running,
+                "journal failure committed a terminal plan separately"
+            );
+            assert_eq!(library.plan_events(&plan)?.len(), events);
+            let retained_state: String = library.conn.query_row(
+                "SELECT state FROM operation_files WHERE operation_id = ?1",
+                [&origin],
+                |row| row.get(0),
+            )?;
+            assert_eq!(retained_state, "quarantined");
+            assert_eq!(library.pending_operations()?.len(), 1);
+            library
+                .conn
+                .execute_batch("DROP TRIGGER reject_recovery_completion")?;
+            assert_eq!(library.recover_pending()?.recovered_operations, [operation]);
+            let expected = if state == "db-committed" {
+                PlanState::Complete
+            } else {
+                PlanState::Failed
+            };
+            assert_eq!(library.durable_plan(&plan)?.state(), expected);
+            assert_eq!(library.plan_events(&plan)?.len(), events + 1);
+            assert!(library.recover_pending()?.recovered_operations.is_empty());
+            assert_eq!(library.plan_events(&plan)?.len(), events + 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn regexp_reuses_a_bound_pattern_within_one_statement() -> Result<()> {
+        let library = Library::open_in_memory()?;
+        REGEXP_COMPILATIONS.with(|count| count.set(0));
+        let matched: usize = library.conn.query_row(
+            "WITH RECURSIVE inputs(id) AS (
+                 SELECT 1 UNION ALL SELECT id + 1 FROM inputs WHERE id < 1000
+             )
+             SELECT COUNT(*) FROM inputs WHERE CAST(id AS TEXT) REGEXP ?1",
+            ["^[0-9]+$"],
+            |row| row.get(0),
+        )?;
+        assert_eq!(matched, 1_000);
+        assert_eq!(
+            REGEXP_COMPILATIONS.with(std::cell::Cell::get),
+            1,
+            "the controlled statement recompiled its unchanged bound pattern"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn regexp_cache_follows_pattern_bindings_and_row_values() -> Result<()> {
+        let library = Library::open_in_memory()?;
+        let mut statement = library.conn.prepare("SELECT regexp(?1, ?2)")?;
+        for (pattern, value, expected) in
+            [("^a$", "a", true), ("^b$", "a", false), ("^b$", "b", true)]
+        {
+            let actual: bool = statement.query_row([pattern, value], |row| row.get(0))?;
+            assert_eq!(actual, expected, "stale regexp binding: {pattern}, {value}");
+        }
+        let mut row_patterns = library.conn.prepare(
+            "WITH patterns(pattern) AS (VALUES ('^a$'), ('^b$'), ('a+'))
+             SELECT regexp(pattern, 'a') FROM patterns",
+        )?;
+        let actual = row_patterns
+            .query_map([], |row| row.get::<_, bool>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(
+            actual,
+            [true, false, true],
+            "regexp reused another row's pattern"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn regexp_preserves_null_and_malformed_pattern_behavior() -> Result<()> {
+        let library = Library::open_in_memory()?;
+        let null_match: bool = library
+            .conn
+            .query_row("SELECT regexp('a', NULL)", [], |row| row.get(0))?;
+        assert!(!null_match);
+        for sql in [
+            "SELECT regexp('[', 'a')",
+            "SELECT regexp('[', NULL)",
+            "SELECT regexp(NULL, 'a')",
+        ] {
+            assert!(
+                library
+                    .conn
+                    .query_row(sql, [], |row| row.get::<_, bool>(0))
+                    .is_err(),
+                "regexp hid a pattern error: {sql}"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn a_small_exact_query_has_a_bounded_statement_count() -> Result<()> {
         let mut library = Library::open_in_memory()?;
@@ -3836,6 +4565,59 @@ mod tests {
     }
 
     #[test]
+    fn purge_selection_does_not_rescan_history_for_each_file() -> Result<()> {
+        const FILES: i32 = 2_000;
+        let mut library = Library::open_in_memory()?;
+        library.conn.execute_batch(
+            "INSERT INTO operation_journal
+                 (id, kind, state, created_at, updated_at, completed_at)
+             VALUES ('retained-fixture', 'remove-delete', 'complete',
+                     '2020-01-01', '2020-01-01', '2020-01-01'),
+                    ('active-purge', 'purge-delete', 'quarantining',
+                     '2020-01-01', '2020-01-01', NULL),
+                    ('rolled-back-purge', 'purge-delete', 'complete',
+                     '2020-01-01', '2020-01-01', '2020-01-01');
+             INSERT INTO operation_files
+                 (operation_id, ordinal, source_path, staged_path, destination_path, state)
+             VALUES ('active-purge', 0, '/generated/retained-1',
+                     '/generated/active-purge', '/generated/retained-1', 'prepared'),
+                    ('rolled-back-purge', 0, '/generated/retained-2',
+                     '/generated/rolled-back-purge', '/generated/retained-2', 'restored');",
+        )?;
+        library.conn.execute(
+            "WITH RECURSIVE records(id) AS (
+                 SELECT 1 UNION ALL SELECT id + 1 FROM records WHERE id < ?1
+             )
+             INSERT INTO operation_files
+                 (operation_id, ordinal, source_path, staged_path, destination_path, state)
+             SELECT 'retained-fixture', id, '/generated/source-' || id,
+                    '/generated/retained-' || id, '/generated/source-' || id,
+                    'quarantined' FROM records",
+            [FILES],
+        )?;
+        drop(take_traced_sql());
+        library.conn.trace(Some(trace_sql));
+        let selected = library.retained_removals_before(Utc::now())?;
+        library.conn.trace(None);
+        assert_eq!(selected.len(), 1_999);
+        assert_eq!(selected[0].ordinal, 2);
+
+        let traced = take_traced_sql();
+        assert_eq!(traced.len(), 1);
+        let mut measured = library.conn.prepare(&traced[0])?;
+        let count = measured
+            .query_map([], |_row| Ok(()))?
+            .try_fold(0, |count, row| row.map(|()| count + 1))?;
+        assert_eq!(count, FILES - 1);
+        let steps = measured.get_status(rusqlite::StatementStatus::VmStep);
+        assert!(
+            steps < FILES * 100,
+            "purge selection rescanned retained history: {steps} VM steps for {FILES} files"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn current_schema_dry_run_uses_a_read_only_connection_without_copying() -> Result<()> {
         let temporary = tempfile::tempdir()?;
         let database = temporary.path().join("library.db");
@@ -3850,12 +4632,170 @@ mod tests {
     }
 
     #[test]
+    fn missing_database_snapshots_reject_mutation() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let database = temporary.path().join("missing.db");
+        let snapshot = Library::open_snapshot(&database)?;
+        let result = snapshot.create_durable_plan(
+            crate::operations::PlanKind::Removal,
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+            None,
+        );
+
+        assert!(
+            result.is_err(),
+            "missing-database snapshot accepted a durable write: {result:?}"
+        );
+        assert!(snapshot.query_items(&Query::all())?.is_empty());
+        assert_eq!(snapshot.stats()?.tracks, 0);
+        assert!(!database.exists());
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn migrated_snapshot_recovery_preserves_journaled_files() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let database = temporary.path().join("legacy.db");
+        let staged = temporary.path().join("owned.stage");
+        let destination = temporary.path().join("destination.flac");
+        std::fs::write(&staged, b"owned audio")?;
+        let source = Connection::open(&database)?;
+        for migration in migrations::MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version < migrations::LATEST_VERSION)
+        {
+            source.execute_batch(migration.sql)?;
+        }
+        source.execute(
+            "INSERT INTO operation_journal (id, kind, state, created_at, updated_at)
+             VALUES ('snapshot-import', 'import-copy', 'staging', ?1, ?1)",
+            [Utc::now().to_rfc3339()],
+        )?;
+        source.execute(
+            "INSERT INTO operation_files
+                 (operation_id, ordinal, source_path, staged_path, destination_path,
+                  content_hash, owned_identity, role, state)
+             VALUES ('snapshot-import', 0, ?1, ?2, ?3, ?4, ?5, 'track', 'staged')",
+            params![
+                path_to_storage(&temporary.path().join("source.flac"))?,
+                path_to_storage(&staged)?,
+                path_to_storage(&destination)?,
+                hash_path(&staged)?,
+                file_identity(&std::fs::metadata(&staged)?),
+            ],
+        )?;
+        drop(source);
+        let before = std::fs::read(&database)?;
+        let mut snapshot = Library::open_snapshot(&database)?;
+        assert_eq!(
+            snapshot.migration_report().from_version,
+            migrations::LATEST_VERSION - 1
+        );
+
+        let result = snapshot.recover_pending();
+
+        assert_eq!(
+            std::fs::read(&staged).ok().as_deref(),
+            Some(b"owned audio".as_slice()),
+            "migrated snapshot recovery changed a journaled file: {result:?}"
+        );
+        assert!(result.is_err(), "snapshot accepted recovery: {result:?}");
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read(&database)?, before);
+        assert!(snapshot.query_items(&Query::all())?.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn a_second_library_writer_is_rejected_before_database_work() -> Result<()> {
         let temporary = tempfile::tempdir()?;
         let database = temporary.path().join("library.db");
         let first = Library::open(&database)?;
         assert!(Library::open(&database).is_err());
         assert!(first.query_items(&Query::all())?.is_empty());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_database_symbolic_link_cannot_bypass_the_writer_lease() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let database = temporary.path().join("library.db");
+        let alias = temporary.path().join("alias.db");
+        let first = Library::open(&database)?;
+        std::os::unix::fs::symlink(&database, &alias)?;
+        let before = std::fs::read(&database)?;
+
+        assert!(
+            Library::open(&alias).is_err(),
+            "a database symbolic link admitted a second writer"
+        );
+        assert_eq!(std::fs::read(&database)?, before);
+        assert!(first.query_items(&Query::all())?.is_empty());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_database_hard_link_cannot_bypass_the_writer_lease() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let database = temporary.path().join("library.db");
+        let alias = temporary.path().join("alias.db");
+        let first = Library::open(&database)?;
+        std::fs::hard_link(&database, &alias)?;
+        let before = std::fs::read(&database)?;
+
+        assert!(
+            Library::open(&alias).is_err(),
+            "a database hard link admitted a second writer"
+        );
+        assert_eq!(std::fs::read(&database)?, before);
+        assert!(first.query_items(&Query::all())?.is_empty());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_database_opens_through_a_parent_symbolic_link() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let parent = temporary.path().join("catalog");
+        let alias_parent = temporary.path().join("catalog-alias");
+        std::fs::create_dir(&parent)?;
+        std::os::unix::fs::symlink(&parent, &alias_parent)?;
+        let database = parent.join("library.db");
+        let alias = alias_parent.join("library.db");
+
+        let result = Library::open(&alias);
+        assert!(
+            result.is_ok(),
+            "a new database could not use its canonical parent"
+        );
+        let first = result?;
+        assert!(database.is_file());
+        let before = std::fs::read(&database)?;
+        assert!(Library::open(&database).is_err());
+        assert_eq!(std::fs::read(&database)?, before);
+        assert!(first.query_items(&Query::all())?.is_empty());
+        drop(first);
+        let second = Library::open(&database)?;
+        assert!(Library::open(&alias).is_err());
+        assert!(second.query_items(&Query::all())?.is_empty());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_writer_reports_the_requested_database_path() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let database = temporary.path().join("library.db");
+        let alias = temporary.path().join("alias.db");
+        drop(Library::open(&database)?);
+        std::os::unix::fs::symlink(&database, &alias)?;
+
+        let library = Library::open(&alias)?;
+        assert_eq!(library.path(), Some(alias.as_path()));
         Ok(())
     }
 
@@ -4239,6 +5179,272 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
+    fn regular_cleanup_preserves_a_replaced_parent() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let parent = temporary.path().join("staging");
+        let moved_parent = temporary.path().join("moved-staging");
+        std::fs::create_dir(&parent)?;
+        let staged = parent.join("retained.stage");
+        std::fs::write(&staged, b"owned audio")?;
+        let file = JournalFile {
+            source: temporary.path().join("source.flac"),
+            staged: staged.clone(),
+            destination: temporary.path().join("destination.flac"),
+            content_hash: Some(hash_path(&staged)?),
+            sha256: None,
+            source_identity: None,
+            owned_identity: Some(file_identity(&std::fs::metadata(&staged)?)),
+            role: "track".into(),
+            state: "prepared".into(),
+        };
+        let result = remove_if_owned_with(&staged, &file, |_acquired| {
+            std::fs::rename(&parent, &moved_parent)?;
+            std::fs::create_dir(&parent)?;
+            std::fs::write(&staged, b"newcomer")?;
+            Ok(())
+        });
+        assert_eq!(
+            std::fs::read(&staged).ok().as_deref(),
+            Some(b"newcomer".as_slice()),
+            "regular recovery deleted a file in the replacement parent: {result:?}"
+        );
+        result?;
+        assert!(std::fs::read_dir(&moved_parent)?.next().is_none());
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn regular_cleanup_preserves_an_acquired_replacement() -> Result<()> {
+        for replacement in [b"newcomer".as_slice(), b"owned audio".as_slice()] {
+            let temporary = tempfile::tempdir()?;
+            let staged = temporary.path().join("retained.stage");
+            let preserved = temporary.path().join("preserved-original");
+            std::fs::write(&staged, b"owned audio")?;
+            let file = JournalFile {
+                source: temporary.path().join("source.flac"),
+                staged: staged.clone(),
+                destination: temporary.path().join("destination.flac"),
+                content_hash: Some(hash_path(&staged)?),
+                sha256: None,
+                source_identity: None,
+                owned_identity: Some(file_identity(&std::fs::metadata(&staged)?)),
+                role: "tag-rewrite".into(),
+                state: "prepared".into(),
+            };
+            let (mut library, plan, operation) =
+                recovery_plan_fixture(OperationKind::TagWrite, "prepared", Some(3))?;
+            library.append_operation_file(&operation, &file)?;
+            let original_plan = serde_json::to_value(library.durable_plan(&plan)?)?;
+            let original_events = serde_json::to_value(library.plan_events(&plan)?)?;
+            let result = remove_if_owned_with(&staged, &file, |acquired| {
+                std::fs::rename(acquired, &preserved)?;
+                std::fs::write(acquired, replacement)?;
+                Ok(())
+            });
+            assert_eq!(
+                std::fs::read(&staged).ok().as_deref(),
+                Some(replacement),
+                "regular recovery deleted an acquired replacement: {result:?}"
+            );
+            assert!(result.is_err(), "regular recovery accepted a replacement");
+            for _ in 0..2 {
+                assert_eq!(library.recover_pending()?.unresolved.len(), 1);
+                assert_eq!(
+                    serde_json::to_value(library.durable_plan(&plan)?)?,
+                    original_plan,
+                    "uncertain ownership changed the linked Running plan"
+                );
+                assert_eq!(
+                    serde_json::to_value(library.plan_events(&plan)?)?,
+                    original_events,
+                    "uncertain ownership changed the linked plan events"
+                );
+                assert_eq!(std::fs::read(&staged)?, replacement);
+                assert_eq!(std::fs::read(&preserved)?, b"owned audio");
+            }
+            assert!(library
+                .pending_operations()?
+                .iter()
+                .any(|pending| pending.id == operation));
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn rollback_requires_matching_digests_when_identity_is_unchanged() -> Result<()> {
+        for (replacement, sha256) in [
+            (Some(b"replaced".as_slice()), None),
+            (None, Some("0".repeat(64))),
+        ] {
+            let temporary = tempfile::tempdir()?;
+            let staged = temporary.path().join("retained.stage");
+            std::fs::write(&staged, b"original")?;
+            let metadata = std::fs::metadata(&staged)?;
+            let identity = file_identity(&metadata);
+            let file = JournalFile {
+                source: temporary.path().join("source.flac"),
+                staged: staged.clone(),
+                destination: temporary.path().join("destination.flac"),
+                content_hash: Some(hash_path(&staged)?),
+                sha256,
+                source_identity: None,
+                owned_identity: Some(identity.clone()),
+                role: "track".into(),
+                state: "prepared".into(),
+            };
+            let mut library = Library::open_in_memory()?;
+            let operation =
+                library.create_operation(OperationKind::ImportCopy, std::slice::from_ref(&file))?;
+            if let Some(bytes) = replacement {
+                std::fs::write(&staged, bytes)?;
+                std::fs::File::open(&staged)?.set_modified(metadata.modified()?)?;
+            }
+            assert_eq!(file_identity(&std::fs::metadata(&staged)?), identity);
+            let expected = replacement.unwrap_or(b"original");
+
+            for _ in 0..2 {
+                let report = library.recover_pending()?;
+                assert_eq!(
+                    std::fs::read(&staged).ok().as_deref(),
+                    Some(expected),
+                    "recovery removed a file without matching digest evidence: {report:?}"
+                );
+                assert_eq!(report.unresolved.len(), 1);
+                assert!(library
+                    .pending_operations()?
+                    .iter()
+                    .any(|pending| pending.id == operation));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn rollback_rejects_a_replacement_fifo_before_opening_it() -> Result<()> {
+        use rustix::fs::{mkfifoat, open, Mode, OFlags, CWD};
+        use std::os::unix::fs::FileTypeExt;
+        use std::process::{Command, Stdio};
+        use std::time::Instant;
+
+        const CHILD_DATABASE: &str = "RSBTS_TEST_REPLACEMENT_FIFO_DATABASE";
+        if let Some(database) = std::env::var_os(CHILD_DATABASE) {
+            let mut library = Library::open(Path::new(&database))?;
+            assert_eq!(library.recover_pending()?.unresolved.len(), 1);
+            assert_eq!(library.pending_operations()?.len(), 1);
+            return Ok(());
+        }
+
+        let temporary = tempfile::tempdir()?;
+        let database = temporary.path().join("library.db");
+        let staged = temporary.path().join("retained.stage");
+        let preserved = temporary.path().join("preserved-original");
+        let probe = temporary.path().join("fifo-probe");
+        std::fs::write(&staged, b"owned audio")?;
+        let library = Library::open(&database)?;
+        library.create_operation(
+            OperationKind::ImportCopy,
+            &[JournalFile {
+                source: temporary.path().join("source.flac"),
+                staged: staged.clone(),
+                destination: temporary.path().join("destination.flac"),
+                content_hash: Some(hash_path(&staged)?),
+                sha256: None,
+                source_identity: None,
+                owned_identity: Some(file_identity(&std::fs::metadata(&staged)?)),
+                role: "track".into(),
+                state: "prepared".into(),
+            }],
+        )?;
+        drop(library);
+        std::fs::rename(&staged, &preserved)?;
+        mkfifoat(CWD, &staged, Mode::RUSR | Mode::WUSR).map_err(std::io::Error::from)?;
+        // Keep the probe available while recovery temporarily renames the FIFO.
+        std::fs::hard_link(&staged, &probe)?;
+        let mut child = Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "db::tests::rollback_rejects_a_replacement_fifo_before_opening_it",
+            ])
+            .env(CHILD_DATABASE, &database)
+            .stdout(Stdio::null())
+            .spawn()?;
+        let result = (|| -> std::io::Result<_> {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut opened_fifo = false;
+            loop {
+                if let Some(status) = child.try_wait()? {
+                    return Ok((status, opened_fifo));
+                }
+                match open(&probe, OFlags::WRONLY | OFlags::NONBLOCK, Mode::empty()) {
+                    Ok(writer) => {
+                        opened_fifo = true;
+                        // EOF releases the child's attempted read before the assertion.
+                        drop(writer);
+                    }
+                    Err(rustix::io::Errno::NXIO) => {}
+                    Err(error) => return Err(error.into()),
+                }
+                if Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "FIFO recovery child did not exit",
+                    ));
+                }
+                std::thread::yield_now();
+            }
+        })();
+        if result.is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let (status, opened_fifo) = result?;
+        assert!(status.success(), "FIFO recovery child failed: {status}");
+        assert!(
+            !opened_fifo,
+            "recovery opened a replaced FIFO before checking identity"
+        );
+        assert!(std::fs::symlink_metadata(&staged)?.file_type().is_fifo());
+        assert_eq!(std::fs::read(&preserved)?, b"owned audio");
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn rollback_resumes_a_regular_acquisition() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let staged = temporary.path().join("retained.stage");
+        std::fs::write(&staged, b"owned audio")?;
+        let file = JournalFile {
+            source: temporary.path().join("source.flac"),
+            staged: staged.clone(),
+            destination: temporary.path().join("destination.flac"),
+            content_hash: Some(hash_path(&staged)?),
+            sha256: None,
+            source_identity: None,
+            owned_identity: Some(file_identity(&std::fs::metadata(&staged)?)),
+            role: "track".into(),
+            state: "staged".into(),
+        };
+        let mut library = Library::open_in_memory()?;
+        let operation =
+            library.create_operation(OperationKind::ImportCopy, std::slice::from_ref(&file))?;
+        library.set_file_state(&operation, 0, "staged")?;
+        let acquired = owned_cleanup_path(&staged, &file)?;
+        std::fs::rename(&staged, &acquired)?;
+
+        for _ in 0..2 {
+            assert!(library.recover_pending()?.unresolved.is_empty());
+            assert!(!acquired.exists(), "rollback abandoned an acquired file");
+            assert!(!staged.exists());
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
     fn rollback_removes_a_hard_link_finalized_by_rsbts() -> Result<()> {
         let temporary = tempfile::tempdir()?;
         let source = temporary.path().join("source");
@@ -4467,6 +5673,54 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn quarantine_restore_preserves_unowned_hard_links() -> Result<()> {
+        for replacement in [b"newcomer".as_slice(), b"owned audio".as_slice()] {
+            let temporary = tempfile::tempdir()?;
+            let source = temporary.path().join("source");
+            let staged = temporary.path().join("staged");
+            let original = temporary.path().join("preserved-original");
+            std::fs::write(&source, b"owned audio")?;
+            let identity = file_identity(&std::fs::metadata(&source)?);
+            let mut library = Library::open_in_memory()?;
+            let operation = library.create_operation(
+                OperationKind::RemoveDelete,
+                &[JournalFile {
+                    source: source.clone(),
+                    staged: staged.clone(),
+                    destination: source.clone(),
+                    content_hash: Some(hash_path(&source)?),
+                    sha256: None,
+                    source_identity: Some(identity.clone()),
+                    owned_identity: Some(identity),
+                    role: "track".into(),
+                    state: "quarantined".into(),
+                }],
+            )?;
+            std::fs::rename(&source, &original)?;
+            std::fs::write(&source, replacement)?;
+            std::fs::hard_link(&source, &staged)?;
+
+            for _ in 0..2 {
+                let report = library.recover_pending()?;
+                assert_eq!(
+                    std::fs::read(&staged).ok().as_deref(),
+                    Some(replacement),
+                    "quarantine recovery deleted an unowned hard link: {report:?}"
+                );
+                assert_eq!(report.unresolved.len(), 1);
+                assert_eq!(std::fs::read(&source)?, replacement);
+                assert_eq!(std::fs::read(&original)?, b"owned audio");
+            }
+            assert!(library
+                .pending_operations()?
+                .iter()
+                .any(|pending| pending.id == operation));
+        }
+        Ok(())
+    }
+
     #[test]
     fn committed_removal_recovery_retains_the_quarantine() -> Result<()> {
         let temporary = tempfile::tempdir()?;
@@ -4497,6 +5751,348 @@ mod tests {
 
         assert_eq!(report.recovered_operations, [operation]);
         assert_eq!(std::fs::read(staged)?, b"audio");
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn purge_recovery_preserves_a_replaced_parent() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let parent = temporary.path().join("quarantine");
+        let moved_parent = temporary.path().join("moved-quarantine");
+        std::fs::create_dir(&parent)?;
+        let staged = parent.join("retained.purge");
+        std::fs::write(&staged, b"audio")?;
+        let identity = file_identity(&std::fs::metadata(&staged)?);
+        let file = JournalFile {
+            source: parent.join("retained.delete"),
+            staged: staged.clone(),
+            destination: parent.join("retained.delete"),
+            content_hash: Some(hash_path(&staged)?),
+            sha256: None,
+            source_identity: Some(identity.clone()),
+            owned_identity: Some(identity),
+            role: "purge-retained-file".into(),
+            state: "quarantined".into(),
+        };
+        let mut library = Library::open_in_memory()?;
+        let operation =
+            library.create_operation(OperationKind::PurgeDelete, std::slice::from_ref(&file))?;
+        library.set_operation_state(&operation, "db-committed", None)?;
+
+        let result = cleanup_purge_file_with(&operation, 0, &file, |_acquired| {
+            std::fs::rename(&parent, &moved_parent)?;
+            std::fs::create_dir(&parent)?;
+            std::fs::write(&staged, b"replacement")?;
+            Ok(())
+        });
+        assert_eq!(
+            std::fs::read(&staged).ok().as_deref(),
+            Some(b"replacement".as_slice()),
+            "purge recovery deleted a file in the replacement parent: {result:?}"
+        );
+        result?;
+        library.complete_operation(&operation)?;
+        for _ in 0..2 {
+            assert!(library.recover_pending()?.unresolved.is_empty());
+            assert_eq!(std::fs::read(&staged)?, b"replacement");
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn purge_recovery_preserves_an_acquired_replacement() -> Result<()> {
+        for replacement in [b"replacement".as_slice(), b"audio".as_slice()] {
+            let temporary = tempfile::tempdir()?;
+            let staged = temporary.path().join("retained.purge");
+            let preserved = temporary.path().join("preserved-original");
+            std::fs::write(&staged, b"audio")?;
+            let identity = file_identity(&std::fs::metadata(&staged)?);
+            let file = JournalFile {
+                source: temporary.path().join("retained.delete"),
+                staged: staged.clone(),
+                destination: temporary.path().join("retained.delete"),
+                content_hash: Some(hash_path(&staged)?),
+                sha256: None,
+                source_identity: Some(identity.clone()),
+                owned_identity: Some(identity),
+                role: "purge-retained-file".into(),
+                state: "quarantined".into(),
+            };
+            let mut library = Library::open_in_memory()?;
+            let operation = library
+                .create_operation(OperationKind::PurgeDelete, std::slice::from_ref(&file))?;
+            library.set_operation_state(&operation, "db-committed", None)?;
+
+            let result = cleanup_purge_file_with(&operation, 0, &file, |acquired| {
+                std::fs::rename(acquired, &preserved)?;
+                std::fs::write(acquired, replacement)?;
+                Ok(())
+            });
+            assert_eq!(
+                std::fs::read(&staged).ok().as_deref(),
+                Some(replacement),
+                "purge recovery deleted an acquired replacement: {result:?}"
+            );
+            assert!(result.is_err(), "purge recovery accepted a replacement");
+            assert_eq!(std::fs::read(&preserved)?, b"audio");
+            for _ in 0..2 {
+                assert_eq!(library.recover_pending()?.unresolved.len(), 1);
+                assert_eq!(std::fs::read(&staged)?, replacement);
+                assert_eq!(std::fs::read(&preserved)?, b"audio");
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn purge_recovery_resumes_an_interrupted_acquisition() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let staged = temporary.path().join("retained.purge");
+        std::fs::write(&staged, b"audio")?;
+        let identity = file_identity(&std::fs::metadata(&staged)?);
+        let file = JournalFile {
+            source: temporary.path().join("retained.delete"),
+            staged: staged.clone(),
+            destination: temporary.path().join("retained.delete"),
+            content_hash: Some(hash_path(&staged)?),
+            sha256: None,
+            source_identity: Some(identity.clone()),
+            owned_identity: Some(identity),
+            role: "purge-retained-file".into(),
+            state: "quarantined".into(),
+        };
+        let mut library = Library::open_in_memory()?;
+        let operation =
+            library.create_operation(OperationKind::PurgeDelete, std::slice::from_ref(&file))?;
+        library.set_operation_state(&operation, "db-committed", None)?;
+        let acquired = purge_cleanup_path(&operation, 0, &staged)?;
+        std::fs::rename(&staged, &acquired)?;
+
+        for _ in 0..2 {
+            assert!(library.recover_pending()?.unresolved.is_empty());
+            assert!(
+                !acquired.exists(),
+                "purge recovery abandoned its acquired file"
+            );
+            assert!(!staged.exists());
+        }
+        Ok(())
+    }
+
+    fn metadata_fixture(metadata: &ExtendedMetadata) -> Result<(Library, i64)> {
+        let library = Library::open_in_memory()?;
+        library.conn.execute(
+            "INSERT INTO items
+                 (path, title, artist, album, albumartist, genre, year, track, disc,
+                  format, bitrate, length, added, mtime, singleton)
+             VALUES ('/generated/track.flac', 'Title', 'Artist', 'Album',
+                     'Album Artist', 'Rock', 2020, 1, 1, 'FLAC', 1, 1.0,
+                     '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z', 1)",
+            [],
+        )?;
+        let id = library.conn.last_insert_rowid();
+        let transaction = library.conn.unchecked_transaction()?;
+        save_extended_metadata(&transaction, "item", id, metadata)?;
+        save_external_ids(&transaction, "item", id, metadata.external_ids.iter())?;
+        transaction.commit()?;
+        Ok((library, id))
+    }
+
+    #[test]
+    fn tag_updates_persist_native_metadata_snapshots() -> Result<()> {
+        let (library, id) = metadata_fixture(&ExtendedMetadata::default())?;
+        let mut item = library.query_items(&Query::all())?.remove(0);
+        item.year = Some(2024);
+        item.extended = ExtendedMetadata {
+            date: crate::PartialDate {
+                year: Some(2024),
+                month: Some(3),
+                day: Some(2),
+            },
+            original_date: crate::PartialDate {
+                year: Some(1999),
+                month: None,
+                day: None,
+            },
+            track_total: Some(12),
+            disc_total: Some(2),
+            compilation: Some(false),
+            label: Some("Label".into()),
+            catalog_number: Some("CAT-1".into()),
+            country: Some("GB".into()),
+            media: Some("CD".into()),
+            language: Some("en".into()),
+            artists: vec!["Artist".into(), "Guest".into()],
+            album_artists: vec!["Album Artist".into(), "Guest".into()],
+            genres: vec!["Rock".into(), "Folk".into()],
+            composers: vec!["Composer".into()],
+            ..ExtendedMetadata::default()
+        };
+        item.extended
+            .flexible_fields
+            .insert("work".into(), FlexibleValue::String("New work".into()));
+        library.update_items(&[(id, item.clone())])?;
+        assert_eq!(
+            library.query_items(&Query::all())?[0].extended,
+            item.extended
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tag_updates_preserve_unrelated_flexible_fields() -> Result<()> {
+        let mut metadata = ExtendedMetadata::default();
+        metadata
+            .flexible_fields
+            .insert("user_rating".into(), FlexibleValue::Integer(5));
+        let (library, id) = metadata_fixture(&metadata)?;
+        let mut item = library.query_items(&Query::all())?.remove(0);
+        item.extended = ExtendedMetadata::default();
+        library.update_items(&[(id, item)])?;
+        assert_eq!(
+            library.query_items(&Query::all())?[0]
+                .extended
+                .flexible_fields
+                .get("user_rating"),
+            Some(&FlexibleValue::Integer(5))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tag_updates_clear_absent_native_flexible_fields() -> Result<()> {
+        let mut metadata = ExtendedMetadata::default();
+        metadata
+            .flexible_fields
+            .insert("work".into(), FlexibleValue::String("Old work".into()));
+        let (library, id) = metadata_fixture(&metadata)?;
+        let mut item = library.query_items(&Query::all())?.remove(0);
+        item.extended = ExtendedMetadata::default();
+        library.update_items(&[(id, item)])?;
+        assert!(!library.query_items(&Query::all())?[0]
+            .extended
+            .flexible_fields
+            .contains_key("work"));
+        Ok(())
+    }
+
+    #[test]
+    fn tag_updates_preserve_identity_invalidation_for_supported_aliases() -> Result<()> {
+        let mut metadata = ExtendedMetadata::default();
+        for kind in [
+            "recording",
+            "track",
+            "release_track",
+            "release-track",
+            "release",
+            "legacy",
+        ] {
+            metadata.external_ids.push(ExternalId::new_typed(
+                "musicbrainz",
+                kind,
+                "123e4567-e89b-12d3-a456-426614174000",
+            )?);
+        }
+        let (library, id) = metadata_fixture(&metadata)?;
+        let mut item = library.query_items(&Query::all())?.remove(0);
+        item.title = "Changed".into();
+        item.year = Some(2024);
+        library.update_items(&[(id, item)])?;
+        assert!(library.query_items(&Query::all())?[0]
+            .extended
+            .external_ids
+            .is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn failed_tag_updates_roll_back_extended_metadata() -> Result<()> {
+        let metadata = ExtendedMetadata {
+            label: Some("Original".into()),
+            ..ExtendedMetadata::default()
+        };
+        let (library, id) = metadata_fixture(&metadata)?;
+        let before = library.query_items(&Query::all())?.remove(0);
+        let mut changed = before.clone();
+        changed.title = "Changed".into();
+        changed.extended.label = Some("Changed label".into());
+        let result = library.update_items(&[(id, changed.clone()), (id + 1, changed)]);
+        assert!(result.is_err());
+        let stored = library.query_items(&Query::all())?.remove(0);
+        assert_eq!(stored.extended, before.extended);
+        assert_eq!(stored.title, before.title);
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_modifications_replace_stale_projection_metadata() -> Result<()> {
+        let metadata = ExtendedMetadata {
+            date: crate::PartialDate {
+                year: Some(2020),
+                month: Some(2),
+                day: Some(3),
+            },
+            artists: vec!["Old artist".into(), "Guest".into()],
+            album_artists: vec!["Old album artist".into()],
+            genres: vec!["Old genre".into()],
+            ..ExtendedMetadata::default()
+        };
+        let (library, id) = metadata_fixture(&metadata)?;
+        library.modify_items(
+            &[id],
+            &[
+                "artist=New artist".into(),
+                "albumartist=New album artist".into(),
+                "genre=New genre".into(),
+                "year=2024".into(),
+            ],
+        )?;
+        let item = library.query_items(&Query::all())?.remove(0);
+        assert_eq!(item.extended.artists, ["New artist"]);
+        assert_eq!(item.extended.album_artists, ["New album artist"]);
+        assert_eq!(item.extended.genres, ["New genre"]);
+        assert_eq!(
+            item.extended.date,
+            crate::PartialDate {
+                year: Some(2024),
+                month: None,
+                day: None
+            }
+        );
+        library.modify_items(
+            &[id],
+            &["albumartist=".into(), "genre=".into(), "year=".into()],
+        )?;
+        let cleared = library.query_items(&Query::all())?.remove(0);
+        assert!(cleared.extended.album_artists.is_empty());
+        assert!(cleared.extended.genres.is_empty());
+        assert_eq!(cleared.extended.date, crate::PartialDate::default());
+        Ok(())
+    }
+
+    #[test]
+    fn modifications_reject_positions_above_retained_totals() -> Result<()> {
+        for field in ["track=3", "disc=3"] {
+            let metadata = ExtendedMetadata {
+                track_total: Some(2),
+                disc_total: Some(2),
+                ..ExtendedMetadata::default()
+            };
+            let (library, id) = metadata_fixture(&metadata)?;
+            let result =
+                library.modify_items(&[id], &["title=Must not persist".into(), field.into()]);
+            assert!(
+                result.is_err(),
+                "modification accepted a position above its total: {field}"
+            );
+            let item = library.query_items(&Query::all())?.remove(0);
+            assert_eq!(item.title, "Title");
+            assert_eq!(item.track, Some(1));
+            assert_eq!(item.disc, Some(1));
+        }
         Ok(())
     }
 

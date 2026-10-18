@@ -94,6 +94,20 @@ pub struct AlbumPlan {
     pub singleton: bool,
 }
 
+impl AlbumPlan {
+    /// Return the compact release ID when all source release IDs agree.
+    #[must_use]
+    pub fn common_embedded_release_id(&self) -> Option<&ExternalId> {
+        common_release_id(&self.items)
+    }
+
+    /// Check the compact release ID and all same-provider source release IDs.
+    #[must_use]
+    pub fn matches_embedded_release_id(&self, release: &ReleaseCandidate) -> bool {
+        matches_embedded_release_id(&self.items, release)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScoredCandidate {
     pub release: ReleaseCandidate,
@@ -209,6 +223,29 @@ impl<'a> ImportPlanner<'a> {
             library,
             provider,
             options,
+        }
+    }
+
+    /// Scan existing tags without querying metadata providers.
+    pub fn plan_existing_tags(&self, paths: &[PathBuf]) -> ImportPlan {
+        let progress = ConsoleProgress::new();
+        let (items, scan_issues) = scan_paths(paths, self.options.follow_symlinks, &progress);
+        let albums = group_into_albums(items)
+            .into_iter()
+            .map(|group| AlbumPlan {
+                source_artist: group.artist,
+                source_album: group.album,
+                items: group.items,
+                candidates: Vec::new(),
+                candidate_set_complete: false,
+                lookup_error: None,
+                singleton: group.singleton,
+            })
+            .collect();
+        ImportPlan {
+            albums,
+            scan_issues,
+            provider_warnings: Vec::new(),
         }
     }
 
@@ -553,6 +590,23 @@ impl<'a> ImportExecutor<'a> {
 
         if plan.action == Action::InPlace {
             return self.execute_in_place(&plan, &active_tracks, already_managed_tracks);
+        }
+        self.library.require_path_root_mutation(&plan.library_dir)?;
+        for track in &active_tracks {
+            self.library
+                .require_path_root_mutation(&track.destination)?;
+            if plan.action == Action::Move {
+                self.library
+                    .require_path_root_mutation(&std::fs::canonicalize(&track.source)?)?;
+            }
+        }
+        if let Some(artwork) = &plan.artwork {
+            if !artwork.original_already_present {
+                self.library
+                    .require_path_root_mutation(artwork.original.path())?;
+            }
+            self.library
+                .require_path_root_mutation(&artwork.destination)?;
         }
         RootCapabilities::detect(&plan.library_dir)?.require_safe_mutation()?;
 
@@ -937,9 +991,78 @@ fn album_and_items(
             value: candidate.release.external_id.clone(),
         }),
         added: Utc::now(),
-        extended: crate::ExtendedMetadata::default(),
+        extended: shared_album_metadata(&items),
     };
     (Some(album), items)
+}
+
+fn shared_album_metadata(items: &[Item]) -> crate::ExtendedMetadata {
+    let Some(first) = items.first() else {
+        return crate::ExtendedMetadata::default();
+    };
+    let mut metadata = crate::ExtendedMetadata {
+        date: shared_album_value(items, |value| &value.date),
+        original_date: shared_album_value(items, |value| &value.original_date),
+        disc_total: shared_album_value(items, |value| &value.disc_total),
+        compilation: shared_album_value(items, |value| &value.compilation),
+        label: shared_album_value(items, |value| &value.label),
+        catalog_number: shared_album_value(items, |value| &value.catalog_number),
+        country: shared_album_value(items, |value| &value.country),
+        media: shared_album_value(items, |value| &value.media),
+        language: shared_album_value(items, |value| &value.language),
+        album_artists: shared_album_value(items, |value| &value.album_artists),
+        genres: shared_album_value(items, |value| &value.genres),
+        ..crate::ExtendedMetadata::default()
+    };
+    for name in [
+        "labels",
+        "catalog_numbers",
+        "barcode",
+        "replaygain_album_gain",
+        "replaygain_album_peak",
+    ] {
+        if let Some(value) = first.extended.flexible_fields.get(name) {
+            if items
+                .iter()
+                .all(|item| item.extended.flexible_fields.get(name) == Some(value))
+            {
+                metadata.flexible_fields.insert(name.into(), value.clone());
+            }
+        }
+    }
+    for id in &first.extended.external_ids {
+        if matches!(id.kind(), "release" | "release-group" | "album-artist")
+            && items.iter().all(|item| {
+                let same_scope = |candidate: &&ExternalId| {
+                    candidate.provider() == id.provider() && candidate.kind() == id.kind()
+                };
+                first
+                    .extended
+                    .external_ids
+                    .iter()
+                    .filter(same_scope)
+                    .eq(item.extended.external_ids.iter().filter(same_scope))
+            })
+        {
+            metadata.external_ids.push(id.clone());
+        }
+    }
+    metadata
+}
+
+fn shared_album_value<T: Clone + Default + PartialEq>(
+    items: &[Item],
+    field: impl Fn(&crate::ExtendedMetadata) -> &T,
+) -> T {
+    let Some(first) = items.first() else {
+        return T::default();
+    };
+    let value = field(&first.extended);
+    if items.iter().all(|item| field(&item.extended) == value) {
+        value.clone()
+    } else {
+        T::default()
+    }
 }
 
 fn reject_duplicate_destination(
@@ -1041,7 +1164,10 @@ fn scan_paths<P: ScanProgress>(
                             });
                         }
                         Ok(canonical)
-                            if is_audio_file(&canonical) && seen.insert(canonical.clone()) =>
+                            if (is_audio_file(&canonical)
+                                || direct_files.contains(&canonical)
+                                || has_audio_extension(&canonical))
+                                && seen.insert(canonical.clone()) =>
                         {
                             files.push(canonical);
                         }
@@ -1080,6 +1206,18 @@ fn scan_paths<P: ScanProgress>(
     }
     progress.finish(items.len());
     (items, issues)
+}
+
+fn has_audio_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|extension| {
+            crate::AudioFormat::from_extension(extension) != crate::AudioFormat::Unknown
+                || matches!(
+                    extension.to_ascii_lowercase().as_str(),
+                    "wma" | "dsf" | "dff" | "mka"
+                )
+        })
 }
 
 fn group_into_albums(items: Vec<Item>) -> Vec<AlbumGroup> {
@@ -1169,6 +1307,7 @@ fn score_track_candidates(
             };
             let composite = artist.mul_add(0.35, title.mul_add(0.55, provider * 0.10));
             let mut failures = Vec::new();
+            failures.extend(provider_score_failure(track.provider_score));
             if artist < ARTIST_GATE {
                 failures.push("artist similarity is below 95%".into());
             }
@@ -1240,7 +1379,7 @@ fn score_track_candidates(
     });
     let runner_up = candidates
         .get(1)
-        .map_or(0.0, |candidate| candidate.confidence.composite);
+        .map(|candidate| candidate.confidence.composite);
     if let Some(best) = candidates.first_mut() {
         apply_singleton_confidence_gates(best, runner_up, threshold, required_margin);
     }
@@ -1249,11 +1388,12 @@ fn score_track_candidates(
 
 fn apply_singleton_confidence_gates(
     best: &mut ScoredCandidate,
-    runner_up: f64,
+    runner_up: Option<f64>,
     threshold: f64,
     required_margin: f64,
 ) {
-    best.confidence.runner_up_margin = Some(best.confidence.composite - runner_up);
+    best.confidence.runner_up_margin =
+        runner_up.map(|runner_up| best.confidence.composite - runner_up);
     let thresholds_valid =
         (0.0..=1.0).contains(&threshold) && (0.0..=1.0).contains(&required_margin);
     if !thresholds_valid {
@@ -1279,11 +1419,18 @@ fn apply_singleton_confidence_gates(
             .runner_up_margin
             .is_none_or(|margin| margin < required_margin)
     {
-        best.confidence.gate_failures.push(format!(
-            "runner-up margin {:.1}% is below {:.1}%",
-            best.confidence.runner_up_margin.unwrap_or_default() * 100.0,
-            required_margin * 100.0
-        ));
+        best.confidence
+            .gate_failures
+            .push(best.confidence.runner_up_margin.map_or_else(
+                || "runner-up margin is unknown".into(),
+                |margin| {
+                    format!(
+                        "runner-up margin {:.1}% is below {:.1}%",
+                        margin * 100.0,
+                        required_margin * 100.0
+                    )
+                },
+            ));
     }
     best.confidence.high_confidence = best.confidence.gate_failures.is_empty();
 }
@@ -1328,7 +1475,8 @@ fn score_candidates(
                     mean_track.mul_add(TRACK_WEIGHT, provider * PROVIDER_WEIGHT),
                 ),
             );
-            let exact_release_identity = exact_release_confidence(&release);
+            let (exact_release_identity, edition_failures) =
+                compare_release_edition(items, &release);
             ScoredCandidate {
                 release,
                 confidence: ConfidenceBreakdown {
@@ -1344,7 +1492,7 @@ fn score_candidates(
                     runner_up_margin: None,
                     candidate_set_complete,
                     high_confidence: false,
-                    gate_failures: Vec::new(),
+                    gate_failures: edition_failures,
                 },
                 track_matches,
             }
@@ -1377,7 +1525,8 @@ fn confidence_gate_failures(
     threshold: f64,
     required_margin: f64,
 ) -> Vec<String> {
-    let mut failures = Vec::new();
+    let mut failures = candidate.confidence.gate_failures.clone();
+    failures.extend(provider_score_failure(candidate.release.provider_score));
     if !(0.0..=1.0).contains(&threshold) || !(0.0..=1.0).contains(&required_margin) {
         failures.push("matching thresholds are invalid".into());
     }
@@ -1458,12 +1607,8 @@ fn confidence_gate_failures(
             threshold * 100.0
         ));
     }
-    let direct_release_identity = common_release_id(items).is_some_and(|id| {
-        id.kind() == "release"
-            && id.provider() == candidate.release.provider
-            && id.value() == candidate.release.external_id
-            && candidate.release.edition.explicit_id
-    });
+    let direct_release_identity = candidate.release.edition.explicit_id
+        && matches_embedded_release_id(items, &candidate.release);
     match candidate.confidence.runner_up_margin {
         Some(margin) if margin + 1e-12 < required_margin => failures.push(format!(
             "runner-up margin {:.1} points is below {:.1}",
@@ -1477,40 +1622,247 @@ fn confidence_gate_failures(
     failures
 }
 
+fn provider_score_failure(score: f64) -> Option<String> {
+    (!score.is_finite()).then(|| "provider score is not finite".into())
+}
+
 fn common_release_id(items: &[Item]) -> Option<&ExternalId> {
     let first = items.first()?.release_external_id.as_ref()?;
-    if !items.iter().all(|item| {
-        item.release_external_id.as_ref().is_some_and(|id| {
-            id.provider == first.provider && id.kind == first.kind && id.value == first.value
+    if first.kind() != "release"
+        || !items.iter().all(|item| {
+            item.release_external_id.as_ref().is_some_and(|id| {
+                id.provider() == first.provider()
+                    && id.kind() == "release"
+                    && same_provider_id_value(first.provider(), id.value(), first.value())
+            })
         })
-    }) {
+        || has_release_id_conflict(items, first.provider(), first.value())
+    {
         return None;
     }
     Some(first)
 }
 
-fn exact_release_confidence(release: &ReleaseCandidate) -> f64 {
+fn same_provider_id_value(provider: &str, left: &str, right: &str) -> bool {
+    if provider == "musicbrainz" {
+        match (uuid::Uuid::parse_str(left), uuid::Uuid::parse_str(right)) {
+            (Ok(left), Ok(right)) => left == right,
+            _ => false,
+        }
+    } else {
+        left == right
+    }
+}
+
+fn has_release_id_conflict(items: &[Item], provider: &str, value: &str) -> bool {
+    items
+        .iter()
+        .flat_map(|item| {
+            item.release_external_id
+                .iter()
+                .chain(item.extended.external_ids.iter())
+        })
+        .filter(|id| id.provider() == provider && external_id_family(id.kind()) == "release")
+        .any(|id| !same_provider_id_value(provider, id.value(), value))
+}
+
+fn matches_embedded_release_id(items: &[Item], release: &ReleaseCandidate) -> bool {
+    common_release_id(items).is_some_and(|id| matches_release_id(id, release))
+}
+
+fn matches_release_id(id: &ExternalId, release: &ReleaseCandidate) -> bool {
+    id.kind() == "release"
+        && id.provider() == release.provider
+        && same_provider_id_value(&release.provider, id.value(), &release.external_id)
+}
+
+/// Compare source edition facts and return credit and review reasons.
+fn compare_release_edition(items: &[Item], release: &ReleaseCandidate) -> (f64, Vec<String>) {
     let evidence = &release.edition;
-    if evidence.explicit_id {
-        return 1.0;
-    }
+    let label_catalog = label_catalog_agreement(items, &evidence.labels_and_catalog_numbers);
+    let country = edition_values_agree(
+        items,
+        |item| item.extended.country.as_deref(),
+        evidence.country.iter().map(String::as_str),
+    );
+    let medium = edition_values_agree(
+        items,
+        |item| item.extended.media.as_deref(),
+        evidence.media_formats.iter().map(String::as_str),
+    );
     let mut score: f64 = 0.0;
-    if evidence.barcode.is_some() {
-        score += 0.35;
+    let mut failures = Vec::new();
+    if items
+        .iter()
+        .filter_map(|item| item.release_external_id.as_ref())
+        .filter(|id| id.provider() == release.provider)
+        .any(|id| !matches_release_id(id, release))
+        || has_release_id_conflict(items, &release.provider, &release.external_id)
+    {
+        failures.push("candidate contradicts an embedded release ID".into());
     }
-    if !evidence.labels_and_catalog_numbers.is_empty() {
-        score += 0.35;
+    for (agreement, weight, reason) in [
+        (
+            label_catalog,
+            0.35,
+            "source label/catalog facts contradict candidate edition",
+        ),
+        (country, 0.1, "source country contradicts candidate edition"),
+        (medium, 0.1, "source medium contradicts candidate edition"),
+    ] {
+        match agreement {
+            Some(true) => score += weight,
+            Some(false) => failures.push(reason.into()),
+            None => {}
+        }
     }
-    if !evidence.disc_ids.is_empty() {
-        score += 0.6;
+    if evidence.explicit_id && matches_embedded_release_id(items, release) && failures.is_empty() {
+        score = 1.0;
     }
-    if evidence.country.is_some() {
-        score += 0.1;
+    (score, failures)
+}
+
+/// Missing facts are unknown. Every supplied source value must agree.
+fn edition_values_agree<'a>(
+    items: &[Item],
+    source_value: fn(&Item) -> Option<&str>,
+    candidates: impl IntoIterator<Item = &'a str>,
+) -> Option<bool> {
+    let candidates = candidates
+        .into_iter()
+        .filter_map(edition_fact)
+        .map(normalize_edition_fact)
+        .collect::<Vec<_>>();
+    let mut saw_source = false;
+    for source in items
+        .iter()
+        .filter_map(source_value)
+        .filter_map(edition_fact)
+    {
+        if candidates.is_empty() {
+            return None;
+        }
+        saw_source = true;
+        if !candidates.contains(&normalize_edition_fact(source)) {
+            return Some(false);
+        }
     }
-    if !evidence.media_formats.is_empty() {
-        score += 0.1;
+    saw_source.then_some(true)
+}
+
+fn label_catalog_agreement(
+    items: &[Item],
+    candidates: &[(String, Option<String>)],
+) -> Option<bool> {
+    let mut saw_source = false;
+    let mut unknown = false;
+    let (known_labels, missing_labels) =
+        known_edition_values(candidates.iter().map(|(label, _)| Some(label.as_str())));
+    let (known_catalogs, missing_catalogs) =
+        known_edition_values(candidates.iter().map(|(_, catalog)| catalog.as_deref()));
+    for item in items {
+        for (singular, field, known, missing) in [
+            (
+                item.extended.label.as_deref(),
+                "labels",
+                &known_labels,
+                missing_labels,
+            ),
+            (
+                item.extended.catalog_number.as_deref(),
+                "catalog_numbers",
+                &known_catalogs,
+                missing_catalogs,
+            ),
+        ] {
+            let plural = match item.extended.flexible_fields.get(field) {
+                Some(crate::FlexibleValue::StringList(values)) => values.as_slice(),
+                _ => &[],
+            };
+            for source in singular
+                .into_iter()
+                .chain(plural.iter().map(String::as_str))
+                .filter_map(edition_fact)
+            {
+                saw_source = true;
+                if !known.contains(&normalize_edition_fact(source)) {
+                    if missing {
+                        unknown = true;
+                    } else {
+                        return Some(false);
+                    }
+                }
+            }
+        }
+        let label = item.extended.label.as_deref().and_then(edition_fact);
+        let catalog = item
+            .extended
+            .catalog_number
+            .as_deref()
+            .and_then(edition_fact);
+        if label.is_none() && catalog.is_none() {
+            continue;
+        }
+        saw_source = true;
+        let mut matched = false;
+        let mut missing_candidate = candidates.is_empty();
+        for (candidate_label, candidate_catalog) in candidates {
+            let label_match = label
+                .zip(edition_fact(candidate_label))
+                .map(|(source, target)| {
+                    normalize_edition_fact(source) == normalize_edition_fact(target)
+                });
+            let catalog_match = catalog
+                .zip(candidate_catalog.as_deref().and_then(edition_fact))
+                .map(|(source, target)| {
+                    normalize_edition_fact(source) == normalize_edition_fact(target)
+                });
+            if label_match == Some(false) || catalog_match == Some(false) {
+                continue;
+            }
+            if (label.is_none() || label_match == Some(true))
+                && (catalog.is_none() || catalog_match == Some(true))
+            {
+                matched = true;
+                break;
+            }
+            missing_candidate = true;
+        }
+        if !matched && !missing_candidate {
+            return Some(false);
+        }
+        unknown |= !matched;
     }
-    score.min(1.0)
+    (saw_source && !unknown).then_some(true)
+}
+
+fn known_edition_values<'a>(values: impl Iterator<Item = Option<&'a str>>) -> (Vec<String>, bool) {
+    let mut known = Vec::new();
+    let mut missing = false;
+    for value in values {
+        if let Some(value) = value.and_then(edition_fact) {
+            known.push(normalize_edition_fact(value));
+        } else {
+            missing = true;
+        }
+    }
+    let missing = missing || known.is_empty();
+    (known, missing)
+}
+
+fn edition_fact(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty()).then_some(value)
+}
+
+fn normalize_edition_fact(value: &str) -> String {
+    value
+        .nfc()
+        .flat_map(char::to_lowercase)
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Assign source items to provider release tracks using the same bounded
@@ -1631,14 +1983,33 @@ fn apply_release_metadata(items: &mut [Item], candidate: &ScoredCandidate) {
         value: candidate.release.external_id.clone(),
     });
     for item in &mut *items {
-        item.album.clone_from(&candidate.release.title);
-        item.albumartist = Some(candidate.release.artist.clone());
-        item.year = candidate.release.year;
-        item.release_external_id.clone_from(&release_id);
-        if let Some(release_id) = &release_id {
-            if !item.extended.external_ids.contains(release_id) {
-                item.extended.external_ids.push(release_id.clone());
+        for id in item
+            .track_external_id
+            .iter()
+            .chain(item.release_external_id.iter())
+        {
+            if !item.extended.external_ids.contains(id) {
+                item.extended.external_ids.push(id.clone());
             }
+        }
+        item.album.clone_from(&candidate.release.title);
+        if item.effective_albumartist() != candidate.release.artist {
+            item.extended.album_artists = vec![candidate.release.artist.clone()];
+        }
+        item.albumartist = Some(candidate.release.artist.clone());
+        if let Some(year) = candidate.release.year {
+            if item.extended.date.year.or(item.year) != Some(year) {
+                item.extended.date = crate::PartialDate {
+                    year: Some(year),
+                    month: None,
+                    day: None,
+                };
+            }
+            item.year = Some(year);
+        }
+        if let Some(release_id) = &release_id {
+            item.release_external_id = Some(release_id.clone());
+            replace_external_id(&mut item.extended.external_ids, release_id.clone());
         }
     }
     for matched in &candidate.track_matches {
@@ -1649,7 +2020,12 @@ fn apply_release_metadata(items: &mut [Item], candidate: &ScoredCandidate) {
             continue;
         };
         item.title.clone_from(&track.title);
+        if item.artist != track.artist {
+            item.extended.artists = vec![track.artist.clone()];
+        }
         item.artist.clone_from(&track.artist);
+        clear_exceeded_total(item.track, track.number, &mut item.extended.track_total);
+        clear_exceeded_total(item.disc, track.disc, &mut item.extended.disc_total);
         item.track = track.number;
         item.disc = track.disc;
         if !track.external_id.is_empty() {
@@ -1659,20 +2035,61 @@ fn apply_release_metadata(items: &mut [Item], candidate: &ScoredCandidate) {
                 value: track.external_id.clone(),
             };
             item.track_external_id = Some(recording_id.clone());
-            if !item.extended.external_ids.contains(&recording_id) {
-                item.extended.external_ids.push(recording_id);
-            }
+            replace_external_id(&mut item.extended.external_ids, recording_id);
         }
-        if let Some(value) = &track.release_track_external_id {
+        if let Some(value) = track
+            .release_track_external_id
+            .as_ref()
+            .filter(|value| !value.is_empty())
+        {
             let release_track_id = ExternalId {
                 provider: candidate.release.provider.clone(),
                 kind: "release-track".into(),
                 value: value.clone(),
             };
-            if !item.extended.external_ids.contains(&release_track_id) {
-                item.extended.external_ids.push(release_track_id);
+            replace_external_id(&mut item.extended.external_ids, release_track_id);
+        }
+    }
+    for item in items {
+        if let (Some(track), Some(release)) = (&item.track_external_id, &item.release_external_id) {
+            if track.provider() != release.provider() {
+                if release.provider() == candidate.release.provider {
+                    item.track_external_id = None;
+                } else if track.provider() == candidate.release.provider {
+                    item.release_external_id = None;
+                }
             }
         }
+    }
+}
+
+fn clear_exceeded_total(old: Option<u32>, selected: Option<u32>, total: &mut Option<u32>) {
+    if old != selected
+        && selected
+            .zip(*total)
+            .is_some_and(|(number, total)| number > total)
+    {
+        *total = None;
+    }
+}
+
+fn external_id_family(kind: &str) -> &str {
+    match kind {
+        "legacy" => "release",
+        "track" => "recording",
+        "release_track" => "release-track",
+        _ => kind,
+    }
+}
+
+fn replace_external_id(ids: &mut Vec<ExternalId>, selected: ExternalId) {
+    ids.retain(|id| {
+        id.provider() != selected.provider()
+            || external_id_family(id.kind()) != external_id_family(selected.kind())
+            || id == &selected
+    });
+    if !ids.contains(&selected) {
+        ids.push(selected);
     }
 }
 
@@ -1779,7 +2196,10 @@ fn staging_path(destination: &Path, operation: uuid::Uuid, suffix: &str) -> Resu
                 destination.display()
             ))
         })?;
-    Ok(destination.with_file_name(format!(".{name}.rsbts-{operation}.{suffix}")))
+    Ok(crate::fsops::bounded_sibling_path(
+        destination,
+        format!(".{name}.rsbts-{operation}.{suffix}"),
+    ))
 }
 
 fn append_extension(path: &Path, extension: &std::ffi::OsStr) -> PathBuf {
@@ -2055,6 +2475,30 @@ mod tests {
     }
 
     #[test]
+    fn a_single_track_candidate_keeps_unknown_runner_up_margin() {
+        let source = item("one.flac".into(), "War Pigs", 1);
+        let candidate = TrackCandidate {
+            provider: "test".into(),
+            external_id: "only".into(),
+            title: "War Pigs".into(),
+            artist: "Black Sabbath".into(),
+            length_ms: Some(180_000),
+            provider_score: 1.0,
+            release_external_id: None,
+        };
+
+        let candidates = score_track_candidates(&[source], vec![candidate], 0.92, 0.05);
+
+        assert_eq!(candidates[0].confidence.runner_up_margin, None);
+        assert!(!candidates[0].confidence.high_confidence);
+        assert!(candidates[0]
+            .confidence
+            .gate_failures
+            .iter()
+            .any(|failure| failure.contains("runner-up margin is unknown")));
+    }
+
+    #[test]
     fn a_direct_embedded_release_id_supplies_real_uniqueness_evidence() -> Result<()> {
         let release_id = ExternalId::new_typed("test", "release", "direct")?;
         let mut items = vec![
@@ -2080,6 +2524,710 @@ mod tests {
             .gate_failures
             .iter()
             .all(|failure| !failure.contains("runner-up")));
+        Ok(())
+    }
+
+    fn edition_source_items() -> Vec<Item> {
+        vec![
+            item("one.flac".into(), "War Pigs", 1),
+            item("two.flac".into(), "Paranoid", 2),
+        ]
+    }
+
+    fn direct_musicbrainz_case() -> Result<(Vec<Item>, ReleaseCandidate)> {
+        let value = "abcdef12-3456-4789-8123-123456789abc";
+        let mut items = edition_source_items();
+        for item in &mut items {
+            item.release_external_id =
+                Some(ExternalId::new_typed("musicbrainz", "release", value)?);
+        }
+        let mut candidate = release(value, "Paranoid");
+        candidate.provider = "musicbrainz".into();
+        candidate.edition.explicit_id = true;
+        Ok((items, candidate))
+    }
+
+    fn assert_extended_release_id_conflict(item_index: usize, kind: &str) -> Result<()> {
+        let (mut items, mut candidate) = direct_musicbrainz_case()?;
+        if item_index == 0 {
+            items.truncate(1);
+            candidate.tracks.truncate(1);
+        }
+        items[item_index]
+            .extended
+            .external_ids
+            .push(ExternalId::new_typed(
+                "musicbrainz",
+                kind,
+                "22222222-2222-4222-8222-222222222222",
+            )?);
+        let scored = score_candidates(&items, vec![candidate], true, 0.92, 0.05);
+        assert!(
+            !scored[0].confidence.high_confidence,
+            "an extended release ID conflict retained direct-ID acceptance"
+        );
+        assert!(common_release_id(&items).is_none());
+        assert!(scored[0].confidence.exact_release_identity.abs() < f64::EPSILON);
+        assert!(scored[0]
+            .confidence
+            .gate_failures
+            .iter()
+            .any(|failure| failure.contains("embedded release ID")));
+        Ok(())
+    }
+
+    #[test]
+    fn one_track_extended_release_id_conflict_requires_review() -> Result<()> {
+        assert_extended_release_id_conflict(0, "release")
+    }
+
+    #[test]
+    fn cross_track_extended_release_id_conflict_requires_review() -> Result<()> {
+        assert_extended_release_id_conflict(1, "release")
+    }
+
+    #[test]
+    fn legacy_extended_release_id_conflict_requires_review() -> Result<()> {
+        assert_extended_release_id_conflict(0, "legacy")
+    }
+
+    #[test]
+    fn opaque_extended_release_id_comparison_is_exact() -> Result<()> {
+        let mut items = edition_source_items();
+        for item in &mut items {
+            item.release_external_id = Some(ExternalId::new_typed("test", "release", "opaque-A")?);
+        }
+        items[0]
+            .extended
+            .external_ids
+            .push(ExternalId::new_typed("test", "release", "opaque-a")?);
+        let mut candidate = release("opaque-A", "Paranoid");
+        candidate.edition.explicit_id = true;
+        let scored = score_candidates(&items, vec![candidate], true, 0.92, 0.05);
+        assert!(
+            !scored[0].confidence.high_confidence,
+            "different opaque release IDs retained direct-ID acceptance"
+        );
+        assert!(scored[0]
+            .confidence
+            .gate_failures
+            .iter()
+            .any(|failure| failure.contains("embedded release ID")));
+        Ok(())
+    }
+
+    #[test]
+    fn musicbrainz_release_id_uuid_aliases_preserve_common_evidence() -> Result<()> {
+        let value = "abcdef12-3456-4789-8123-123456789abc";
+        let id = uuid::Uuid::parse_str(value)
+            .map_err(|error| Error::Import(format!("invalid fixture UUID: {error}")))?;
+        let mut accepted = Vec::new();
+        for alias in [
+            id.simple().to_string(),
+            id.braced().to_string(),
+            id.urn().to_string(),
+            value.to_uppercase(),
+        ] {
+            let (mut items, candidate) = direct_musicbrainz_case()?;
+            items[1].release_external_id =
+                Some(ExternalId::new_typed("musicbrainz", "release", &alias)?);
+            items[0].extended.external_ids.push(ExternalId::new_typed(
+                "musicbrainz",
+                "release",
+                &alias,
+            )?);
+            accepted.push(
+                score_candidates(&items, vec![candidate], true, 0.92, 0.05)[0]
+                    .confidence
+                    .high_confidence,
+            );
+        }
+        assert_eq!(
+            accepted, [true; 4],
+            "equivalent UUID spellings lost evidence"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn matching_and_unrelated_extended_release_ids_preserve_evidence() -> Result<()> {
+        let mut accepted = Vec::new();
+        for (provider, kind, value) in [
+            (
+                "musicbrainz",
+                "release",
+                "abcdef12-3456-4789-8123-123456789abc",
+            ),
+            ("discogs", "release", "123"),
+            (
+                "musicbrainz",
+                "recording",
+                "22222222-2222-4222-8222-222222222222",
+            ),
+        ] {
+            let (mut items, candidate) = direct_musicbrainz_case()?;
+            items[0]
+                .extended
+                .external_ids
+                .push(ExternalId::new_typed(provider, kind, value)?);
+            accepted.push(
+                score_candidates(&items, vec![candidate], true, 0.92, 0.05)[0]
+                    .confidence
+                    .high_confidence,
+            );
+        }
+        assert_eq!(
+            accepted, [true; 3],
+            "unrelated IDs blocked direct-ID evidence"
+        );
+        Ok(())
+    }
+
+    fn candidate_with_edition_facts() -> ReleaseCandidate {
+        let mut candidate = release("edition", "Paranoid");
+        candidate.edition.barcode = Some("1234567890123".into());
+        candidate.edition.labels_and_catalog_numbers = vec![("Vertigo".into(), Some("VO6".into()))];
+        candidate.edition.country = Some("US".into());
+        candidate.edition.media_formats = vec!["Vinyl".into()];
+        candidate.edition.disc_ids = vec!["candidate-disc-id".into()];
+        candidate
+    }
+
+    fn selected_metadata_case() -> Result<(Item, ScoredCandidate)> {
+        let old = "11111111-1111-4111-8111-111111111111";
+        let mut source = item("fixture.flac".into(), "War Pigs", 1);
+        source.release_external_id = Some(ExternalId::new_typed("musicbrainz", "release", old)?);
+        source.track_external_id = Some(ExternalId::new_typed("musicbrainz", "recording", old)?);
+        source.extended.artists = vec![source.artist.clone(), "Guest".into()];
+        source.extended.album_artists = vec![source.artist.clone(), "Album Guest".into()];
+        source.extended.date = crate::PartialDate {
+            year: Some(1970),
+            month: Some(10),
+            day: Some(2),
+        };
+        source.extended.track_total = Some(2);
+        source.extended.disc_total = Some(2);
+        for kind in ["legacy", "track", "release_track"] {
+            source
+                .extended
+                .external_ids
+                .push(ExternalId::new_typed("musicbrainz", kind, old)?);
+        }
+        let mut selected = release("22222222-2222-4222-8222-222222222222", "Paranoid");
+        selected.provider = "musicbrainz".into();
+        selected.artist = "Selected Album Artist".into();
+        selected.year = Some(2025);
+        selected.tracks.truncate(1);
+        selected.tracks[0].artist = "Selected Track Artist".into();
+        selected.tracks[0].number = Some(4);
+        selected.tracks[0].disc = Some(3);
+        selected.tracks[0].external_id = "33333333-3333-4333-8333-333333333333".into();
+        selected.tracks[0].release_track_external_id =
+            Some("44444444-4444-4444-8444-444444444444".into());
+        let candidate = score_candidates(
+            std::slice::from_ref(&source),
+            vec![selected],
+            true,
+            0.92,
+            0.05,
+        )
+        .pop()
+        .ok_or_else(|| Error::Import("fixture candidate is missing".into()))?;
+        Ok((source, candidate))
+    }
+
+    fn selected_canonical_metadata(
+        mut source: Item,
+        candidate: &ScoredCandidate,
+    ) -> Result<serde_json::Value> {
+        source.extended.track_total = None;
+        source.extended.disc_total = None;
+        apply_release_metadata(std::slice::from_mut(&mut source), candidate);
+        Ok(serde_json::to_value(crate::write::canonical_tags(
+            &source,
+        )?)?)
+    }
+
+    #[test]
+    fn selected_metadata_updates_canonical_artist_lists() -> Result<()> {
+        let (source, candidate) = selected_metadata_case()?;
+        let tags = selected_canonical_metadata(source, &candidate)?;
+        assert_eq!(
+            (tags["track_artists"].clone(), tags["album_artists"].clone()),
+            (
+                serde_json::json!(["Selected Track Artist"]),
+                serde_json::json!(["Selected Album Artist"])
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn selected_metadata_updates_a_changed_canonical_year() -> Result<()> {
+        let (source, candidate) = selected_metadata_case()?;
+        assert_eq!(
+            selected_canonical_metadata(source, &candidate)?["recording_date"],
+            "2025"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn selected_metadata_preserves_year_when_provider_omits_it() -> Result<()> {
+        let (mut source, mut candidate) = selected_metadata_case()?;
+        candidate.release.year = None;
+        apply_release_metadata(std::slice::from_mut(&mut source), &candidate);
+        assert_eq!(
+            source.year,
+            Some(1970),
+            "missing provider year erased the known year"
+        );
+        assert_eq!(
+            source.extended.date,
+            crate::PartialDate {
+                year: Some(1970),
+                month: Some(10),
+                day: Some(2),
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn selected_metadata_replaces_identity_families_in_canonical_tags() -> Result<()> {
+        let (source, candidate) = selected_metadata_case()?;
+        let tags = selected_canonical_metadata(source, &candidate)?;
+        assert_eq!(
+            [
+                tags["musicbrainz_release_ids"].clone(),
+                tags["musicbrainz_recording_ids"].clone(),
+                tags["musicbrainz_release_track_ids"].clone()
+            ],
+            [
+                serde_json::json!(["22222222-2222-4222-8222-222222222222"]),
+                serde_json::json!(["33333333-3333-4333-8333-333333333333"]),
+                serde_json::json!(["44444444-4444-4444-8444-444444444444"])
+            ],
+            "selected IDs retained obsolete canonical or legacy identities"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn selected_metadata_clears_only_exceeded_position_totals() -> Result<()> {
+        let (mut source, candidate) = selected_metadata_case()?;
+        apply_release_metadata(std::slice::from_mut(&mut source), &candidate);
+        assert_eq!(
+            (source.extended.track_total, source.extended.disc_total),
+            (None, None),
+            "changed positions exceed retained totals"
+        );
+        crate::write::canonical_tags(&source)?;
+        Ok(())
+    }
+
+    #[test]
+    fn selected_metadata_provider_change_preserves_missing_recording_evidence() -> Result<()> {
+        let (mut source, mut candidate) = selected_metadata_case()?;
+        candidate.release.provider = "other".into();
+        candidate.release.external_id = "selected-release".into();
+        candidate.release.tracks[0].external_id.clear();
+        candidate.release.tracks[0].release_track_external_id = None;
+        apply_release_metadata(std::slice::from_mut(&mut source), &candidate);
+        assert!(
+            source.track_external_id.is_none(),
+            "compact IDs retained different providers"
+        );
+        assert!(source
+            .extended
+            .external_ids
+            .iter()
+            .any(|id| id.provider() == "musicbrainz"
+                && id.kind() == "recording"
+                && id.value() == "11111111-1111-4111-8111-111111111111"));
+        crate::validate_item_metadata(&source)?;
+        Ok(())
+    }
+
+    #[test]
+    fn selected_metadata_preserves_unchanged_facts_and_valid_totals() -> Result<()> {
+        let (mut source, mut candidate) = selected_metadata_case()?;
+        let old = "11111111-1111-4111-8111-111111111111";
+        candidate.release.artist.clone_from(&source.artist);
+        candidate.release.year = source.year;
+        candidate.release.external_id = old.into();
+        candidate.release.tracks[0]
+            .artist
+            .clone_from(&source.artist);
+        candidate.release.tracks[0].number = Some(2);
+        candidate.release.tracks[0].disc = Some(2);
+        candidate.release.tracks[0].external_id = old.into();
+        candidate.release.tracks[0].release_track_external_id = Some(old.into());
+        source.extended.external_ids.clear();
+        for kind in ["release", "recording", "release-track", "artist"] {
+            source
+                .extended
+                .external_ids
+                .push(ExternalId::new_typed("musicbrainz", kind, old)?);
+        }
+        source
+            .extended
+            .external_ids
+            .push(ExternalId::new_typed("discogs", "release", "123")?);
+        source.extended.country = Some("US".into());
+        source.extended.label = Some("Source label".into());
+        source.extended.catalog_number = Some("SRC-1".into());
+        source.extended.media = Some("Vinyl".into());
+        source.extended.genres = vec!["Rock".into(), "Metal".into()];
+        source.extended.composers = vec!["Composer".into()];
+        source.extended.original_date = crate::PartialDate {
+            year: Some(1969),
+            month: None,
+            day: None,
+        };
+        source.extended.flexible_fields.insert(
+            "replaygain_track_gain".into(),
+            crate::FlexibleValue::String("-6.0 dB".into()),
+        );
+        source.extended.flexible_fields.insert(
+            "custom_note".into(),
+            crate::FlexibleValue::String("Keep".into()),
+        );
+        let expected = source.extended.clone();
+        apply_release_metadata(std::slice::from_mut(&mut source), &candidate);
+        assert_eq!(
+            source.extended, expected,
+            "unchanged or unrelated source facts were lost"
+        );
+        let tags = serde_json::to_value(crate::write::canonical_tags(&source)?)?;
+        assert_eq!(tags["recording_date"], "1970-10-02");
+        assert_eq!(
+            tags["track_artists"],
+            serde_json::json!(["Black Sabbath", "Guest"])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_release_confidence_rejects_unmatched_explicit_ids() -> Result<()> {
+        let mut observations = Vec::new();
+        for (provider, kind, value) in [
+            ("other", "release", "edition"),
+            ("test", "recording", "edition"),
+            ("test", "release", "other"),
+        ] {
+            let mut items = edition_source_items();
+            let id = ExternalId::new_typed(provider, kind, value)?;
+            for item in &mut items {
+                item.release_external_id = Some(id.clone());
+            }
+            let mut candidate = release("edition", "Paranoid");
+            candidate.edition.explicit_id = true;
+            observations.extend(
+                score_candidates(&items, vec![candidate], true, 0.92, 0.05)
+                    .into_iter()
+                    .map(|candidate| (provider, candidate)),
+            );
+        }
+
+        assert!(
+            observations.iter().all(|(_, candidate)| candidate
+                .confidence
+                .exact_release_identity
+                .abs()
+                < f64::EPSILON),
+            "unmatched provider, ID kind, or ID value received exact-release credit: {:?}",
+            observations
+                .iter()
+                .map(|(_, candidate)| candidate.confidence.exact_release_identity)
+                .collect::<Vec<_>>()
+        );
+        for (provider, candidate) in observations {
+            assert_eq!(
+                candidate
+                    .confidence
+                    .gate_failures
+                    .iter()
+                    .any(|failure| failure.contains("embedded release ID")),
+                provider == "test",
+                "complementary providers must not create a release-ID contradiction"
+            );
+            assert!(candidate
+                .confidence
+                .gate_failures
+                .iter()
+                .any(|failure| failure.contains("runner-up margin is unknown")));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn exact_release_confidence_ignores_candidate_only_facts() {
+        let items = edition_source_items();
+        let scored = score_candidates(
+            &items,
+            vec![candidate_with_edition_facts()],
+            true,
+            0.92,
+            0.05,
+        );
+
+        assert!(
+            scored[0].confidence.exact_release_identity.abs() < f64::EPSILON,
+            "candidate-only metadata received exact-release credit"
+        );
+        assert!((scored[0].confidence.composite - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn exact_release_confidence_uses_matching_source_facts() {
+        let mut items = edition_source_items();
+        for item in &mut items {
+            item.extended.label = Some("  VERTIGO ".into());
+            item.extended.catalog_number = Some(" vo6 ".into());
+            item.extended.country = Some("us".into());
+            item.extended.media = Some(" vinyl ".into());
+        }
+        let scored = score_candidates(
+            &items,
+            vec![candidate_with_edition_facts()],
+            true,
+            0.92,
+            0.05,
+        );
+
+        assert!(
+            (scored[0].confidence.exact_release_identity - 0.55).abs() < f64::EPSILON,
+            "edition credit did not use the matching source facts"
+        );
+        assert!(scored[0]
+            .confidence
+            .gate_failures
+            .iter()
+            .all(|failure| !failure.contains("contradict")));
+    }
+
+    #[test]
+    fn edition_contradictions_require_review_without_conflicting_credit() -> Result<()> {
+        let mut items = edition_source_items();
+        let id = ExternalId::new_typed("test", "release", "edition")?;
+        for item in &mut items {
+            item.release_external_id = Some(id.clone());
+            item.extended.label = Some("Other label".into());
+            item.extended.catalog_number = Some("OTHER-1".into());
+            item.extended.country = Some("GB".into());
+            item.extended.media = Some("CD".into());
+        }
+        let mut candidate = candidate_with_edition_facts();
+        candidate.edition.explicit_id = true;
+        let scored = score_candidates(&items, vec![candidate], true, 0.92, 0.05);
+
+        assert!(
+            !scored[0].confidence.high_confidence,
+            "a shared release ID hid contradictory source edition facts"
+        );
+        assert!(scored[0].confidence.exact_release_identity.abs() < f64::EPSILON);
+        assert_eq!(
+            scored[0].confidence.gate_failures,
+            [
+                "source label/catalog facts contradict candidate edition",
+                "source country contradicts candidate edition",
+                "source medium contradicts candidate edition",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_number_punctuation_distinguishes_editions() {
+        let mut items = edition_source_items();
+        for item in &mut items {
+            item.extended.label = Some("Vertigo".into());
+            item.extended.catalog_number = Some("VO-6".into());
+        }
+        let mut candidate = release("edition", "Paranoid");
+        candidate.edition.labels_and_catalog_numbers = vec![("Vertigo".into(), Some("VO6".into()))];
+        let scored = score_candidates(&items, vec![candidate], true, 0.92, 0.05);
+
+        assert!(
+            scored[0].confidence.exact_release_identity.abs() < f64::EPSILON,
+            "different catalog numbers received the same edition credit"
+        );
+        assert!(scored[0]
+            .confidence
+            .gate_failures
+            .iter()
+            .any(|failure| failure.contains("label/catalog")));
+    }
+
+    fn secondary_edition_values(
+        field: &str,
+        secondary: &str,
+    ) -> Result<(Vec<Item>, ReleaseCandidate)> {
+        let (mut items, mut candidate) = direct_musicbrainz_case()?;
+        for item in &mut items {
+            item.extended.label = Some("Vertigo".into());
+            item.extended.catalog_number = Some("VO6".into());
+        }
+        let primary = if field == "labels" { "Vertigo" } else { "VO6" };
+        items[0].extended.flexible_fields.insert(
+            field.into(),
+            crate::FlexibleValue::StringList(vec![primary.into(), secondary.into()]),
+        );
+        candidate.edition.labels_and_catalog_numbers = vec![("Vertigo".into(), Some("VO6".into()))];
+        Ok((items, candidate))
+    }
+
+    fn assert_secondary_edition_conflict(field: &str) -> Result<()> {
+        let (items, candidate) = secondary_edition_values(field, "Contradictory value")?;
+        let scored = score_candidates(&items, vec![candidate], true, 0.92, 0.05);
+        assert!(
+            !scored[0].confidence.high_confidence,
+            "a shared release ID hid contradictory secondary {field}"
+        );
+        assert!(scored[0].confidence.exact_release_identity.abs() < f64::EPSILON);
+        assert!(scored[0]
+            .confidence
+            .gate_failures
+            .iter()
+            .any(|reason| reason.contains("label/catalog")));
+        Ok(())
+    }
+
+    #[test]
+    fn secondary_label_contradictions_require_review() -> Result<()> {
+        assert_secondary_edition_conflict("labels")
+    }
+
+    #[test]
+    fn secondary_catalog_contradictions_require_review() -> Result<()> {
+        assert_secondary_edition_conflict("catalog_numbers")
+    }
+
+    #[test]
+    fn secondary_edition_matching_duplicates_keep_shared_id_acceptance() -> Result<()> {
+        let (mut items, candidate) = secondary_edition_values("labels", "  VERTIGO  ")?;
+        items[0].extended.flexible_fields.insert(
+            "catalog_numbers".into(),
+            crate::FlexibleValue::StringList(vec!["VO6".into(), " vo6 ".into()]),
+        );
+        let scored = score_candidates(&items, vec![candidate], true, 0.92, 0.05);
+        assert!(
+            scored[0].confidence.high_confidence,
+            "matching repeated source values lost shared-ID acceptance: {:?}",
+            scored[0].confidence.gate_failures
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn secondary_edition_missing_candidate_catalog_stays_unknown() -> Result<()> {
+        let (items, mut candidate) =
+            secondary_edition_values("catalog_numbers", "Unresolved catalog")?;
+        candidate
+            .edition
+            .labels_and_catalog_numbers
+            .push(("Vertigo".into(), None));
+        assert_eq!(
+            label_catalog_agreement(&items, &candidate.edition.labels_and_catalog_numbers),
+            None
+        );
+        let scored = score_candidates(&items, vec![candidate], true, 0.92, 0.05);
+        assert!(
+            scored[0].confidence.high_confidence,
+            "missing candidate evidence became a definite contradiction: {:?}",
+            scored[0].confidence.gate_failures
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn label_and_catalog_must_match_the_same_candidate_entry() {
+        let mut items = edition_source_items();
+        for item in &mut items {
+            item.extended.label = Some("Vertigo".into());
+            item.extended.catalog_number = Some("VO6".into());
+        }
+        let mut candidate = release("edition", "Paranoid");
+        candidate.edition.labels_and_catalog_numbers = vec![
+            ("Vertigo".into(), Some("OTHER".into())),
+            ("Other label".into(), Some("VO6".into())),
+        ];
+        let scored = score_candidates(&items, vec![candidate], true, 0.92, 0.05);
+
+        assert!(
+            scored[0].confidence.exact_release_identity.abs() < f64::EPSILON,
+            "separate label and catalog entries supplied a false matched pair"
+        );
+        assert!(scored[0]
+            .confidence
+            .gate_failures
+            .iter()
+            .any(|failure| failure.contains("label/catalog")));
+    }
+
+    #[test]
+    fn missing_candidate_edition_facts_stay_unknown() {
+        let mut items = edition_source_items();
+        for item in &mut items {
+            item.extended.label = Some("Vertigo".into());
+            item.extended.catalog_number = Some("VO6".into());
+            item.extended.country = Some("US".into());
+            item.extended.media = Some("Vinyl".into());
+        }
+        let mut candidate = candidate_with_edition_facts();
+        candidate.edition.country = None;
+        let scored = score_candidates(&items, vec![candidate], true, 0.92, 0.05);
+
+        assert!(
+            (scored[0].confidence.exact_release_identity - 0.45).abs() < f64::EPSILON,
+            "missing country evidence received credit or suppressed matching facts"
+        );
+        assert!(scored[0]
+            .confidence
+            .gate_failures
+            .iter()
+            .all(|failure| !failure.contains("contradict")));
+    }
+
+    #[test]
+    fn conflicting_source_countries_require_review() {
+        let mut items = edition_source_items();
+        items[0].extended.country = Some("US".into());
+        items[1].extended.country = Some("GB".into());
+        let mut candidate = release("edition", "Paranoid");
+        candidate.edition.country = Some("US".into());
+        let scored = score_candidates(&items, vec![candidate], true, 0.92, 0.05);
+
+        assert!(
+            scored[0].confidence.exact_release_identity.abs() < f64::EPSILON,
+            "one track hid another track's contradictory country evidence"
+        );
+        assert!(scored[0]
+            .confidence
+            .gate_failures
+            .iter()
+            .any(|failure| failure.contains("source country contradicts")));
+    }
+
+    #[test]
+    fn conflicting_embedded_release_ids_require_review() -> Result<()> {
+        let mut items = edition_source_items();
+        items[0].release_external_id = Some(ExternalId::new_typed("test", "release", "edition")?);
+        items[1].release_external_id = Some(ExternalId::new_typed("test", "release", "other")?);
+        let mut candidate = release("edition", "Paranoid");
+        candidate.edition.explicit_id = true;
+        let scored = score_candidates(&items, vec![candidate], true, 0.92, 0.05);
+
+        assert!(
+            scored[0]
+                .confidence
+                .gate_failures
+                .iter()
+                .any(|failure| failure.contains("embedded release ID")),
+            "conflicting source IDs received no explicit review reason"
+        );
+        assert!(scored[0].confidence.exact_release_identity.abs() < f64::EPSILON);
         Ok(())
     }
 
@@ -2147,18 +3295,80 @@ mod tests {
     }
 
     #[test]
-    fn non_finite_provider_scores_fail_closed() {
-        let items = vec![
-            item("/tmp/one.flac".into(), "War Pigs", 1),
-            item("/tmp/two.flac".into(), "Paranoid", 2),
+    fn non_finite_provider_scores_fail_closed() -> Result<()> {
+        let release_id = ExternalId::new_typed("test", "release", "direct")?;
+        let mut items = vec![
+            item("one.flac".into(), "War Pigs", 1),
+            item("two.flac".into(), "Paranoid", 2),
         ];
-        let mut candidate = release("bad-score", "Paranoid");
-        candidate.provider_score = f64::NAN;
+        for item in &mut items {
+            item.release_external_id = Some(release_id.clone());
+        }
+        let mut candidate = release("direct", "Paranoid");
+        candidate.edition.explicit_id = true;
+        let scored = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY]
+            .into_iter()
+            .map(|score| {
+                candidate.provider_score = score;
+                score_candidates(&items, vec![candidate.clone()], true, 0.85, 0.05)
+            })
+            .collect::<Vec<_>>();
 
-        let candidates = score_candidates(&items, vec![candidate], true, 0.92, 0.05);
+        assert!(
+            scored
+                .iter()
+                .all(|result| !result[0].confidence.high_confidence),
+            "non-finite scores passed all confidence rules: {:?}",
+            scored
+                .iter()
+                .map(|result| result[0].confidence.high_confidence)
+                .collect::<Vec<_>>()
+        );
+        for result in scored {
+            assert!(result[0].confidence.provider.abs() < f64::EPSILON);
+            assert_eq!(
+                result[0].confidence.gate_failures,
+                ["provider score is not finite"]
+            );
+        }
+        candidate.provider_score = 0.0;
+        let finite = score_candidates(&items, vec![candidate], true, 0.85, 0.05);
+        assert!(finite[0].confidence.high_confidence);
+        Ok(())
+    }
 
-        assert!(candidates[0].confidence.provider.abs() < f64::EPSILON);
-        assert!(!candidates[0].confidence.high_confidence);
+    #[test]
+    fn non_finite_singleton_scores_report_malformed_provider_evidence() {
+        let source = item("one.flac".into(), "War Pigs", 1);
+        let candidates = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY]
+            .into_iter()
+            .enumerate()
+            .map(|(index, score)| TrackCandidate {
+                provider: "test".into(),
+                external_id: format!("invalid-{index}"),
+                title: "War Pigs".into(),
+                artist: "Black Sabbath".into(),
+                length_ms: Some(180_000),
+                provider_score: score,
+                release_external_id: None,
+            })
+            .collect();
+        let scored = score_track_candidates(&[source], candidates, 0.85, 0.05);
+
+        assert!(
+            scored.iter().all(|result| result
+                .confidence
+                .gate_failures
+                .iter()
+                .any(|failure| failure == "provider score is not finite")),
+            "singleton scoring hid malformed provider scores behind other rules"
+        );
+        assert!(scored
+            .iter()
+            .all(|result| result.confidence.provider.abs() < f64::EPSILON));
+        assert!(scored
+            .iter()
+            .all(|result| !result.confidence.high_confidence));
     }
 
     #[test]
@@ -2432,6 +3642,257 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
+    fn import_rejects_disabled_destination_roots() -> Result<()> {
+        use crate::roots::RootState;
+
+        for action in [Action::Copy, Action::Move, Action::Link] {
+            for state in [RootState::Offline, RootState::ReadOnly, RootState::Degraded] {
+                let temporary = tempfile::tempdir()?;
+                let source = temporary.path().join("source.flac");
+                let destination_root = temporary.path().join("library");
+                std::fs::write(&source, b"generated audio")?;
+                let plan = approved_plan(&source, &destination_root, action)?;
+                let mut library = Library::open_in_memory()?;
+                let root = library.register_root(&plan.library_dir)?;
+                library.set_root_state(root.id(), state)?;
+
+                assert!(
+                    ImportExecutor::new(&mut library)
+                        .execute(plan.clone())
+                        .is_err(),
+                    "import {action:?} ignored {state:?} destination policy"
+                );
+                assert_eq!(std::fs::read(&source)?, b"generated audio");
+                assert!(!destination_root.exists());
+                assert!(library.query_items(&crate::query::Query::all())?.is_empty());
+                let journals: u64 = library.conn.query_row(
+                    "SELECT COUNT(*) FROM operation_journal",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(journals, 0);
+                library.set_root_state(root.id(), RootState::Online)?;
+                assert_eq!(
+                    ImportExecutor::new(&mut library)
+                        .execute(plan)?
+                        .imported_tracks,
+                    1
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn import_audio_rejects_disabled_child_roots() -> Result<()> {
+        use crate::roots::RootState;
+
+        for action in [Action::Copy, Action::Move, Action::Link] {
+            let temporary = tempfile::tempdir()?;
+            let source = temporary.path().join("source.flac");
+            let destination_root = temporary.path().join("library");
+            std::fs::write(&source, b"generated audio")?;
+            let plan = approved_plan(&source, &destination_root, action)?;
+            let mut library = Library::open_in_memory()?;
+            library.register_root(&plan.library_dir)?;
+            let nested = library.register_root(
+                plan.tracks[0]
+                    .destination
+                    .parent()
+                    .ok_or_else(|| Error::Import("test destination has no parent".into()))?,
+            )?;
+            library.set_root_state(nested.id(), RootState::Offline)?;
+
+            assert!(
+                ImportExecutor::new(&mut library)
+                    .execute(plan.clone())
+                    .is_err(),
+                "import {action:?} wrote into a disabled child root"
+            );
+            assert_eq!(std::fs::read(&source)?, b"generated audio");
+            assert!(!destination_root.exists());
+            let journals: u64 =
+                library
+                    .conn
+                    .query_row("SELECT COUNT(*) FROM operation_journal", [], |row| {
+                        row.get(0)
+                    })?;
+            assert_eq!(journals, 0);
+            library.set_root_state(nested.id(), RootState::Online)?;
+            assert_eq!(
+                ImportExecutor::new(&mut library)
+                    .execute(plan)?
+                    .imported_tracks,
+                1
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn import_artwork_rejects_disabled_original_child_roots() -> Result<()> {
+        require_disabled_artwork_child_root(true)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn import_artwork_rejects_disabled_projection_child_roots() -> Result<()> {
+        require_disabled_artwork_child_root(false)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn require_disabled_artwork_child_root(original_root: bool) -> Result<()> {
+        use crate::roots::RootState;
+
+        let temporary = tempfile::tempdir()?;
+        let source = temporary.path().join("source.flac");
+        let destination_root = temporary.path().join("library");
+        std::fs::write(&source, b"generated audio")?;
+        let mut plan = approved_plan(&source, &destination_root, Action::Copy)?;
+        let mut output = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(1, 1).write_to(&mut output, image::ImageFormat::Png)?;
+        let bytes = output.into_inner();
+        let validated = validate_artwork(&bytes)?;
+        let original = original_path(&plan.library_dir, &validated);
+        let projection = plan.library_dir.join("Artwork/cover.png");
+        plan.album
+            .as_mut()
+            .ok_or_else(|| Error::Import("test import has no album".into()))?
+            .artpath = Some(projection.clone());
+        let disabled_path = if original_root {
+            &original
+        } else {
+            &projection
+        };
+        let mut library = Library::open_in_memory()?;
+        library.register_root(&plan.library_dir)?;
+        let nested = library.register_root(
+            disabled_path
+                .parent()
+                .ok_or_else(|| Error::Import("test artwork has no parent".into()))?,
+        )?;
+        let provenance = ArtworkProvenance {
+            role: ArtworkRole::Front,
+            source_provider: Some("test".into()),
+            source_reference: Some("generated".into()),
+            provider_release_id: None,
+            exact_release: false,
+            rights: None,
+        };
+        plan.artwork = Some(PlannedArtwork {
+            destination: projection,
+            original: ArtworkAssetMetadata::from_validated(original, &validated, provenance),
+            original_already_present: false,
+            content_hash: blake3::hash(&bytes).to_hex().to_string(),
+            sha256: validated.sha256().to_owned(),
+            bytes,
+        });
+        library.set_root_state(nested.id(), RootState::Offline)?;
+
+        assert!(
+            ImportExecutor::new(&mut library)
+                .execute(plan.clone())
+                .is_err(),
+            "artwork import wrote into a disabled child root: original={original_root}"
+        );
+        assert_eq!(std::fs::read(&source)?, b"generated audio");
+        assert!(!destination_root.exists());
+        let journals: u64 =
+            library
+                .conn
+                .query_row("SELECT COUNT(*) FROM operation_journal", [], |row| {
+                    row.get(0)
+                })?;
+        assert_eq!(journals, 0);
+        library.set_root_state(nested.id(), RootState::Online)?;
+        assert_eq!(
+            ImportExecutor::new(&mut library)
+                .execute(plan)?
+                .imported_tracks,
+            1
+        );
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn in_place_cataloging_preserves_disabled_root_semantics() -> Result<()> {
+        use crate::roots::RootState;
+
+        for state in [RootState::Offline, RootState::ReadOnly, RootState::Degraded] {
+            let temporary = tempfile::tempdir()?;
+            let source = temporary.path().join("source.flac");
+            let destination_root = temporary.path().join("library");
+            std::fs::write(&source, b"generated audio")?;
+            let mut plan = approved_plan(&source, &destination_root, Action::InPlace)?;
+            plan.tracks[0].destination.clone_from(&source);
+            plan.tracks[0].item.path.clone_from(&source);
+            let mut library = Library::open_in_memory()?;
+            let root = library.register_root(&plan.library_dir)?;
+            library.set_root_state(root.id(), state)?;
+
+            let result = ImportExecutor::new(&mut library).execute(plan);
+            assert!(
+                result.is_ok(),
+                "in-place cataloging rejected {state:?} root policy: {result:?}"
+            );
+            assert_eq!(result?.imported_tracks, 1);
+            assert_eq!(std::fs::read(&source)?, b"generated audio");
+            assert!(!destination_root.exists());
+            assert_eq!(library.query_items(&crate::query::Query::all())?.len(), 1);
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn import_move_preserves_disabled_source_roots() -> Result<()> {
+        use crate::roots::RootState;
+
+        for state in [RootState::Offline, RootState::ReadOnly, RootState::Degraded] {
+            let temporary = tempfile::tempdir()?;
+            let source_root = temporary.path().join("incoming");
+            std::fs::create_dir(&source_root)?;
+            let source = source_root.join("source.flac");
+            let destination_root = temporary.path().join("library");
+            std::fs::write(&source, b"generated audio")?;
+            let plan = approved_plan(&source, &destination_root, Action::Move)?;
+            let mut library = Library::open_in_memory()?;
+            let root = library.register_root(&source_root)?;
+            library.set_root_state(root.id(), state)?;
+
+            assert!(
+                ImportExecutor::new(&mut library)
+                    .execute(plan.clone())
+                    .is_err(),
+                "import move ignored {state:?} source policy"
+            );
+            assert_eq!(std::fs::read(&source)?, b"generated audio");
+            assert!(!destination_root.exists());
+            assert!(library.query_items(&crate::query::Query::all())?.is_empty());
+            let journals: u64 =
+                library
+                    .conn
+                    .query_row("SELECT COUNT(*) FROM operation_journal", [], |row| {
+                        row.get(0)
+                    })?;
+            assert_eq!(journals, 0);
+            library.set_root_state(root.id(), RootState::Online)?;
+            assert_eq!(
+                ImportExecutor::new(&mut library)
+                    .execute(plan)?
+                    .imported_tracks,
+                1
+            );
+            assert!(!source.exists());
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
     fn every_import_safety_boundary_recovers_without_losing_unowned_bytes() -> Result<()> {
         fn one(
             failure: Option<(usize, Option<i32>)>,
@@ -2452,7 +3913,12 @@ mod tests {
                 }),
                 Some((index, Some(raw_os_error))) => {
                     crate::failpoints::run_failing_io(index, raw_os_error, || {
-                        ImportExecutor::new(&mut library).execute(plan)
+                        let result = ImportExecutor::new(&mut library).execute(plan);
+                        assert!(
+                            matches!(result, Err(Error::Io(ref error)) if error.raw_os_error() == Some(raw_os_error)),
+                            "executor did not propagate the injected operating-system error: {result:?}"
+                        );
+                        result
                     })
                 }
             };

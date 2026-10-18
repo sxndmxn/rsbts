@@ -9,7 +9,7 @@ use num_traits::ToPrimitive;
 use rsbts::catalog::{EntityId, EntityKind};
 use rsbts::config::Config;
 use rsbts::db::{validate_modification_fields, AuditIssue, AuditMode, Library};
-use rsbts::fixity::{FixityMode, FixityScheduleId};
+use rsbts::fixity::{FixityMode, FixitySchedule, FixityScheduleId};
 use rsbts::import::{
     Action, AlbumPlan, ApprovalChoice, ApprovedAlbumPlan, ImportExecutor, ImportOptions,
     ImportPlanner,
@@ -313,10 +313,14 @@ pub async fn run(
         Commands::Fixity { action } => {
             fixity_command(&library, &action, output).map_err(Into::into)
         }
-        Commands::Verify { query } => {
-            verify(&mut library, &config.library.directory, query.as_deref()).map_err(Into::into)
-        }
-        Commands::Update { query } => update(&library, query.as_deref(), streams),
+        Commands::Verify { query } => verify(
+            &mut library,
+            &config.library.directory,
+            query.as_deref(),
+            output,
+        )
+        .map_err(Into::into),
+        Commands::Update { query } => update(&library, query.as_deref(), output, streams),
         Commands::Write {
             query,
             all,
@@ -356,8 +360,8 @@ pub async fn run(
             older_than_days,
             dry_run,
             yes,
-        } => purge(&mut library, older_than_days, dry_run, yes).map_err(Into::into),
-        Commands::Modify { query, fields } => modify(&library, &query, &fields, streams),
+        } => purge(&mut library, older_than_days, dry_run, yes, output).map_err(Into::into),
+        Commands::Modify { query, fields } => modify(&library, &query, &fields, output, streams),
         Commands::ProviderRefresh {
             entity_kind,
             entity_id,
@@ -415,20 +419,22 @@ fn preflight(command: &Commands) -> Result<()> {
     match command {
         Commands::List {
             query,
-            album: false,
-            ..
+            album,
+            limit,
+        } => {
+            list_limit(*limit)?;
+            if !album {
+                parse_query(query.as_deref())?;
+            }
         }
-        | Commands::Update { query }
-        | Commands::Verify { query } => {
+        Commands::Update { query } | Commands::Verify { query } => {
             parse_query(query.as_deref())?;
         }
         Commands::Remove { query, .. } => {
             require_selection(query, "removal")?;
-            Query::parse(query)?;
         }
         Commands::Modify { query, fields } => {
             require_selection(query, "modify")?;
-            Query::parse(query)?;
             validate_modification_fields(fields)?;
         }
         Commands::ProviderRefresh {
@@ -457,15 +463,7 @@ fn preflight(command: &Commands) -> Result<()> {
                 .map_err(|error| Error::Operation(format!("invalid asset ID: {error}")))?;
             parse_naming_profile(profile)?;
         }
-        Commands::Plan { action } => {
-            let id = match action {
-                PlanCommand::Status { id }
-                | PlanCommand::Events { id }
-                | PlanCommand::Cancel { id }
-                | PlanCommand::Resume { id } => id,
-            };
-            PlanId::parse(id.clone())?;
-        }
+        Commands::Plan { action } => preflight_plan(action)?,
         Commands::Fixity { action } => preflight_fixity(action)?,
         Commands::Write { query, all, .. } | Commands::Move { query, all, .. } => {
             if *all {
@@ -479,16 +477,46 @@ fn preflight(command: &Commands) -> Result<()> {
                     Error::Query("operation requires --all or an explicit query".into())
                 })?;
                 require_selection(query, "operation")?;
-                Query::parse(query)?;
             }
         }
+        Commands::Purge {
+            older_than_days, ..
+        } => {
+            PurgePlan::retention_cutoff(*older_than_days)?;
+        }
         Commands::Import { .. }
-        | Commands::Purge { .. }
-        | Commands::List { album: true, .. }
         | Commands::Stats
         | Commands::Audit { .. }
         | Commands::Integrity
         | Commands::Migrate { .. } => {}
+    }
+    Ok(())
+}
+
+fn preflight_plan(action: &PlanCommand) -> Result<()> {
+    let id = match action {
+        PlanCommand::Status { id }
+        | PlanCommand::Events { id, .. }
+        | PlanCommand::Cancel { id }
+        | PlanCommand::Resume { id } => id,
+    };
+    PlanId::parse(id.clone())?;
+    if let PlanCommand::Events {
+        after_sequence,
+        limit,
+        ..
+    } = action
+    {
+        if *limit == 0 || *limit > 4096 {
+            return Err(Error::Operation(
+                "plan event limit must be between 1 and 4096".into(),
+            ));
+        }
+        if after_sequence.is_some_and(|sequence| i64::try_from(sequence).is_err()) {
+            return Err(Error::Operation(
+                "plan event cursor exceeds the stored sequence range".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -504,11 +532,10 @@ fn preflight_fixity(action: &FixityCommand) -> Result<()> {
         FixityCommand::Schedule {
             interval_seconds, ..
         } => {
-            if *interval_seconds == 0 {
-                return Err(Error::Operation(
-                    "fixity interval must be at least one second".into(),
-                ));
-            }
+            FixitySchedule::validate_interval(
+                std::time::Duration::from_secs(*interval_seconds),
+                Utc::now(),
+            )?;
         }
         FixityCommand::Due { limit } => {
             if *limit == 0 || *limit > 256 {
@@ -631,9 +658,12 @@ async fn import(
         runner_up_margin: config.matching.runner_up_margin,
     };
     let provider = ProviderSet::from_config(config)?;
-    let plan = ImportPlanner::new(library, &provider, options.clone())
-        .plan(paths)
-        .await;
+    let planner = ImportPlanner::new(library, &provider, options.clone());
+    let plan = if existing_tags {
+        planner.plan_existing_tags(paths)
+    } else {
+        planner.plan(paths).await
+    };
     let preview = serde_json::to_value(&plan)?;
     let mut execution = Vec::new();
     let mut partial = !plan.scan_issues.is_empty();
@@ -864,29 +894,16 @@ fn choose_import(
 }
 
 fn common_embedded_release_id(plan: &AlbumPlan) -> Option<(&str, &str)> {
-    let first = plan.items.first()?.release_external_id.as_ref()?;
-    if first.kind() != "release"
-        || !plan.items.iter().all(|item| {
-            item.release_external_id.as_ref().is_some_and(|id| {
-                id.kind() == "release"
-                    && id.provider() == first.provider()
-                    && id.value() == first.value()
-            })
-        })
-    {
-        return None;
-    }
-    Some((first.provider(), first.value()))
+    plan.common_embedded_release_id()
+        .map(|id| (id.provider(), id.value()))
 }
 
 fn unattended_exact_candidate(plan: &AlbumPlan) -> Option<usize> {
     if plan.lookup_error.is_some() || !plan.candidate_set_complete {
         return None;
     }
-    let (provider, release_id) = common_embedded_release_id(plan)?;
     let mut matches = plan.candidates.iter().enumerate().filter(|(_, candidate)| {
-        candidate.release.provider == provider
-            && candidate.release.external_id == release_id
+        plan.matches_embedded_release_id(&candidate.release)
             && candidate.release.edition.explicit_id
             && candidate.confidence.candidate_set_complete
             && candidate.confidence.high_confidence
@@ -914,11 +931,8 @@ fn unattended_gate_failures(plan: &AlbumPlan) -> Vec<String> {
         failures.extend(plan.candidates[0].confidence.gate_failures.iter().cloned());
         if common_id.is_some()
             && !plan.candidates.iter().any(|candidate| {
-                common_id.is_some_and(|(provider, release_id)| {
-                    candidate.release.provider == provider
-                        && candidate.release.external_id == release_id
-                        && candidate.release.edition.explicit_id
-                })
+                plan.matches_embedded_release_id(&candidate.release)
+                    && candidate.release.edition.explicit_id
             })
         {
             failures.push("no provider candidate matches the common embedded release ID".into());
@@ -1013,6 +1027,16 @@ fn print_approved(plan: &ApprovedAlbumPlan, streams: &mut Streams<'_>) -> CliRes
     Ok(())
 }
 
+fn list_limit(limit: Option<u32>) -> Result<u32> {
+    let limit = limit.unwrap_or(1_000);
+    if limit == 0 || limit > 100_000 {
+        return Err(Error::Query(
+            "list limit must be between 1 and 100000".into(),
+        ));
+    }
+    Ok(limit)
+}
+
 fn list(
     library: &Library,
     query: Option<&str>,
@@ -1020,12 +1044,7 @@ fn list(
     limit: Option<u32>,
     output: OutputFormat,
 ) -> Result<Outcome> {
-    let limit = limit.unwrap_or(1_000);
-    if limit == 0 || limit > 100_000 {
-        return Err(Error::Query(
-            "list limit must be between 1 and 100000".into(),
-        ));
-    }
+    let limit = list_limit(limit)?;
     if album {
         let mut after = None;
         let mut remaining = limit;
@@ -1065,38 +1084,23 @@ fn list(
         }
     } else {
         let query = parse_query(query)?;
-        let mut after = None;
-        let mut remaining = limit;
         let mut json_items = Vec::new();
-        while remaining > 0 {
-            let page_size = remaining.min(1_000);
-            let page = library.query_items_page(&query, after, page_size)?;
-            if page.is_empty() {
-                break;
+        library.visit_items(&query, limit, |item| {
+            if output == OutputFormat::Json {
+                json_items.push(item);
+            } else if output == OutputFormat::Jsonl {
+                emit(output, &item)?;
+            } else {
+                println!(
+                    "{} - {} - {} [{}]",
+                    terminal_safe(&item.artist),
+                    terminal_safe(&item.album),
+                    terminal_safe(&item.title),
+                    format_duration(item.length)
+                );
             }
-            for item in &page {
-                if output == OutputFormat::Json {
-                    json_items.push(item.clone());
-                } else if output == OutputFormat::Jsonl {
-                    emit(output, item)?;
-                } else {
-                    println!(
-                        "{} - {} - {} [{}]",
-                        terminal_safe(&item.artist),
-                        terminal_safe(&item.album),
-                        terminal_safe(&item.title),
-                        format_duration(item.length)
-                    );
-                }
-            }
-            let emitted = u32::try_from(page.len())
-                .map_err(|_error| Error::Query("list page is too large".into()))?;
-            remaining = remaining.saturating_sub(emitted);
-            after = page.last().and_then(|item| item.id);
-            if page.len() < page_size as usize {
-                break;
-            }
-        }
+            Ok(())
+        })?;
         if output == OutputFormat::Json {
             emit(output, &json_items)?;
         }
@@ -1365,48 +1369,94 @@ fn integrity(library: &Library, output: OutputFormat) -> Result<Outcome> {
     })
 }
 
-fn update(library: &Library, query: Option<&str>, streams: &mut Streams<'_>) -> CliResult<Outcome> {
+fn update(
+    library: &Library,
+    query: Option<&str>,
+    output: OutputFormat,
+    streams: &mut Streams<'_>,
+) -> CliResult<Outcome> {
     let query = parse_query(query)?;
     let items = library.query_items_bounded(&query, 9_999)?;
     let mut tag_updates = Vec::new();
-    let mut failed = 0;
+    let mut failures = Vec::new();
     for item in items {
-        let Some(id) = item.id else {
-            failed += 1;
-            continue;
-        };
-        match rsbts::tags::read_tags(&item.path) {
-            Ok(value) => tag_updates.push((id, value)),
+        let result = item
+            .id
+            .ok_or_else(|| Error::Query("a matched item has no database ID".into()))
+            .and_then(|id| rsbts::tags::read_tags_for_update(&item).map(|value| (id, value)));
+        match result {
+            Ok(value) => tag_updates.push(value),
             Err(error) => {
-                errln!(
-                    streams,
-                    "Could not update {}: {}",
-                    terminal_safe(item.path.display()),
-                    terminal_safe(error)
-                );
-                failed += 1;
+                if output == OutputFormat::Text {
+                    errln!(
+                        streams,
+                        "Could not update {}: {}",
+                        terminal_safe(item.path.display()),
+                        terminal_safe(&error)
+                    );
+                }
+                failures.push(serde_json::json!({
+                    "item_id": item.id,
+                    "path": item.path,
+                    "error": error.to_string(),
+                }));
             }
         }
     }
     let updated_count = library.update_items(&tag_updates)?;
-    outln!(streams, "Updated {updated_count} item(s); {failed} failed");
-    Ok(if failed == 0 {
+    if output == OutputFormat::Text {
+        outln!(
+            streams,
+            "Updated {updated_count} item(s); {} failed",
+            failures.len()
+        );
+    } else {
+        emit(
+            output,
+            &serde_json::json!({
+                "operation": "update",
+                "updated": updated_count,
+                "failures": failures,
+            }),
+        )?;
+    }
+    Ok(if failures.is_empty() {
         Outcome::Success
     } else {
         Outcome::Partial
     })
 }
 
-fn verify(library: &mut Library, root: &std::path::Path, query: Option<&str>) -> Result<Outcome> {
+fn verify(
+    library: &mut Library,
+    root: &std::path::Path,
+    query: Option<&str>,
+    output: OutputFormat,
+) -> Result<Outcome> {
     let query = parse_query(query)?;
     let report = library.verify_items(&query, root)?;
-    println!("Verified {} asset(s)", report.verified);
-    for (item_id, path, detail) in &report.skipped {
-        println!(
-            "Skipped item {item_id}: {}: {}",
-            terminal_safe(path.display()),
-            terminal_safe(detail)
-        );
+    if output == OutputFormat::Text {
+        println!("Verified {} asset(s)", report.verified);
+        for (item_id, path, detail) in &report.skipped {
+            println!(
+                "Skipped item {item_id}: {}: {}",
+                terminal_safe(path.display()),
+                terminal_safe(detail)
+            );
+        }
+    } else {
+        emit(
+            output,
+            &serde_json::json!({
+                "operation": "verify",
+                "verified": report.verified,
+                "skipped": report.skipped.iter().map(|(item_id, path, detail)| serde_json::json!({
+                    "item_id": item_id,
+                    "path": path,
+                    "detail": detail,
+                })).collect::<Vec<_>>(),
+            }),
+        )?;
     }
     if report.skipped.is_empty() {
         Ok(Outcome::Success)
@@ -1429,8 +1479,7 @@ fn write_tags(
     } else {
         let raw_query = raw_query
             .ok_or_else(|| Error::Query("write requires --all or an explicit query".into()))?;
-        require_selection(raw_query, "write")?;
-        Query::parse(raw_query)?
+        require_selection(raw_query, "write")?
     };
     let plan = TagWritePlan::build(library, &query)?;
     let preview = serde_json::json!({
@@ -1443,7 +1492,7 @@ fn write_tags(
         for file in &plan.files {
             outln!(streams, "  {}", terminal_safe(file.item.path.display()));
         }
-    } else {
+    } else if output == OutputFormat::Jsonl || dry_run || plan.files.is_empty() {
         emit(output, &preview)?;
     }
     if dry_run || plan.files.is_empty() {
@@ -1514,8 +1563,7 @@ fn move_files(
     } else {
         let raw_query = raw_query
             .ok_or_else(|| Error::Query("move requires --all or an explicit query".into()))?;
-        require_selection(raw_query, "move")?;
-        Query::parse(raw_query)?
+        require_selection(raw_query, "move")?
     };
     let plan = MovePlan::build(
         library,
@@ -1541,7 +1589,7 @@ fn move_files(
                 terminal_safe(track.destination.display())
             );
         }
-    } else {
+    } else if output == OutputFormat::Jsonl || dry_run || plan.tracks.is_empty() {
         emit(output, &preview)?;
     }
     if dry_run || plan.tracks.is_empty() {
@@ -1767,8 +1815,7 @@ fn remove(
     output: OutputFormat,
     streams: &mut Streams<'_>,
 ) -> CliResult<Outcome> {
-    require_selection(raw_query, "removal")?;
-    let query = Query::parse(raw_query)?;
+    let query = require_selection(raw_query, "removal")?;
     let plan = RemovalPlan::build(library, &query, delete)?;
     if output == OutputFormat::Text {
         println!(
@@ -1834,17 +1881,38 @@ fn remove(
     })
 }
 
-fn purge(library: &mut Library, older_than_days: u64, dry_run: bool, yes: bool) -> Result<Outcome> {
+fn purge(
+    library: &mut Library,
+    older_than_days: u64,
+    dry_run: bool,
+    yes: bool,
+    output: OutputFormat,
+) -> Result<Outcome> {
     let plan = PurgePlan::build(library, older_than_days)?;
-    println!(
-        "Purge plan: {} quarantined file(s) at least {older_than_days} day(s) old",
-        plan.len()
-    );
-    for path in plan.paths() {
-        println!("  {}", terminal_safe(path.display()));
+    if output == OutputFormat::Text {
+        println!(
+            "Purge plan: {} quarantined file(s) at least {older_than_days} day(s) old",
+            plan.len()
+        );
+        for path in plan.paths() {
+            println!("  {}", terminal_safe(path.display()));
+        }
+    } else if output == OutputFormat::Jsonl || dry_run || plan.is_empty() {
+        emit(
+            output,
+            &serde_json::json!({
+                "operation": "purge",
+                "older_than_days": older_than_days,
+                "paths": plan.paths().collect::<Vec<_>>(),
+                "dry_run": dry_run,
+                "executed": false,
+            }),
+        )?;
     }
     if dry_run || plan.is_empty() {
-        println!("No changes made");
+        if output == OutputFormat::Text {
+            println!("No changes made");
+        }
         return Ok(Outcome::Success);
     }
     if !yes {
@@ -1860,10 +1928,21 @@ fn purge(library: &mut Library, older_than_days: u64, dry_run: bool, yes: bool) 
     }
     let plan = plan.approve(library)?;
     let report = PurgeExecutor::new(library).execute(&plan)?;
-    println!(
-        "Purged {} file(s); {} were already missing",
-        report.purged_files, report.already_missing
-    );
+    if output == OutputFormat::Text {
+        println!(
+            "Purged {} file(s); {} were already missing",
+            report.purged_files, report.already_missing
+        );
+    } else {
+        emit(
+            output,
+            &serde_json::json!({
+                "operation": "purge",
+                "executed": true,
+                "report": report,
+            }),
+        )?;
+    }
     Ok(if report.already_missing == 0 {
         Outcome::Success
     } else {
@@ -1875,10 +1954,10 @@ fn modify(
     library: &Library,
     raw_query: &str,
     fields: &[String],
+    output: OutputFormat,
     streams: &mut Streams<'_>,
 ) -> CliResult<Outcome> {
-    require_selection(raw_query, "modify")?;
-    let query = Query::parse(raw_query)?;
+    let query = require_selection(raw_query, "modify")?;
     let items = library.query_items_bounded(&query, 9_999)?;
     let ids = items
         .iter()
@@ -1888,7 +1967,14 @@ fn modify(
         })
         .collect::<Result<Vec<_>>>()?;
     let count = library.modify_items(&ids, fields)?;
-    outln!(streams, "Modified {count} item(s)");
+    if output == OutputFormat::Text {
+        outln!(streams, "Modified {count} item(s)");
+    } else {
+        emit(
+            output,
+            &serde_json::json!({"operation": "modify", "modified": count}),
+        )?;
+    }
     Ok(Outcome::Success)
 }
 
@@ -2288,7 +2374,7 @@ fn fixity_command(
 fn plan_command(library: &Library, action: &PlanCommand, output: OutputFormat) -> Result<Outcome> {
     let id = match &action {
         PlanCommand::Status { id }
-        | PlanCommand::Events { id }
+        | PlanCommand::Events { id, .. }
         | PlanCommand::Cancel { id }
         | PlanCommand::Resume { id } => PlanId::parse(id.clone())?,
     };
@@ -2308,8 +2394,12 @@ fn plan_command(library: &Library, action: &PlanCommand, output: OutputFormat) -
                 emit(output, &plan)?;
             }
         }
-        PlanCommand::Events { .. } => {
-            let events = library.plan_events(&id)?;
+        PlanCommand::Events {
+            after_sequence,
+            limit,
+            ..
+        } => {
+            let events = library.plan_events_page(&id, *after_sequence, *limit)?;
             if output == OutputFormat::Json {
                 emit(output, &events)?;
             } else if output == OutputFormat::Jsonl {
@@ -2419,14 +2509,19 @@ fn parse_query(query: Option<&str>) -> Result<Query> {
     }
 }
 
-fn require_selection(query: &str, operation: &str) -> Result<()> {
+fn require_selection(query: &str, operation: &str) -> Result<Query> {
     if query.trim().is_empty() {
-        Err(Error::Query(format!(
+        return Err(Error::Query(format!(
             "{operation} query cannot be empty; provide an explicit filter"
-        )))
-    } else {
-        Ok(())
+        )));
     }
+    let query = Query::parse(query)?;
+    if !query.has_filters() {
+        return Err(Error::Query(format!(
+            "{operation} query requires an explicit filter; sort terms do not select items"
+        )));
+    }
+    Ok(query)
 }
 
 fn require_confirmation_channel(dry_run: bool, yes: bool, operation: &str) -> Result<()> {
@@ -2618,6 +2713,52 @@ mod tests {
         assert_eq!(dry_run, confirmed);
         assert_eq!(confirmed.choice, ApprovalChoice::Candidate(0));
         assert_eq!(confirmed.selection, "embedded-release-id");
+        Ok(())
+    }
+
+    #[test]
+    fn unattended_extended_release_id_conflict_rejects_stale_confidence() -> Result<(), rsbts::Error>
+    {
+        let mut plan = decision_plan()?;
+        plan.items[0]
+            .extended
+            .external_ids
+            .push(ExternalId::new_typed("test", "release", "release-2")?);
+
+        let decision = choose_import(&plan, false, false, true)?;
+
+        assert_eq!(decision.choice, ApprovalChoice::Skip);
+        assert_eq!(decision.reason, Some("requires-review"));
+        assert!(decision
+            .gate_failures
+            .iter()
+            .any(|failure| failure.contains("no common embedded release ID")));
+        Ok(())
+    }
+
+    #[test]
+    fn unattended_musicbrainz_release_id_uuid_alias_is_accepted() -> Result<(), rsbts::Error> {
+        let mut plan = decision_plan()?;
+        let value = "abcdef12-3456-4789-8123-123456789abc";
+        plan.items[0].release_external_id = Some(ExternalId::new_typed(
+            "musicbrainz",
+            "release",
+            format!("{{{value}}}"),
+        )?);
+        plan.candidates[0].release.provider = "musicbrainz".into();
+        plan.candidates[0].release.external_id = value.into();
+
+        assert_eq!(
+            choose_import(&plan, false, false, true)?.choice,
+            ApprovalChoice::Candidate(0)
+        );
+        plan.candidates[0].confidence.high_confidence = false;
+        let decision = choose_import(&plan, false, false, true)?;
+        assert!(decision
+            .gate_failures
+            .iter()
+            .all(|failure| !failure.contains("no common embedded")
+                && !failure.contains("no provider candidate matches")));
         Ok(())
     }
 

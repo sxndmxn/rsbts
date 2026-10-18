@@ -21,9 +21,9 @@ impl PlanId {
 
     pub fn parse(value: impl Into<String>) -> Result<Self> {
         let value = value.into();
-        uuid::Uuid::parse_str(&value)
+        let id = uuid::Uuid::parse_str(&value)
             .map_err(|error| Error::Operation(format!("invalid plan ID: {error}")))?;
-        Ok(Self(value.to_ascii_lowercase()))
+        Ok(Self(id.to_string()))
     }
 
     #[must_use]
@@ -145,6 +145,15 @@ impl DurablePlan {
     #[must_use]
     pub const fn state(&self) -> PlanState {
         self.state
+    }
+
+    pub(crate) fn require_approved(&self) -> Result<()> {
+        if self.state != PlanState::Approved {
+            return Err(Error::Operation(
+                "plan does not match its approved request and preview".into(),
+            ));
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -270,6 +279,78 @@ impl Library {
         self.transition_plan_with_event(id, PlanState::Planned, PlanState::Approved, None)
     }
 
+    pub(crate) fn require_saved_plan(
+        &self,
+        id: &PlanId,
+        kind: PlanKind,
+        request: &serde_json::Value,
+        preview: &serde_json::Value,
+    ) -> Result<DurablePlan> {
+        let stored = self.durable_plan(id)?;
+        if stored.kind() != kind.as_str()
+            || stored.request() != request
+            || stored.preview() != preview
+        {
+            return Err(Error::Operation(
+                "plan does not match its saved request and preview".into(),
+            ));
+        }
+        Ok(stored)
+    }
+
+    pub(crate) fn require_reviewed_plan(
+        &self,
+        id: &PlanId,
+        kind: PlanKind,
+        request: &serde_json::Value,
+        preview: &serde_json::Value,
+    ) -> Result<()> {
+        self.require_saved_plan(id, kind, request, preview)?
+            .require_approved()
+    }
+
+    pub(crate) fn require_projection_step(
+        &self,
+        id: &PlanId,
+        asset_id: &str,
+        before: &serde_json::Value,
+        after: &serde_json::Value,
+        evidence: &serde_json::Value,
+    ) -> Result<()> {
+        let (stored_before, stored_after, stored_evidence) = self
+            .conn
+            .query_row(
+                "SELECT before_json, after_json, evidence_json
+                 FROM asset_projection_steps
+                 WHERE plan_id = ?1 AND asset_id = ?2 AND state = 'planned'",
+                params![id.as_str(), asset_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| Error::Operation("plan has no reviewed projection step".into()))?;
+        let stored_evidence: serde_json::Value = serde_json::from_str(&stored_evidence)?;
+        let matching_evidence = evidence.as_object().is_some_and(|fields| {
+            fields
+                .iter()
+                .all(|(name, value)| stored_evidence.get(name) == Some(value))
+        });
+        if serde_json::from_str::<serde_json::Value>(&stored_before)? != *before
+            || serde_json::from_str::<serde_json::Value>(&stored_after)? != *after
+            || !matching_evidence
+        {
+            return Err(Error::Operation(
+                "projection does not match its reviewed step and source evidence".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn start_durable_plan(&self, id: &PlanId) -> Result<()> {
         self.transition_plan_with_event(id, PlanState::Approved, PlanState::Running, None)
     }
@@ -390,13 +471,47 @@ impl Library {
             )
     }
 
-    /// Return immutable event history in sequence order.
+    /// Return the complete immutable event history in sequence order.
     pub fn plan_events(&self, id: &PlanId) -> Result<Vec<PlanEvent>> {
+        self.read_plan_events(id, -1, -1)
+    }
+
+    /// Return events with sequence numbers greater than `after_sequence`.
+    /// Start at sequence zero when `after_sequence` is `None`.
+    /// The limit must be between 1 and 4096.
+    pub fn plan_events_page(
+        &self,
+        id: &PlanId,
+        after_sequence: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<PlanEvent>> {
+        if limit == 0 || limit > 4096 {
+            return Err(Error::Operation(
+                "plan event limit must be between 1 and 4096".into(),
+            ));
+        }
+        let after_sequence = after_sequence
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_error| {
+                Error::Operation("plan event cursor exceeds the stored sequence range".into())
+            })?
+            .unwrap_or(-1);
+        self.read_plan_events(id, after_sequence, i64::from(limit))
+    }
+
+    fn read_plan_events(
+        &self,
+        id: &PlanId,
+        after_sequence: i64,
+        limit: i64,
+    ) -> Result<Vec<PlanEvent>> {
         let mut statement = self.conn.prepare(
             "SELECT sequence, event_type, detail_json, created_at
-             FROM plan_events WHERE plan_id = ?1 ORDER BY sequence",
+             FROM plan_events
+             WHERE plan_id = ?1 AND sequence > ?2 ORDER BY sequence LIMIT ?3",
         )?;
-        let rows = statement.query_map([id.as_str()], |row| {
+        let rows = statement.query_map(params![id.as_str(), after_sequence, limit], |row| {
             Ok((
                 row.get::<_, u64>(0)?,
                 row.get::<_, String>(1)?,
@@ -486,6 +601,7 @@ impl Library {
 
     /// Atomically claim one ready request for a provider.
     pub fn claim_provider_job(&self, provider: &str) -> Result<Option<ProviderJob>> {
+        check_label(provider, "provider")?;
         let transaction = self.conn.unchecked_transaction()?;
         let ready = transaction
             .query_row(
@@ -508,23 +624,33 @@ impl Library {
             transaction.commit()?;
             return Ok(None);
         };
-        let changed = transaction.execute(
-            "UPDATE provider_jobs
-             SET state = 'running', attempt_count = attempt_count + 1,
-                 started_at = ?2, updated_at = ?2
-             WHERE id = ?1 AND state IN ('queued', 'retry')",
-            params![id, Utc::now().to_rfc3339()],
-        )?;
-        require_one(changed, "provider job was claimed concurrently")?;
-        transaction.commit()?;
-        failpoints::hit("db.claim-provider-job")?;
-        Ok(Some(ProviderJob {
+        let attempt_count = attempts
+            .checked_add(1)
+            .ok_or_else(|| Error::Operation("provider job attempt limit reached".into()))?;
+        check_label(&operation, "provider operation")?;
+        let job = ProviderJob {
             id: PlanId::parse(id)?,
             provider: provider.to_owned(),
             operation,
             request: serde_json::from_str(&request)?,
-            attempt_count: attempts.saturating_add(1),
-        }))
+            attempt_count,
+        };
+        let changed = transaction.execute(
+            "UPDATE provider_jobs
+             SET state = 'running', attempt_count = ?3,
+                 started_at = ?2, updated_at = ?2
+             WHERE id = ?1 AND state IN ('queued', 'retry') AND attempt_count = ?4",
+            params![
+                job.id.as_str(),
+                Utc::now().to_rfc3339(),
+                job.attempt_count,
+                attempts
+            ],
+        )?;
+        require_one(changed, "provider job was claimed concurrently")?;
+        transaction.commit()?;
+        failpoints::hit("db.claim-provider-job")?;
+        Ok(Some(job))
     }
 
     pub fn complete_provider_job(&self, job: &ProviderJob, snapshot_id: &str) -> Result<()> {
@@ -532,10 +658,15 @@ impl Library {
             "UPDATE provider_jobs
              SET state = 'complete', response_snapshot_id = ?2,
                  completed_at = ?3, updated_at = ?3, last_error = NULL
-             WHERE id = ?1 AND state = 'running'",
-            params![job.id.as_str(), snapshot_id, Utc::now().to_rfc3339()],
+             WHERE id = ?1 AND state = 'running' AND attempt_count = ?4",
+            params![
+                job.id.as_str(),
+                snapshot_id,
+                Utc::now().to_rfc3339(),
+                job.attempt_count
+            ],
         )?;
-        require_one(changed, "provider job is not running")?;
+        require_one(changed, "provider job attempt is not running")?;
         failpoints::hit("db.complete-provider-job")
     }
 
@@ -551,16 +682,17 @@ impl Library {
         let changed = self.conn.execute(
             "UPDATE provider_jobs
              SET state = ?2, available_at = ?3, last_error = ?4, updated_at = ?5
-             WHERE id = ?1 AND state = 'running'",
+             WHERE id = ?1 AND state = 'running' AND attempt_count = ?6",
             params![
                 job.id.as_str(),
                 state,
                 available.to_rfc3339(),
                 detail,
-                Utc::now().to_rfc3339()
+                Utc::now().to_rfc3339(),
+                job.attempt_count
             ],
         )?;
-        require_one(changed, "provider job is not running")?;
+        require_one(changed, "provider job attempt is not running")?;
         failpoints::hit("db.fail-provider-job")
     }
 
@@ -642,6 +774,27 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn alternate_plan_id_forms_find_the_stored_plan() -> Result<()> {
+        let library = Library::open_in_memory()?;
+        let id = library.create_durable_plan(PlanKind::Audit, &json!({}), &json!({}), None)?;
+        let uuid = uuid::Uuid::parse_str(id.as_str())
+            .map_err(|error| Error::Operation(error.to_string()))?;
+        for value in [
+            uuid.simple().to_string(),
+            uuid.braced().to_string(),
+            uuid.urn().to_string(),
+            id.as_str().to_ascii_uppercase(),
+        ] {
+            let parsed = PlanId::parse(&value)?;
+            let found = library.durable_plan(&parsed);
+            assert!(found.is_ok(), "{value} missed the stored plan: {found:?}");
+            assert_eq!(parsed, id);
+            assert_eq!(serde_json::from_value::<PlanId>(json!(value))?, id);
+        }
+        Ok(())
+    }
+
     fn exercise_transition_sequence(actions: &[u8]) -> Result<()> {
         let library = Library::open_in_memory()?;
         let id = library.create_durable_plan(
@@ -650,36 +803,40 @@ mod tests {
             &json!({"assets": actions.len()}),
             Some(actions.len() as u64),
         )?;
+        let transitions = [
+            (PlanState::Planned, PlanState::Approved),
+            (PlanState::Approved, PlanState::Running),
+            (PlanState::Running, PlanState::Paused),
+            (PlanState::Paused, PlanState::Running),
+        ];
         for (index, action) in actions.iter().enumerate() {
-            match action % 8 {
-                0 => {
-                    let _result = library.approve_durable_plan(&id);
-                }
-                1 => {
-                    let _result = library.start_durable_plan(&id);
-                }
-                2 => {
-                    let _result = library.pause_durable_plan(&id, Some("cursor"));
-                }
-                3 => {
-                    let _result = library.resume_durable_plan(&id);
-                }
-                4 => {
-                    let _result = library.update_plan_progress(&id, index as u64, Some("cursor"));
-                }
-                5 => {
-                    let _result = library.request_plan_cancellation(&id);
-                }
-                6 => {
-                    let _result = library.finish_durable_plan(&id, PlanState::Complete, None);
-                }
-                _ => {
-                    let _result =
-                        library.finish_durable_plan(&id, PlanState::Failed, Some("failure"));
+            let action = usize::from(action % 8);
+            let before = library.durable_plan(&id)?;
+            let result = match action {
+                0 => library.approve_durable_plan(&id),
+                1 => library.start_durable_plan(&id),
+                2 => library.pause_durable_plan(&id, Some("cursor")),
+                3 => library.resume_durable_plan(&id),
+                4 => library.update_plan_progress(&id, index as u64, Some("cursor")),
+                5 => library.request_plan_cancellation(&id),
+                6 => library.finish_durable_plan(&id, PlanState::Complete, None),
+                _ => library.finish_durable_plan(&id, PlanState::Failed, Some("failure")),
+            };
+            let after = library.durable_plan(&id)?;
+            if let Some((from, to)) = transitions.get(action) {
+                let allowed = before.state() == *from && !before.cancel_requested();
+                if result.is_ok() != allowed || (allowed && after.state() != *to) {
+                    return Err(Error::Operation(format!(
+                        "action {action} violated transition {from:?} -> {to:?}: before={before:?}, after={after:?}, result={result:?}"
+                    )));
                 }
             }
+            if result.is_err() && serde_json::to_value(&before)? != serde_json::to_value(&after)? {
+                return Err(Error::Operation(format!(
+                    "failed action {action} changed the saved plan"
+                )));
+            }
         }
-        let _plan = library.durable_plan(&id)?;
         let events = library.plan_events(&id)?;
         for (sequence, event) in events.iter().enumerate() {
             if event.sequence() != sequence as u64 {
@@ -696,7 +853,8 @@ mod tests {
         fn arbitrary_journal_transition_sequences_remain_valid(
             actions in proptest::collection::vec(any::<u8>(), 0..128)
         ) {
-            prop_assert!(exercise_transition_sequence(&actions).is_ok());
+            let result = exercise_transition_sequence(&actions);
+            prop_assert!(result.is_ok(), "{result:?}");
         }
     }
 

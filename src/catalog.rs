@@ -32,9 +32,9 @@ impl EntityId {
     /// Validate an identifier read at an API boundary.
     pub fn parse(value: impl Into<String>) -> Result<Self> {
         let value = value.into();
-        Uuid::parse_str(&value)
+        let id = Uuid::parse_str(&value)
             .map_err(|error| Error::Catalog(format!("invalid entity ID: {error}")))?;
-        Ok(Self(value.to_ascii_lowercase()))
+        Ok(Self(id.to_string()))
     }
 
     #[must_use]
@@ -103,12 +103,19 @@ pub struct PartialDate(String);
 impl PartialDate {
     pub fn parse(value: impl Into<String>) -> Result<Self> {
         let value = value.into();
-        let valid = match value.len() {
-            4 => value.parse::<u16>().is_ok_and(|year| year > 0),
-            7 => NaiveDate::parse_from_str(&format!("{value}-01"), "%Y-%m-%d").is_ok(),
-            10 => NaiveDate::parse_from_str(&value, "%Y-%m-%d").is_ok(),
-            _ => false,
-        };
+        let exact_syntax = matches!(value.len(), 4 | 7 | 10)
+            && value.bytes().enumerate().all(|(index, byte)| match index {
+                4 | 7 => byte == b'-',
+                _ => byte.is_ascii_digit(),
+            });
+        let valid = exact_syntax
+            && !value.starts_with("0000")
+            && match value.len() {
+                4 => true,
+                7 => NaiveDate::parse_from_str(&format!("{value}-01"), "%Y-%m-%d").is_ok(),
+                10 => NaiveDate::parse_from_str(&value, "%Y-%m-%d").is_ok(),
+                _ => false,
+            };
         if valid {
             Ok(Self(value))
         } else {
@@ -213,7 +220,7 @@ impl DataLicense {
 }
 
 /// Immutable evidence for one entity field.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct MetadataClaim {
     id: EntityId,
     entity_kind: EntityKind,
@@ -227,6 +234,47 @@ pub struct MetadataClaim {
     confidence: Confidence,
     data_license: DataLicense,
     locked: bool,
+}
+
+impl<'de> Deserialize<'de> for MetadataClaim {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct UncheckedMetadataClaim {
+            id: EntityId,
+            entity_kind: EntityKind,
+            entity_id: EntityId,
+            field: String,
+            value: ValueState<serde_json::Value>,
+            source_kind: String,
+            source_provider: Option<String>,
+            source_reference: Option<String>,
+            retrieved_at: DateTime<Utc>,
+            confidence: Confidence,
+            data_license: DataLicense,
+            locked: bool,
+        }
+
+        let claim = UncheckedMetadataClaim::deserialize(deserializer)?;
+        validate_claim(&claim.field, &claim.source_kind, claim.locked)
+            .map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            id: claim.id,
+            entity_kind: claim.entity_kind,
+            entity_id: claim.entity_id,
+            field: claim.field,
+            value: claim.value,
+            source_kind: claim.source_kind,
+            source_provider: claim.source_provider,
+            source_reference: claim.source_reference,
+            retrieved_at: claim.retrieved_at,
+            confidence: claim.confidence,
+            data_license: claim.data_license,
+            locked: claim.locked,
+        })
+    }
 }
 
 impl MetadataClaim {
@@ -243,13 +291,9 @@ impl MetadataClaim {
         data_license: DataLicense,
         locked: bool,
     ) -> Result<Self> {
-        let field = checked_label(field.into(), "claim field")?;
-        let source_kind = checked_label(source_kind.into(), "claim source kind")?;
-        if locked && source_kind != "manual" {
-            return Err(Error::Catalog(
-                "only manual claims may be locked against refresh".into(),
-            ));
-        }
+        let field = field.into();
+        let source_kind = source_kind.into();
+        validate_claim(&field, &source_kind, locked)?;
         Ok(Self {
             id: EntityId::new(),
             entity_kind,
@@ -337,6 +381,22 @@ impl ProviderRefreshPlan {
     pub fn diffs(&self) -> &[FieldDiff] {
         &self.diffs
     }
+
+    fn request(&self) -> serde_json::Value {
+        serde_json::json!({
+            "entity_kind": self.entity_kind,
+            "entity_id": self.entity_id,
+        })
+    }
+
+    fn preview(&self) -> serde_json::Value {
+        serde_json::json!({
+            "policy_version": RESOLUTION_POLICY_VERSION,
+            "diffs": self.diffs,
+            "claim_set_sha256": self.claim_set_sha256,
+            "media_tags_unchanged": true,
+        })
+    }
 }
 
 /// Persisted raw provider response identity.
@@ -389,8 +449,8 @@ impl Library {
         payload: &[u8],
         complete: bool,
     ) -> Result<SnapshotReceipt> {
-        checked_label(provider.to_owned(), "provider")?;
-        checked_label(request_key.to_owned(), "request key")?;
+        checked_label(provider, "provider")?;
+        checked_label(request_key, "request key")?;
         let sha256 = format!("{:x}", Sha256::digest(payload));
         let existing = self
             .conn
@@ -461,7 +521,7 @@ impl Library {
         entity_id: &EntityId,
         field: &str,
     ) -> Result<Option<FieldDiff>> {
-        checked_label(field.to_owned(), "claim field")?;
+        checked_label(field, "claim field")?;
         let winner = self
             .conn
             .query_row(
@@ -624,31 +684,59 @@ impl Library {
     }
 
     pub fn approve_provider_refresh(&self, plan: &ProviderRefreshPlan) -> Result<()> {
+        self.require_saved_plan(
+            plan.id(),
+            PlanKind::ProviderRefresh,
+            &plan.request(),
+            &plan.preview(),
+        )?;
         self.approve_durable_plan(plan.id())
     }
 
     /// Apply only the exact reviewed diffs. A changed claim set invalidates the
     /// entire plan before any canonical value is written.
     pub fn execute_provider_refresh(&self, plan: &ProviderRefreshPlan) -> Result<()> {
-        if self.durable_plan(plan.id())?.state() != PlanState::Approved {
-            return Err(Error::Catalog(
-                "provider refresh must be approved before execution".into(),
-            ));
+        self.require_reviewed_plan(
+            plan.id(),
+            PlanKind::ProviderRefresh,
+            &plan.request(),
+            &plan.preview(),
+        )?;
+        let result = self
+            .start_durable_plan(plan.id())
+            .and_then(|()| self.apply_provider_refresh(plan));
+        if let Err(error) = result {
+            if self
+                .durable_plan(plan.id())
+                .is_ok_and(|stored| stored.state() == PlanState::Running)
+            {
+                self.finish_durable_plan(plan.id(), PlanState::Failed, Some(&error.to_string()))
+                    .map_err(|cleanup| {
+                        Error::Catalog(format!(
+                            "{error}; provider-refresh failure could not be recorded: {cleanup}"
+                        ))
+                    })?;
+            }
+            return Err(error);
         }
-        self.start_durable_plan(plan.id())?;
+        Ok(())
+    }
+
+    fn apply_provider_refresh(&self, plan: &ProviderRefreshPlan) -> Result<()> {
         if self.active_claim_set_digest(plan.entity_kind, &plan.entity_id)? != plan.claim_set_sha256
         {
-            let detail = "claim set changed after provider-refresh preview";
-            let _ = self.finish_durable_plan(plan.id(), PlanState::Failed, Some(detail));
-            return Err(Error::Catalog(detail.into()));
+            return Err(Error::Catalog(
+                "claim set changed after provider-refresh preview".into(),
+            ));
         }
         for diff in &plan.diffs {
             let current =
                 self.preview_claim_resolution(plan.entity_kind, &plan.entity_id, diff.field())?;
             if current.as_ref() != Some(diff) {
-                let detail = format!("claim set changed for field {:?}", diff.field());
-                let _ = self.finish_durable_plan(plan.id(), PlanState::Failed, Some(&detail));
-                return Err(Error::Catalog(detail));
+                return Err(Error::Catalog(format!(
+                    "claim set changed for field {:?}",
+                    diff.field()
+                )));
             }
         }
         let now = Utc::now().to_rfc3339();
@@ -719,18 +807,26 @@ impl Library {
         Ok(format!("{:x}", hasher.finalize()))
     }
 
-    /// Supersede a claim without destroying the earlier evidence.
+    /// Replace an active claim with a distinct active claim for the same entity field.
+    /// Earlier evidence remains stored. The replacement may use another provider.
     pub fn supersede_claim(&self, old: &EntityId, replacement: &EntityId) -> Result<()> {
         let changed = self.conn.execute(
             "UPDATE metadata_claims SET superseded_by = ?2
-             WHERE id = ?1 AND superseded_by IS NULL",
+             WHERE id = ?1 AND id != ?2 AND superseded_by IS NULL
+               AND EXISTS (
+                   SELECT 1 FROM metadata_claims AS replacement
+                   WHERE replacement.id = ?2 AND replacement.superseded_by IS NULL
+                     AND replacement.entity_type = metadata_claims.entity_type
+                     AND replacement.entity_id = metadata_claims.entity_id
+                     AND replacement.field = metadata_claims.field
+               )",
             params![old.as_str(), replacement.as_str()],
         )?;
         if changed == 1 {
             Ok(())
         } else {
             Err(Error::Catalog(
-                "claim does not exist or was already superseded".into(),
+                "replacement requires distinct active claims for the same entity and field".into(),
             ))
         }
     }
@@ -789,11 +885,22 @@ impl Library {
     }
 }
 
-fn checked_label(value: String, description: &str) -> Result<String> {
+fn validate_claim(field: &str, source_kind: &str, locked: bool) -> Result<()> {
+    checked_label(field, "claim field")?;
+    checked_label(source_kind, "claim source kind")?;
+    if locked && source_kind != "manual" {
+        return Err(Error::Catalog(
+            "only manual claims may be locked against refresh".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn checked_label(value: &str, description: &str) -> Result<()> {
     if value.trim().is_empty() || value.chars().any(char::is_control) || value.len() > 512 {
         Err(Error::Catalog(format!("invalid {description}")))
     } else {
-        Ok(value)
+        Ok(())
     }
 }
 
@@ -820,6 +927,320 @@ mod tests {
 
     use super::*;
 
+    fn test_claim() -> Result<MetadataClaim> {
+        MetadataClaim::new(
+            EntityKind::Release,
+            EntityId::new(),
+            "title",
+            ValueState::Known(json!("Title")),
+            "provider",
+            Some("musicbrainz".into()),
+            Some("snapshot-id".into()),
+            Confidence::new(0.9)?,
+            DataLicense::Cc0,
+            false,
+        )
+    }
+
+    fn refresh_fixture() -> Result<(Library, ProviderRefreshPlan)> {
+        let library = Library::open_in_memory()?;
+        let entity = EntityId::new();
+        for (field, value) in [("country", "GB"), ("title", "Reviewed title")] {
+            let mut claim = test_claim()?;
+            claim.entity_id = entity.clone();
+            claim.field = field.into();
+            claim.value = ValueState::Known(json!(value));
+            library.append_metadata_claim(&claim)?;
+        }
+        let plan = library.plan_provider_refresh(EntityKind::Release, &entity)?;
+        Ok((library, plan))
+    }
+
+    fn canonical_count(library: &Library) -> Result<u64> {
+        library
+            .conn
+            .query_row("SELECT COUNT(*) FROM canonical_values", [], |row| {
+                row.get(0)
+            })
+            .map_err(Error::from)
+    }
+
+    fn claim_snapshot(library: &Library) -> Result<String> {
+        library
+            .conn
+            .query_row(
+                "SELECT json_group_array(json_object(
+                    'id', id, 'entity_type', entity_type, 'entity_id', entity_id,
+                    'field', field, 'value_state', value_state, 'value_json', value_json,
+                    'source_kind', source_kind, 'source_provider', source_provider,
+                    'source_reference', source_reference, 'retrieved_at', retrieved_at,
+                    'confidence', confidence, 'data_license', data_license,
+                    'locked', locked, 'superseded_by', superseded_by))
+                 FROM (SELECT * FROM metadata_claims ORDER BY id)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Error::from)
+    }
+
+    #[test]
+    fn provider_refresh_approval_rejects_changed_saved_content() -> Result<()> {
+        let mut accepted = Vec::new();
+        let mut transitioned = Vec::new();
+        for field in [
+            "entity_kind",
+            "entity_id",
+            "diffs",
+            "claim_set_sha256",
+            "id",
+        ] {
+            let (library, plan) = refresh_fixture()?;
+            let mut encoded = serde_json::to_value(&plan)?;
+            let mut saved_id = plan.id().clone();
+            encoded[field] = match field {
+                "entity_kind" => json!(EntityKind::Recording),
+                "entity_id" => json!(EntityId::new()),
+                "diffs" => json!([]),
+                "claim_set_sha256" => json!("0".repeat(64)),
+                _ => {
+                    saved_id = library.create_durable_plan(
+                        PlanKind::Audit,
+                        &json!({}),
+                        &json!({}),
+                        None,
+                    )?;
+                    json!(saved_id)
+                }
+            };
+            let edited: ProviderRefreshPlan = serde_json::from_value(encoded)?;
+            if library.approve_provider_refresh(&edited).is_ok() {
+                accepted.push(field);
+            }
+            if library.durable_plan(&saved_id)?.state() != PlanState::Planned {
+                transitioned.push(field);
+            }
+            assert_eq!(canonical_count(&library)?, 0);
+        }
+        assert!(
+            accepted.is_empty(),
+            "edited refresh approvals passed: {accepted:?}"
+        );
+        assert!(
+            transitioned.is_empty(),
+            "edited approvals changed state: {transitioned:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn provider_refresh_rejects_removed_reviewed_diffs() -> Result<()> {
+        let (library, plan) = refresh_fixture()?;
+        library.approve_provider_refresh(&plan)?;
+        let mut encoded = serde_json::to_value(&plan)?;
+        encoded["diffs"] = json!(plan.diffs().iter().take(1).collect::<Vec<_>>());
+        let edited: ProviderRefreshPlan = serde_json::from_value(encoded)?;
+        assert!(
+            library.execute_provider_refresh(&edited).is_err(),
+            "a refresh executed after a reviewed field was removed"
+        );
+        assert_eq!(
+            library.durable_plan(plan.id())?.state(),
+            PlanState::Approved
+        );
+        assert_eq!(canonical_count(&library)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn provider_refresh_rejects_an_unreviewed_target_payload() -> Result<()> {
+        let (library, plan) = refresh_fixture()?;
+        library.approve_provider_refresh(&plan)?;
+        let other = test_claim()?;
+        library.append_metadata_claim(&other)?;
+        let unreviewed = library.preview_provider_refresh(other.entity_kind, &other.entity_id)?;
+        let mut encoded = serde_json::to_value(unreviewed)?;
+        encoded["id"] = json!(plan.id());
+        let edited: ProviderRefreshPlan = serde_json::from_value(encoded)?;
+        assert!(
+            library.execute_provider_refresh(&edited).is_err(),
+            "a refresh applied another entity's unreviewed payload"
+        );
+        assert_eq!(
+            library.durable_plan(plan.id())?.state(),
+            PlanState::Approved
+        );
+        assert_eq!(canonical_count(&library)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn provider_refresh_rejects_another_approved_plan_kind() -> Result<()> {
+        let (library, plan) = refresh_fixture()?;
+        let other = library.create_durable_plan(
+            PlanKind::Audit,
+            &json!({}),
+            &json!({}),
+            Some(plan.diffs().len() as u64),
+        )?;
+        library.approve_durable_plan(&other)?;
+        let mut encoded = serde_json::to_value(&plan)?;
+        encoded["id"] = json!(other);
+        let edited: ProviderRefreshPlan = serde_json::from_value(encoded)?;
+        assert!(
+            library.execute_provider_refresh(&edited).is_err(),
+            "a refresh used another plan kind's approval"
+        );
+        assert_eq!(library.durable_plan(&other)?.state(), PlanState::Approved);
+        assert_eq!(canonical_count(&library)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn provider_refresh_start_errors_finish_the_plan() -> Result<()> {
+        let (library, plan) = refresh_fixture()?;
+        library.approve_provider_refresh(&plan)?;
+        let (result, hits) =
+            crate::failpoints::run_failing(0, || library.execute_provider_refresh(&plan));
+        assert!(result.is_err());
+        assert!(hits.contains(&"db.plan-transition"));
+        assert_eq!(
+            library.durable_plan(plan.id())?.state(),
+            PlanState::Failed,
+            "a committed start error left the refresh running"
+        );
+        assert_eq!(canonical_count(&library)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn provider_refresh_query_errors_finish_the_plan() -> Result<()> {
+        let (library, plan) = refresh_fixture()?;
+        library.approve_provider_refresh(&plan)?;
+        library.conn.execute(
+            "UPDATE metadata_claims SET value_json = NULL WHERE entity_id = ?1",
+            [plan.entity_id.as_str()],
+        )?;
+        let result = library.execute_provider_refresh(&plan);
+        assert!(
+            matches!(&result, Err(Error::Catalog(detail)) if detail == "known claim has no value"),
+            "the stored-value failure was not reached: {result:?}"
+        );
+        assert_eq!(
+            library.durable_plan(plan.id())?.state(),
+            PlanState::Failed,
+            "a query error left the refresh running"
+        );
+        assert_eq!(canonical_count(&library)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn provider_refresh_write_errors_roll_back_and_finish_the_plan() -> Result<()> {
+        let (library, plan) = refresh_fixture()?;
+        library.approve_provider_refresh(&plan)?;
+        library.conn.execute_batch(
+            "CREATE TEMP TRIGGER reject_second_canonical_insert
+             BEFORE INSERT ON canonical_values WHEN NEW.field = 'title'
+             BEGIN SELECT RAISE(ABORT, 'injected canonical write failure'); END;",
+        )?;
+        let result = library.execute_provider_refresh(&plan);
+        assert!(
+            matches!(&result, Err(Error::Database(_))),
+            "the transaction write failure was not reached: {result:?}"
+        );
+        assert_eq!(canonical_count(&library)?, 0);
+        assert_eq!(
+            library.durable_plan(plan.id())?.state(),
+            PlanState::Failed,
+            "a rolled-back write left the refresh running"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn claim_supersession_rejects_self_links_and_preserves_evidence() -> Result<()> {
+        let library = Library::open_in_memory()?;
+        let old = test_claim()?;
+        library.append_metadata_claim(&old)?;
+        let before = claim_snapshot(&library)?;
+        assert!(
+            library.supersede_claim(old.id(), old.id()).is_err(),
+            "a claim superseded itself"
+        );
+        assert_eq!(claim_snapshot(&library)?, before);
+
+        let mut replacement = old.clone();
+        replacement.id = EntityId::new();
+        replacement.source_provider = Some("other-provider".into());
+        replacement.value = ValueState::Known(json!("Replacement title"));
+        library.append_metadata_claim(&replacement)?;
+        library.supersede_claim(old.id(), replacement.id())?;
+        let (stored_value, successor): (String, String) = library.conn.query_row(
+            "SELECT value_json, superseded_by FROM metadata_claims WHERE id = ?1",
+            [old.id().as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(stored_value, serde_json::to_string(&json!("Title"))?);
+        assert_eq!(successor, replacement.id().as_str());
+        Ok(())
+    }
+
+    #[test]
+    fn claim_supersession_rejects_different_entity_or_field_scopes() -> Result<()> {
+        let mut accepted = Vec::new();
+        let mut modified = Vec::new();
+        for mismatch in ["entity-kind", "entity-id", "field"] {
+            let library = Library::open_in_memory()?;
+            let old = test_claim()?;
+            let mut replacement = old.clone();
+            replacement.id = EntityId::new();
+            match mismatch {
+                "entity-kind" => replacement.entity_kind = EntityKind::Recording,
+                "entity-id" => replacement.entity_id = EntityId::new(),
+                _ => replacement.field = "country".into(),
+            }
+            library.append_metadata_claim(&old)?;
+            library.append_metadata_claim(&replacement)?;
+            let before = claim_snapshot(&library)?;
+            if library.supersede_claim(old.id(), replacement.id()).is_ok() {
+                accepted.push(mismatch);
+            }
+            if claim_snapshot(&library)? != before {
+                modified.push(mismatch);
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "invalid replacement scopes passed: {accepted:?}"
+        );
+        assert!(modified.is_empty(), "rejected claims changed: {modified:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn claim_supersession_rejects_inactive_replacements_and_cycles() -> Result<()> {
+        let library = Library::open_in_memory()?;
+        let old = test_claim()?;
+        let mut replacement = old.clone();
+        replacement.id = EntityId::new();
+        let mut current = old.clone();
+        current.id = EntityId::new();
+        for claim in [&old, &replacement, &current] {
+            library.append_metadata_claim(claim)?;
+        }
+        library.supersede_claim(replacement.id(), current.id())?;
+        let before = claim_snapshot(&library)?;
+        let inactive = library.supersede_claim(old.id(), replacement.id());
+        let cycle = library.supersede_claim(current.id(), replacement.id());
+        assert!(
+            inactive.is_err(),
+            "an inactive claim replaced active evidence"
+        );
+        assert!(cycle.is_err(), "supersession created a cycle");
+        assert_eq!(claim_snapshot(&library)?, before);
+        Ok(())
+    }
+
     #[test]
     fn invariant_types_reject_invalid_values() -> Result<()> {
         assert!(Confidence::new(f64::NAN).is_err());
@@ -827,6 +1248,106 @@ mod tests {
         assert!(PartialDate::parse("2024-02-30").is_err());
         assert_eq!(PartialDate::parse("2024-02")?.as_str(), "2024-02");
         assert!(EntityId::parse("not-a-uuid").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn partial_dates_require_exact_positive_year_syntax() -> Result<()> {
+        for invalid in [
+            "+123",
+            "0000",
+            "0000-01",
+            "0000-01-01",
+            "2024- 2",
+            "2024-1-01",
+            "2024-01-1",
+            "2024- 1-01",
+        ] {
+            assert!(
+                PartialDate::parse(invalid).is_err(),
+                "invalid partial date was accepted: {invalid:?}"
+            );
+            assert!(serde_json::from_value::<PartialDate>(json!(invalid)).is_err());
+        }
+        for valid in ["0001", "0001-01", "0001-01-01", "2024-02-29", "9999-12-31"] {
+            assert_eq!(PartialDate::parse(valid)?.as_str(), valid);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn claim_deserialization_cannot_store_invalid_labels() -> Result<()> {
+        let library = Library::open_in_memory()?;
+        let valid = serde_json::to_value(test_claim()?)?;
+        let roundtrip: MetadataClaim = serde_json::from_value(valid.clone())?;
+        assert_eq!(serde_json::to_value(roundtrip)?, valid);
+        for field in ["field", "source_kind"] {
+            for invalid in [
+                String::new(),
+                "   ".into(),
+                "bad\nlabel".into(),
+                "x".repeat(513),
+            ] {
+                let mut value = valid.clone();
+                value["id"] = json!(EntityId::new());
+                value[field] = json!(invalid);
+                let result = serde_json::from_value::<MetadataClaim>(value)
+                    .map_err(Error::from)
+                    .and_then(|claim| library.append_metadata_claim(&claim));
+                assert!(result.is_err(), "invalid {field} reached claim storage");
+            }
+        }
+        let stored: u32 =
+            library
+                .conn
+                .query_row("SELECT COUNT(*) FROM metadata_claims", [], |row| row.get(0))?;
+        assert_eq!(stored, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn claim_deserialization_cannot_store_locked_provider_claims() -> Result<()> {
+        let library = Library::open_in_memory()?;
+        let mut value = serde_json::to_value(test_claim()?)?;
+        value["locked"] = json!(true);
+        let result = serde_json::from_value::<MetadataClaim>(value.clone())
+            .map_err(Error::from)
+            .and_then(|claim| library.append_metadata_claim(&claim));
+        assert!(result.is_err(), "a locked provider claim reached storage");
+        let stored: u32 =
+            library
+                .conn
+                .query_row("SELECT COUNT(*) FROM metadata_claims", [], |row| row.get(0))?;
+        assert_eq!(stored, 0);
+        value["source_kind"] = json!("manual");
+        let manual: MetadataClaim = serde_json::from_value(value.clone())?;
+        assert_eq!(serde_json::to_value(manual)?, value);
+        Ok(())
+    }
+
+    #[test]
+    fn equivalent_entity_ids_find_the_same_claim() -> Result<()> {
+        let library = Library::open_in_memory()?;
+        let entity = EntityId::parse("550e8400-e29b-41d4-a716-446655440000")?;
+        let mut claim = test_claim()?;
+        claim.entity_id = entity.clone();
+        library.append_metadata_claim(&claim)?;
+        for spelling in [
+            "550E8400-E29B-41D4-A716-446655440000",
+            "550e8400e29b41d4a716446655440000",
+            "{550e8400-e29b-41d4-a716-446655440000}",
+            "urn:uuid:550e8400-e29b-41d4-a716-446655440000",
+        ] {
+            let parsed = EntityId::parse(spelling)?;
+            assert!(
+                library
+                    .preview_claim_resolution(EntityKind::Release, &parsed, "title")?
+                    .is_some(),
+                "equivalent entity ID could not find its claim: {spelling}"
+            );
+            assert_eq!(parsed, entity);
+            assert_eq!(serde_json::from_value::<EntityId>(json!(spelling))?, entity);
+        }
         Ok(())
     }
 

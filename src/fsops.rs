@@ -5,6 +5,35 @@ use std::path::{Component, Path, PathBuf};
 use crate::failpoints;
 use crate::{Error, Result};
 
+pub fn bounded_sibling_path(path: &Path, name: impl AsRef<std::ffi::OsStr>) -> PathBuf {
+    let name = name.as_ref();
+    if name.as_encoded_bytes().len() <= 255 {
+        return path.with_file_name(name);
+    }
+    // Retain the operation and role identity without exceeding common filesystem limits.
+    let digest = blake3::hash(name.as_encoded_bytes());
+    path.with_file_name(format!(".rsbts-{digest}.tmp"))
+}
+
+pub fn validate_absolute_root_path(path: &Path) -> Result<()> {
+    if !path.is_absolute() {
+        return Err(Error::Root(format!(
+            "root path must be absolute: {}",
+            path.display()
+        )));
+    }
+    if path
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        return Err(Error::Root(format!(
+            "root path contains a parent component: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// A directory-handle-backed mutation boundary.
 ///
 /// On Linux, every component is resolved by the kernel beneath the already
@@ -58,12 +87,7 @@ impl ReadRoot {
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 impl ReadRoot {
     pub fn open(path: &Path) -> Result<Self> {
-        if !path.is_absolute() {
-            return Err(Error::Root(format!(
-                "read root must be absolute: {}",
-                path.display()
-            )));
-        }
+        validate_absolute_root_path(path)?;
         let metadata = std::fs::symlink_metadata(path)?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(Error::Root(format!(
@@ -239,12 +263,7 @@ impl AnchoredRoot {
 impl AnchoredRoot {
     /// Open a real directory as the immutable anchor for later relative I/O.
     pub fn open(path: &Path) -> Result<Self> {
-        if !path.is_absolute() {
-            return Err(Error::Root(format!(
-                "anchored root must be absolute: {}",
-                path.display()
-            )));
-        }
+        validate_absolute_root_path(path)?;
         let mut fd = rustix::fs::open(
             "/",
             rustix::fs::OFlags::RDONLY
@@ -269,12 +288,7 @@ impl AnchoredRoot {
     /// Create a missing absolute directory path one component at a time from
     /// the filesystem root, then retain the final directory handle as anchor.
     pub fn open_or_create(path: &Path) -> Result<Self> {
-        if !path.is_absolute() {
-            return Err(Error::Root(format!(
-                "anchored root must be absolute: {}",
-                path.display()
-            )));
-        }
+        validate_absolute_root_path(path)?;
         if path == Path::new("/") {
             return Self::open(path);
         }
@@ -645,33 +659,6 @@ fn io_error(error: rustix::io::Errno) -> std::io::Error {
     std::io::Error::from_raw_os_error(error.raw_os_error())
 }
 
-/// Atomically rename `source` to `destination` while refusing replacement.
-///
-/// The fallback intentionally fails on platforms where the standard rename
-/// operation may replace a destination. A root capability must never claim a
-/// safety property that the host cannot provide.
-#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
-pub fn rename_noreplace(source: &Path, destination: &Path) -> Result<()> {
-    rustix::fs::renameat_with(
-        rustix::fs::CWD,
-        source,
-        rustix::fs::CWD,
-        destination,
-        rustix::fs::RenameFlags::NOREPLACE,
-    )
-    .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
-    failpoints::hit("fs.rename-noreplace-unanchored")?;
-    Ok(())
-}
-
-#[cfg(all(test, not(any(target_os = "linux", target_os = "android"))))]
-pub fn rename_noreplace(_source: &Path, _destination: &Path) -> Result<()> {
-    Err(crate::Error::Import(
-        "this filesystem backend cannot prove no-replace rename semantics; refusing mutation"
-            .into(),
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -684,7 +671,9 @@ mod tests {
         std::fs::write(&source, b"source")?;
         std::fs::write(&destination, b"destination")?;
 
-        assert!(rename_noreplace(&source, &destination).is_err());
+        let result = AnchoredRoot::open(temporary.path())
+            .and_then(|root| root.rename_noreplace(&source, &destination));
+        assert!(result.is_err());
         assert_eq!(std::fs::read(&source)?, b"source");
         assert_eq!(std::fs::read(&destination)?, b"destination");
         Ok(())
@@ -698,7 +687,8 @@ mod tests {
         let destination = temporary.path().join("destination");
         std::fs::write(&source, b"source")?;
 
-        rename_noreplace(&source, &destination)?;
+        let root = AnchoredRoot::open(temporary.path())?;
+        root.rename_noreplace(&source, &destination)?;
         assert!(!source.exists());
         assert_eq!(std::fs::read(&destination)?, b"source");
         Ok(())
@@ -719,6 +709,69 @@ mod tests {
         assert!(root.create_parent_all(&escaped).is_err());
         assert!(root.write_new(&escaped, b"owned").is_err());
         assert!(!outside.join("track.flac").exists());
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn anchored_open_rejects_parent_components_before_selecting_a_directory() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let wrong = temporary.path().join("a/b");
+        let intended = temporary.path().join("b");
+        std::fs::create_dir_all(&wrong)?;
+        std::fs::create_dir(&intended)?;
+        let requested = temporary.path().join("a/../b");
+        let result = AnchoredRoot::open(&requested);
+        if let Ok(root) = &result {
+            root.write_new(&requested.join("probe"), b"owned bytes")?;
+        }
+        assert!(
+            !wrong.join("probe").exists(),
+            "a parent component redirected the anchor into another directory"
+        );
+        assert!(result.is_err(), "an anchor accepted a parent component");
+        assert!(!intended.join("probe").exists());
+        let root = AnchoredRoot::open(&intended)?;
+        root.write_new(&intended.join("ordinary"), b"ordinary bytes")?;
+        assert_eq!(std::fs::read(intended.join("ordinary"))?, b"ordinary bytes");
+        AnchoredRoot::open(Path::new("/"))?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn anchored_creation_rejects_parent_components_before_creating_any_directory() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let requested = temporary.path().join("new/../target");
+        let result = AnchoredRoot::open_or_create(&requested);
+        assert!(
+            !temporary.path().join("new").exists(),
+            "an invalid root created a directory before parent-component validation"
+        );
+        assert!(!temporary.path().join("target").exists());
+        assert!(result.is_err(), "root creation accepted a parent component");
+        let ordinary = temporary.path().join("ordinary/nested");
+        let root = AnchoredRoot::open_or_create(&ordinary)?;
+        root.write_new(&ordinary.join("probe"), b"ordinary bytes")?;
+        assert_eq!(std::fs::read(ordinary.join("probe"))?, b"ordinary bytes");
+        AnchoredRoot::open_or_create(Path::new("/"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn read_roots_reject_parent_components() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        std::fs::create_dir_all(temporary.path().join("a/b"))?;
+        let intended = temporary.path().join("b");
+        std::fs::create_dir(&intended)?;
+        let requested = temporary.path().join("a").join("..").join("b");
+        assert!(
+            ReadRoot::open(&requested).is_err(),
+            "a read root accepted a parent component"
+        );
+        std::fs::write(intended.join("probe"), b"ordinary bytes")?;
+        let root = ReadRoot::open(&intended)?;
+        assert_eq!(root.entry_metadata(&intended.join("probe"))?.len(), 14);
         Ok(())
     }
 

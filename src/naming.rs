@@ -79,25 +79,29 @@ pub fn sanitize_component(value: &str, profile: NamingProfile) -> Result<String>
     if normalized.is_empty() || normalized == "." || normalized == ".." {
         normalized = "_".into();
     }
-    if profile != NamingProfile::NativeFilesystem && is_windows_reserved(&normalized) {
-        normalized.insert(0, '_');
-    }
     truncate_graphemes(&mut normalized, DEFAULT_COMPONENT_BYTES);
     if normalized.is_empty() {
         return Err(Error::PathFormat("path component became empty".into()));
     }
+    if profile != NamingProfile::NativeFilesystem {
+        normalized = normalized.trim_end_matches([' ', '.']).to_owned();
+    }
+    if normalized.is_empty() || normalized == "." || normalized == ".." {
+        normalized = "_".into();
+    }
+    if profile != NamingProfile::NativeFilesystem && is_windows_reserved(&normalized) {
+        truncate_graphemes(&mut normalized, DEFAULT_COMPONENT_BYTES - 1);
+        normalized = normalized.trim_end_matches([' ', '.']).to_owned();
+        normalized.insert(0, '_');
+    }
     Ok(normalized)
 }
 
-/// NFKC plus full Unicode case folding for comparisons, never for display.
+/// Unicode compatibility caseless matching for comparisons, never for display.
+/// Uses the normalization and case-folding sequence from Unicode D146.
 #[must_use]
 pub fn collision_key(value: &str) -> String {
-    value
-        .nfkc()
-        .collect::<String>()
-        .as_str()
-        .case_fold()
-        .collect()
+    value.nfd().case_fold().nfkd().case_fold().nfkd().collect()
 }
 
 pub fn sanitize_relative_path(path: &Path, profile: NamingProfile) -> Result<PathBuf> {
@@ -206,6 +210,66 @@ mod tests {
         assert!(sanitized.len() <= DEFAULT_COMPONENT_BYTES);
         assert!(sanitized.ends_with("👩‍🔬"));
         Ok(())
+    }
+
+    #[test]
+    fn truncation_cannot_create_dot_components() -> Result<()> {
+        let oversized_grapheme = format!("x{}", "\u{034f}".repeat(DEFAULT_COMPONENT_BYTES));
+        for profile in [
+            NamingProfile::Portable,
+            NamingProfile::NativeFilesystem,
+            NamingProfile::Archival,
+        ] {
+            for prefix in ["..", "."] {
+                let component = format!("{prefix}{oversized_grapheme}");
+                assert_eq!(
+                    sanitize_relative_path(Path::new(&component), profile)?,
+                    PathBuf::from("_"),
+                    "truncation must not create a dot component for {profile:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn truncation_cannot_leave_portable_trailing_characters() -> Result<()> {
+        let prefix = "a".repeat(DEFAULT_COMPONENT_BYTES - 1);
+        for profile in [NamingProfile::Portable, NamingProfile::Archival] {
+            for trailing in ['.', ' '] {
+                let component = format!("{prefix}{trailing}z");
+                assert_eq!(sanitize_component(&component, profile)?, prefix);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn truncation_cannot_create_portable_reserved_names() -> Result<()> {
+        let oversized_grapheme = format!("x{}", "\u{034f}".repeat(DEFAULT_COMPONENT_BYTES));
+        for profile in [NamingProfile::Portable, NamingProfile::Archival] {
+            for reserved in ["CON", "NUL", "COM1", "LPT9"] {
+                let component = format!("{reserved}{oversized_grapheme}");
+                assert_eq!(
+                    sanitize_component(&component, profile)?,
+                    format!("_{reserved}")
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn collision_keys_match_case_variants_with_combining_marks() {
+        assert_eq!(collision_key("\u{0390}"), collision_key("\u{03aa}\u{0301}"));
+    }
+
+    #[test]
+    fn collision_keys_reorder_marks_before_folded_iota() {
+        assert_eq!(
+            collision_key("\u{1f95}\u{0323}"),
+            collision_key("\u{1f25}\u{0323}\u{03b9}")
+        );
     }
 
     #[test]

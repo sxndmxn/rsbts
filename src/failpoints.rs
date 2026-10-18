@@ -11,6 +11,7 @@ use std::cell::RefCell;
 #[derive(Debug, Default)]
 struct State {
     fail_at: Option<usize>,
+    raw_os_error: Option<i32>,
     hits: Vec<&'static str>,
 }
 
@@ -22,21 +23,24 @@ thread_local! {
 /// Mark a mutation, sync, or database transition boundary.
 #[cfg(test)]
 pub fn hit(name: &'static str) -> Result<()> {
-    let should_fail = STATE.with(|slot| {
+    let (should_fail, raw_os_error) = STATE.with(|slot| {
         let mut slot = slot.borrow_mut();
         let Some(state) = slot.as_mut() else {
-            return false;
+            return (false, None);
         };
         let index = state.hits.len();
         state.hits.push(name);
-        state.fail_at == Some(index)
+        (state.fail_at == Some(index), state.raw_os_error)
     });
-    if should_fail {
-        return Err(Error::Operation(format!(
-            "injected failure after safety boundary {name}"
-        )));
+    if !should_fail {
+        return Ok(());
     }
-    Ok(())
+    if let Some(raw_os_error) = raw_os_error {
+        return Err(Error::Io(std::io::Error::from_raw_os_error(raw_os_error)));
+    }
+    Err(Error::Operation(format!(
+        "injected failure after safety boundary {name}"
+    )))
 }
 
 /// Production builds retain the same call sites without the test recorder.
@@ -70,6 +74,7 @@ pub fn run_failing<T>(
     STATE.with(|slot| {
         *slot.borrow_mut() = Some(State {
             fail_at: Some(fail_at),
+            raw_os_error: None,
             hits: Vec::new(),
         });
     });
@@ -92,16 +97,11 @@ pub fn run_failing_io<T>(
     STATE.with(|slot| {
         *slot.borrow_mut() = Some(State {
             fail_at: Some(fail_at),
+            raw_os_error: Some(raw_os_error),
             hits: Vec::new(),
         });
     });
-    let result = operation().map_err(|error| {
-        if matches!(&error, Error::Operation(detail) if detail.starts_with("injected failure")) {
-            Error::Io(std::io::Error::from_raw_os_error(raw_os_error))
-        } else {
-            error
-        }
-    });
+    let result = operation();
     let hits = STATE.with(|slot| {
         slot.borrow_mut()
             .take()

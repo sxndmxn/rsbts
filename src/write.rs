@@ -25,7 +25,7 @@ pub struct TagWritePlan {
 impl TagWritePlan {
     pub fn build(library: &Library, query: &Query) -> Result<Self> {
         let mut files = Vec::new();
-        for item in library.query_items(query)? {
+        for item in library.query_items_bounded(query, 9_999)? {
             let metadata = std::fs::symlink_metadata(&item.path)?;
             if metadata.file_type().is_symlink() || !metadata.is_file() {
                 return Err(Error::Import(format!(
@@ -98,7 +98,8 @@ impl<'a> TagWriteExecutor<'a> {
     }
 }
 
-fn canonical_tags(item: &Item) -> Result<CanonicalTags> {
+pub(crate) fn canonical_tags(item: &Item) -> Result<CanonicalTags> {
+    crate::validate_item_metadata(item)?;
     let artists = if item.extended.artists.is_empty() {
         vec![item.artist.clone()]
     } else {
@@ -120,6 +121,7 @@ fn canonical_tags(item: &Item) -> Result<CanonicalTags> {
     let recording_date = partial_date_text(&item.extended.date)
         .or_else(|| item.year.map(|year| format!("{year:04}")));
     let mut tags = CanonicalTags::new(&item.title, artists, &item.album, album_artists)?
+        .with_display_credits(item.artist.clone(), item.effective_albumartist().to_owned())?
         .with_positions(
             item.track.map(|number| (number, item.extended.track_total)),
             item.disc.map(|number| (number, item.extended.disc_total)),
@@ -183,7 +185,7 @@ fn canonical_tags(item: &Item) -> Result<CanonicalTags> {
         album_artist_ids,
         works,
     )?;
-    Ok(tags)
+    tags.with_extended_fields(&item.extended)
 }
 
 fn partial_date_text(date: &crate::PartialDate) -> Option<String> {
@@ -235,6 +237,248 @@ mod tests {
         bytes.extend_from_slice(&2_u32.to_le_bytes());
         bytes.extend_from_slice(&0_i16.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn canonical_reconstruction_preserves_independent_totals_and_typed_fields() -> Result<()> {
+        use crate::FlexibleValue;
+
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("track.wav");
+        std::fs::write(&path, minimal_wav())?;
+        let mut item = crate::tags::read_tags(&path)?;
+        item.extended.track_total = Some(12);
+        item.extended.disc_total = Some(2);
+        for (key, value) in [
+            (
+                "labels",
+                FlexibleValue::StringList(vec!["One".into(), "Two".into()]),
+            ),
+            (
+                "catalog_numbers",
+                FlexibleValue::StringList(vec!["A".into(), "B".into()]),
+            ),
+            ("barcode", FlexibleValue::String("123456789".into())),
+            (
+                "conductors",
+                FlexibleValue::StringList(vec!["Conductor".into()]),
+            ),
+            (
+                "lyricists",
+                FlexibleValue::StringList(vec!["Lyricist".into()]),
+            ),
+            (
+                "performers",
+                FlexibleValue::StringList(vec!["Performer".into()]),
+            ),
+            ("work", FlexibleValue::String("Work".into())),
+            ("movement", FlexibleValue::String("Movement".into())),
+            ("movement_total", FlexibleValue::Integer(4)),
+            (
+                "replaygain_track_gain",
+                FlexibleValue::String("-3 dB".into()),
+            ),
+            ("replaygain_track_peak", FlexibleValue::String("0.9".into())),
+            (
+                "replaygain_album_gain",
+                FlexibleValue::String("-4 dB".into()),
+            ),
+            ("replaygain_album_peak", FlexibleValue::String("0.8".into())),
+        ] {
+            item.extended.flexible_fields.insert(key.into(), value);
+        }
+        let encoded = serde_json::to_value(canonical_tags(&item)?)?;
+        assert_eq!(
+            encoded["track_total"], 12,
+            "an unknown track number erased its total"
+        );
+        assert_eq!(encoded["disc_total"], 2);
+        assert_eq!(encoded["movement_total"], 4);
+        for key in [
+            "labels",
+            "catalog_numbers",
+            "barcode",
+            "conductors",
+            "lyricists",
+            "performers",
+            "work",
+            "movement",
+            "movement_total",
+            "replaygain_track_gain",
+            "replaygain_track_peak",
+            "replaygain_album_gain",
+            "replaygain_album_peak",
+        ] {
+            let expected = serde_json::to_value(&item.extended.flexible_fields[key])?;
+            assert_eq!(encoded[key], expected["value"], "lost {key}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_reconstruction_rejects_malformed_typed_metadata() -> Result<()> {
+        use crate::FlexibleValue;
+
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("track.wav");
+        std::fs::write(&path, minimal_wav())?;
+        let original = crate::tags::read_tags(&path)?;
+        let mut accepted = Vec::new();
+        for (key, value) in [
+            ("barcode", FlexibleValue::Integer(123)),
+            ("conductors", FlexibleValue::String("Conductor".into())),
+            ("movement_number", FlexibleValue::Float(1.5)),
+            ("movement_total", FlexibleValue::Integer(0)),
+            (
+                "replaygain_track_gain",
+                FlexibleValue::String("bad\nvalue".into()),
+            ),
+        ] {
+            let mut item = original.clone();
+            item.extended.flexible_fields.insert(key.into(), value);
+            if canonical_tags(&item).is_ok() {
+                accepted.push(key);
+            }
+        }
+        let mut invalid_date = original;
+        invalid_date.extended.date.month = Some(2);
+        if canonical_tags(&invalid_date).is_ok() {
+            accepted.push("date");
+        }
+        assert!(
+            accepted.is_empty(),
+            "malformed typed metadata passed: {accepted:?}"
+        );
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn native_workflow_fixture() -> Result<(tempfile::TempDir, PathBuf, CanonicalTags)> {
+        use lofty::config::WriteOptions;
+        use lofty::file::{AudioFile, TaggedFileExt};
+        use lofty::picture::{MimeType, Picture, PictureType};
+        use lofty::probe::Probe;
+        use lofty::tag::ItemKey;
+
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("workflow.flac");
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/formats/flac.flac"),
+            &path,
+        )?;
+        let tags = CanonicalTags::new(
+            "Title",
+            vec!["Artist One".into(), "Artist Two".into()],
+            "Album",
+            vec!["Album Artist".into()],
+        )?
+        .with_positions(Some((1, Some(12))), Some((1, Some(2))))?
+        .with_dates(Some("2024-02-29".into()), Some("1980-03".into()))?
+        .with_genres(vec!["Rock".into(), "Metal".into()])?
+        .with_release_facts(
+            vec!["Label One".into(), "Label Two".into()],
+            vec!["A".into(), "B".into()],
+            Some("GB".into()),
+            Some("CD".into()),
+            Some("123456789".into()),
+        )?
+        .with_classical(
+            vec!["Composer".into()],
+            vec!["Conductor".into()],
+            vec!["Lyricist".into()],
+            vec!["Performer".into()],
+            Some("Work".into()),
+            Some("Movement".into()),
+            Some((1, Some(4))),
+        )?
+        .with_replaygain(
+            Some("-3 dB".into()),
+            Some("0.9".into()),
+            Some("-4 dB".into()),
+            Some("0.8".into()),
+        )?;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        crate::tags::rewrite_tags(&mut file, &path, &tags, TagProfile::ArchivalNativeRich)?;
+        drop(file);
+        let mut native = Probe::open(&path)?.read()?;
+        let tag = native
+            .primary_tag_mut()
+            .ok_or_else(|| Error::Import("test file has no tag".into()))?;
+        assert!(tag.insert_text(ItemKey::Comment, "Unrelated native comment".into()));
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(2, 2).write_to(&mut png, image::ImageFormat::Png)?;
+        tag.push_picture(
+            Picture::unchecked(png.into_inner())
+                .pic_type(PictureType::CoverFront)
+                .mime_type(MimeType::Png)
+                .description("Preserved artwork")
+                .build(),
+        );
+        native.save_to_path(&path, WriteOptions::new().remove_others(false))?;
+        Ok((temporary, path, tags))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn read_import_update_modify_write_preserves_native_metadata() -> Result<()> {
+        use serde_json::json;
+
+        let (_temporary, path, tags) = native_workflow_fixture()?;
+        let before = crate::tags::read_tag_snapshot(&path)?;
+        let essence = crate::media::decoded_audio_essence_hash(&path)?;
+
+        let mut item = crate::tags::read_tags(&path)?;
+        item.singleton = true;
+        item.extended
+            .flexible_fields
+            .insert("user_rating".into(), crate::FlexibleValue::Integer(42));
+        let mut library = Library::open_in_memory()?;
+        let import = library.create_operation(OperationKind::ImportInPlace, &[])?;
+        library.commit_import(&import, None, &[item])?;
+        library.complete_operation(&import)?;
+        let stored = library.query_items(&Query::all())?;
+        let id = stored
+            .first()
+            .and_then(|item| item.id)
+            .ok_or_else(|| Error::Import("test import has no item".into()))?;
+        library.update_items(&[(id, crate::tags::read_tags(&path)?)])?;
+        library.modify_items(
+            &[id],
+            &[
+                "title=Edited title".into(),
+                "artist=Edited artist".into(),
+                "genre=Edited genre".into(),
+                "year=2025".into(),
+            ],
+        )?;
+        let stored = library.query_items(&Query::all())?;
+        assert_eq!(
+            stored[0].extended.flexible_fields.get("user_rating"),
+            Some(&crate::FlexibleValue::Integer(42))
+        );
+        let plan = TagWritePlan::build(&library, &Query::all())?;
+        let report = TagWriteExecutor::new(&mut library).execute(plan);
+        assert_eq!(report.written, 1, "failures: {:?}", report.failures);
+        let reread = crate::tags::read_tags(&path)?;
+        let mut expected = serde_json::to_value(tags)?;
+        expected["title"] = json!("Edited title");
+        expected["track_artists"] = json!(["Edited artist"]);
+        expected["genres"] = json!(["Edited genre"]);
+        expected["recording_date"] = json!("2025");
+        assert_eq!(
+            serde_json::to_value(canonical_tags(&reread)?)?,
+            expected,
+            "normal workflow lost supported metadata"
+        );
+        let after = crate::tags::read_tag_snapshot(&path)?;
+        assert_eq!(after.unprojected_digest(), before.unprojected_digest());
+        assert_eq!(after.picture_digest(), before.picture_digest());
+        assert_eq!(crate::media::decoded_audio_essence_hash(&path)?, essence);
+        Ok(())
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
