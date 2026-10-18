@@ -5619,6 +5619,69 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
+    fn committed_move_recovery_preserves_source_without_verified_destination() -> Result<()> {
+        for replace_identity in [true, false] {
+            let temporary = tempfile::tempdir()?;
+            let source = temporary.path().join("source");
+            let destination = temporary.path().join("destination");
+            std::fs::write(&source, b"original audio")?;
+            std::fs::write(&destination, b"original audio")?;
+            let metadata = std::fs::metadata(&destination)?;
+            let owned_identity = file_identity(&metadata);
+            let mut library = Library::open_in_memory()?;
+            let operation = library.create_operation(
+                OperationKind::ImportMove,
+                &[JournalFile {
+                    source: source.clone(),
+                    staged: temporary.path().join("staged"),
+                    destination: destination.clone(),
+                    content_hash: Some(hash_path(&source)?),
+                    sha256: None,
+                    source_identity: Some(file_identity(&std::fs::metadata(&source)?)),
+                    owned_identity: Some(owned_identity.clone()),
+                    role: "track".into(),
+                    state: "finalized".into(),
+                }],
+            )?;
+            library.set_operation_state(&operation, "db-committed", None)?;
+            let expected_destination = if replace_identity {
+                std::fs::rename(&destination, temporary.path().join("preserved-destination"))?;
+                std::fs::write(&destination, b"original audio")?;
+                assert_ne!(
+                    file_identity(&std::fs::metadata(&destination)?),
+                    owned_identity
+                );
+                b"original audio"
+            } else {
+                std::fs::write(&destination, b"replaced audio")?;
+                std::fs::File::open(&destination)?.set_modified(metadata.modified()?)?;
+                assert_eq!(
+                    file_identity(&std::fs::metadata(&destination)?),
+                    owned_identity
+                );
+                b"replaced audio"
+            };
+
+            for _ in 0..2 {
+                let report = library.recover_pending()?;
+                assert_eq!(
+                    std::fs::read(&source).ok().as_deref(),
+                    Some(b"original audio".as_slice()),
+                    "move recovery deleted its source without a verified destination: {report:?}"
+                );
+                assert_eq!(std::fs::read(&destination)?, expected_destination);
+                assert_eq!(report.unresolved.len(), 1);
+                assert!(library
+                    .pending_operations()?
+                    .iter()
+                    .any(|pending| pending.id == operation));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
     fn committed_move_recovery_removes_the_original_source() -> Result<()> {
         let temporary = tempfile::tempdir()?;
         let source = temporary.path().join("source");
@@ -5766,6 +5829,66 @@ mod tests {
 
         assert_eq!(report.recovered_operations, [operation]);
         assert_eq!(std::fs::read(staged)?, b"audio");
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn purge_recovery_requires_matching_symlink_evidence() -> Result<()> {
+        for (matching_hash, sha256, should_remove) in [
+            (false, None, false),
+            (true, Some("0".repeat(64)), false),
+            (true, None, true),
+        ] {
+            let temporary = tempfile::tempdir()?;
+            let target = temporary.path().join("target.flac");
+            let staged = temporary.path().join("retained-link.flac");
+            std::fs::write(&target, b"audio")?;
+            std::os::unix::fs::symlink(&target, &staged)?;
+            let identity = file_identity(&std::fs::symlink_metadata(&staged)?);
+            let mut library = Library::open_in_memory()?;
+            let operation = library.create_operation(
+                OperationKind::PurgeDelete,
+                &[JournalFile {
+                    source: temporary.path().join("source-link.flac"),
+                    staged: staged.clone(),
+                    destination: temporary.path().join("source-link.flac"),
+                    content_hash: Some(if matching_hash {
+                        journal_hash_path(&staged, "symlink")?
+                    } else {
+                        "0".repeat(64)
+                    }),
+                    sha256,
+                    source_identity: Some(identity.clone()),
+                    owned_identity: Some(identity),
+                    role: "symlink".into(),
+                    state: "quarantined".into(),
+                }],
+            )?;
+            library.set_operation_state(&operation, "db-committed", None)?;
+
+            let report = library.recover_pending()?;
+
+            if should_remove {
+                assert!(
+                    !journal_entry_exists(&staged)?,
+                    "purge recovery retained a verified symbolic link: {report:?}"
+                );
+                assert_eq!(report.recovered_operations, [operation]);
+            } else {
+                assert_eq!(
+                    std::fs::read_link(&staged).ok().as_deref(),
+                    Some(target.as_path()),
+                    "purge recovery removed a link without matching evidence: {report:?}"
+                );
+                assert_eq!(report.unresolved.len(), 1);
+                assert!(library
+                    .pending_operations()?
+                    .iter()
+                    .any(|pending| pending.id == operation));
+            }
+            assert_eq!(std::fs::read(&target)?, b"audio");
+        }
         Ok(())
     }
 

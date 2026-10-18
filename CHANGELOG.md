@@ -25,8 +25,10 @@ The fresh-process benchmark now checks listing row counts and requests the compl
 Journal property and fuzz checks now verify approval order and preserve saved state after failed actions.
 Recovery tests now detect digest disagreement despite unchanged file identity.
 They also detect attempts to read a replacement named pipe before ownership validation.
+Recovery tests now detect invalid link evidence and unverified move destinations.
 CLI regression tests now use supported import actions on each platform and compare canonical file paths.
 Assertions now show unexpected collection values when tests fail.
+The API compatibility check now uses a tool version that supports Rust 1.99.
 
 Existing-tag imports no longer query online metadata providers.
 Preview and execution use the scanned tags directly.
