@@ -913,7 +913,7 @@ fn machine_output_is_parseable_and_projection_previews_are_read_only(
         ],
     )?;
     assert_success(&results);
-    assert!(!String::from_utf8(results.stdout)?.trim().is_empty());
+    assert_ne!(String::from_utf8(results.stdout)?.trim(), "");
 
     Ok(())
 }
@@ -1197,7 +1197,7 @@ fn native_tag_aliases_and_unknown_values_survive_cli_update_and_write(
             assert_eq!(item.extended.album_artists, ["Artist", "Guest"]);
             assert_eq!(item.extended.composers, ["Artist", "Guest"]);
         } else {
-            assert!(item.extended.composers.is_empty());
+            assert_eq!(item.extended.composers, [] as [String; 0]);
         }
         assert_success(&run(&config, &["verify"])?);
         assert_success(&run(

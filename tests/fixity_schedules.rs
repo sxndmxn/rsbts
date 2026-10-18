@@ -61,7 +61,10 @@ fn invalid_schedule_dates_do_not_persist() -> Result<(), Box<dyn std::error::Err
     let now = Utc::now();
     let id = library.schedule_fixity(FixityMode::Quick, Duration::from_secs(60), now)?;
     assert_eq!(library.plan_due_fixity(now, 10)?.len(), 1);
-    assert!(library.plan_due_fixity(now, 10)?.is_empty());
+    assert_eq!(
+        library.plan_due_fixity(now, 10)?,
+        [] as [rsbts::fixity::FixityPlan; 0]
+    );
     let schedules = library.fixity_schedules_page(None, 10)?;
     assert_eq!(schedules[0].id(), &id);
     assert_eq!((schedules[0].next_run_at() - now).num_seconds(), 60);
