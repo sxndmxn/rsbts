@@ -248,6 +248,15 @@ impl DiscogsConfig {
 }
 
 impl Config {
+    /// Resolve the configuration path without reading or creating the file.
+    pub fn path(path: Option<&Path>) -> Result<PathBuf> {
+        let path = path
+            .map(PathBuf::from)
+            .or_else(|| dirs::config_dir().map(|directory| directory.join("rsbts/config.toml")))
+            .ok_or_else(|| Error::Config("cannot determine the configuration directory".into()))?;
+        make_absolute(path)
+    }
+
     /// Load configuration without creating directories or opening the database.
     pub fn load(path: Option<&Path>) -> Result<Self> {
         let explicit_path = path.is_some();

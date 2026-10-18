@@ -173,7 +173,7 @@ fn fresh_process_catalog_workloads() -> Result<(), Box<dyn std::error::Error>> {
                 OsString::from("--config"),
                 config.clone(),
                 OsString::from("ls"),
-                OsString::from("artist:=\"Artist 42\""),
+                OsString::from("artist:=Artist 42"),
             ],
             Some(item_count / 1_000 + u64::from(item_count % 1_000 >= 42)),
         ),

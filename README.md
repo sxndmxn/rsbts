@@ -1,68 +1,15 @@
 # rsbts
 
-`rsbts` is a plan-first Rust CLI and library for cataloging, matching,
-organizing, auditing, preserving, and removing a local music collection. It
-treats ownership proof, recoverability, provenance, and bounded operation as
-product behavior rather than implementation detail.
+`rsbts` is a Rust music library manager for the main beets workflow.
+It imports albums, matches metadata, organizes files, searches the catalog, and edits tags.
+It also provides file checks and recovery through its command line and library API.
+
+The compatibility target is beets core behavior without plugins.
+Full compatibility is still in progress.
+The [compatibility manifest](compat/beets-2.11.toml) records known gaps against beets 2.11.
 
 The normative product contract is [media-library-requirements.md](docs/media-library-requirements.md),
 derived from [media-library-research.md](docs/media-library-research.md).
-
-## Safety model
-
-- One OS-backed collection lease excludes concurrent mutation and recovery.
-- Every managed file has a path-independent asset UUID, BLAKE3 operational
-  digest, SHA-256 archival digest, byte size, filesystem identity, and explicit
-  verification state. Legacy rows are unverified until `verify` proves them.
-- Preview, durable approval, and execution are separate. Execution revalidates
-  source identity and destination state at the filesystem boundary.
-- Linux mutations use directory-handle-anchored, symlink-rejecting I/O and
-  atomic no-replace publication. A platform without those guarantees rejects
-  mutation; read-only catalog operations remain available.
-- Imports, removals, purge, tags, artwork, paths, ancillary files, manifests,
-  and restores use typed persistent journals. Recovery is idempotent and
-  preserves every candidate when ownership is uncertain.
-- File-removing operations quarantine verified assets. Permanent deletion is a
-  separately previewed and approved `purge` operation with an age policy.
-- Dry runs open a current-schema read-only view. They do not create, copy, or
-  modify the database, library, provider cache, journal, or recovery state.
-- Mutating selections are bounded to 9,999 rows. Lists, histories, schedules,
-  fixity work, and results use explicit limits or keyset pages.
-
-Purge checks file identity after acquisition and again before deletion.
-Changed files remain available for recovery review.
-Recovery keeps one parent directory handle while it acquires, checks, and
-deletes a retained file. Missing retained files receive completed cleanup
-records. Files restored during rollback remain eligible for a later purge.
-
-Successful recovery updates the journal and linked active plan in one transaction.
-Committed work completes the plan. Rolled-back work fails the plan.
-Recovery preserves terminal plans and their existing events.
-Uncertain file ownership leaves the operation pending for review.
-
-Database symbolic links use the resolved database path for locking and writes.
-On Unix, rsbts rejects database files with multiple hard links.
-
-Registered roots must be online for import, move, tag, artwork, path, ancillary,
-removal, and purge file changes.
-Catalog-only import and removal remain available when a root is offline.
-Purge checks the retained file's original root policy.
-Import, move, and ancillary operations check each destination for disabled child roots.
-Equivalent root paths reuse the saved identity and policy.
-
-Root paths containing `..` fail before directory creation.
-Moves require source files to match their stored verification evidence.
-Unverified or replaced files require review and explicit verification before a move.
-
-Tag, artwork, path, ancillary, removal, manifest, and restore execution must
-match the saved approved plan.
-Changes to the reviewed plan require a new preview and approval.
-Previously saved plans with incomplete approval evidence also require a new
-preview and approval.
-Typed approval methods check the complete saved request and preview.
-
-Dry-run snapshots remain read-only after in-memory migration.
-They cannot create durable plans or run recovery.
 
 ## Install
 
@@ -90,6 +37,9 @@ rsbts import --existing-tags --dry-run ~/Music/Incoming/album
 rsbts import --existing-tags --yes ~/Music/Incoming/album
 rsbts import --in-place ~/Music/Already-Organized/album
 rsbts ls --limit 100
+rsbts ls 'artist:Black Sabbath' year:1969..1979 year+
+rsbts ls -a year:1970
+rsbts ls -p 'album:Paranoid'
 rsbts audit
 ```
 
@@ -103,6 +53,23 @@ cp config.example.toml ~/.config/rsbts/config.toml
 Relative paths in an explicit config resolve from that config's directory.
 Missing explicit config files, unknown TOML keys, non-finite thresholds, and
 invalid path templates fail closed.
+
+Use `-l DATABASE` and `-d DIRECTORY` before the command to override the configured library paths.
+Relative override paths resolve from the current directory.
+
+```bash
+rsbts -l ./library.db -d ./Music stats
+rsbts config
+rsbts config --path
+rsbts config --default
+rsbts fields
+```
+
+`config` prints the effective TOML configuration.
+`config --default` prints built-in defaults.
+`config` and `fields` do not create a database or music directory.
+`fields` includes stored custom field names when a database exists.
+Use `flex.NAME` to query a custom field.
 
 ### Migrating an existing Beets catalog
 
@@ -184,9 +151,12 @@ results are disclosed and cannot satisfy unattended acceptance gates.
 ## Query and machine output
 
 ```bash
-rsbts ls 'artist:"Black Sabbath" year:1969..1979 year+' --limit 100
+rsbts ls 'artist:Black Sabbath' year:1969..1979 year+ --limit 100
 rsbts ls --album paranoid --limit 50
+rsbts ls -af '$albumartist - $album ($year)' year:1970
+rsbts ls -p 'artist:=~Black Sabbath'
 rsbts --output json stats
+rsbts --output json stats 'album:=Paranoid' length:180..
 rsbts --output jsonl ls --limit 100
 rsbts update 'artist:=Beatles'
 rsbts modify 'album:=Paranoid' genre=Metal year=1970
@@ -202,23 +172,43 @@ Changes to identity fields can clear associated catalog identifiers.
 `modify` keeps artist, album artist, genre, and year consistent with later tag writes.
 
 Filters support literal substrings `field:value`, exact values `field:=value`,
+case-insensitive exact values `field:=~value`,
 regular expressions `field::pattern`, SQLite globs `field:~pattern`, and ranges.
 They also support `^` negation, relative added dates such as `added:-7d`, and
 `+`/`-` sort suffixes. Separate alternative filter groups with `,`.
 Values are bound SQL parameters. Empty or malformed mutating queries fail
 before database open or recovery.
 
-Quoted query values preserve literal backslashes. Use `\"` for a quoted
-double quote and `\\` for a backslash.
+The shell handles quoting for command-line queries.
+Pass each filter or sort term as a separate argument.
+A quoted phrase forms one search term.
+Backslashes and quote characters inside an argument remain literal.
+This applies to listing, statistics, updates, verification, modification, writing, moving, and removal.
+
+Bare keywords use literal substring matching across title, artist, album, album artist, and genre.
+Use `=value` for exact matching and `=~value` for exact matching that ignores case.
+Use `:pattern` for regular expression matching across those fields.
+Album queries use album fields and can filter member tracks by fields such as `title`.
+
+`ls -p` prints file paths or album directories.
+`ls -f FORMAT` substitutes `$field` and `${field}` without changing metadata text.
+`$$` prints one dollar sign. Unknown fields remain in the format.
+Custom fields use `$NAME` or `${flex.NAME}`.
+List formats currently support field substitution. Beets template functions remain a compatibility gap.
+Path and format output require text output.
 
 Exact and range filters compare numeric custom fields as numbers.
 The same filters retain text comparison for custom fields stored as strings.
+
+Numeric fields use equality unless the query supplies a range or an explicit matching operator.
+For example, `track:1` does not match track 11.
+`singleton:true` and `singleton:false` select tracks by album membership status.
 
 For `rm`, `modify`, `write`, and `move`, an explicit query must contain a filter.
 Sort terms alone fail before database open or recovery. Use `--all` to select
 every item for `write` or `move`.
 
-Track listings apply sort terms before `--limit`. The default limit is 1,000
+Track and album listings apply sort terms before `--limit`. The default limit is 1,000
 rows. The allowed range is 1 to 100,000 rows. Invalid relative dates, purge
 ages, and list limits fail before database open or recovery.
 
@@ -227,6 +217,10 @@ This includes original dates, separate artist lists, provider identifiers, and c
 Each imported album group stores release metadata shared by all its tracks.
 Tracks retain individual values when album values conflict or are missing.
 Per-disc track totals and recording identifiers remain attached to tracks.
+
+Listings load extended metadata in batches of 256 records.
+Filtered statistics run directly in SQLite without loading media files or extended metadata.
+Unfiltered statistics retain the cached aggregate.
 
 Write and move plans reject selections above 9,999 rows before reading media
 files. Narrow the query to select fewer rows.
@@ -249,6 +243,62 @@ preview.
 Exit status is 0 for success, 2 for a completed result containing issues or
 partial work, and 1 for validation or fatal runtime failure. Clap uses status 2
 for command-line syntax errors.
+
+## Safety model
+
+- One OS-backed collection lease excludes concurrent mutation and recovery.
+- Every managed file has a path-independent asset UUID, BLAKE3 operational
+  digest, SHA-256 archival digest, byte size, filesystem identity, and explicit
+  verification state. Legacy rows are unverified until `verify` proves them.
+- Preview, durable approval, and execution are separate. Execution revalidates
+  source identity and destination state at the filesystem boundary.
+- Linux mutations use directory-handle-anchored, symlink-rejecting I/O and
+  atomic no-replace publication. A platform without those guarantees rejects
+  mutation; read-only catalog operations remain available.
+- Imports, removals, purge, tags, artwork, paths, ancillary files, manifests,
+  and restores use typed persistent journals. Recovery is idempotent and
+  preserves every candidate when ownership is uncertain.
+- File-removing operations quarantine verified assets. Permanent deletion is a
+  separately previewed and approved `purge` operation with an age policy.
+- Dry runs open a current-schema read-only view. They do not create, copy, or
+  modify the database, library, provider cache, journal, or recovery state.
+- Mutating selections are bounded to 9,999 rows. Lists, histories, schedules,
+  fixity work, and results use explicit limits or keyset pages.
+
+Purge checks file identity after acquisition and again before deletion.
+Changed files remain available for recovery review.
+Recovery keeps one parent directory handle while it acquires, checks, and
+deletes a retained file. Missing retained files receive completed cleanup
+records. Files restored during rollback remain eligible for a later purge.
+
+Successful recovery updates the journal and linked active plan in one transaction.
+Committed work completes the plan. Rolled-back work fails the plan.
+Recovery preserves terminal plans and their existing events.
+Uncertain file ownership leaves the operation pending for review.
+
+Database symbolic links use the resolved database path for locking and writes.
+On Unix, rsbts rejects database files with multiple hard links.
+
+Registered roots must be online for import, move, tag, artwork, path, ancillary,
+removal, and purge file changes.
+Catalog-only import and removal remain available when a root is offline.
+Purge checks the retained file's original root policy.
+Import, move, and ancillary operations check each destination for disabled child roots.
+Equivalent root paths reuse the saved identity and policy.
+
+Root paths containing `..` fail before directory creation.
+Moves require source files to match their stored verification evidence.
+Unverified or replaced files require review and explicit verification before a move.
+
+Tag, artwork, path, ancillary, removal, manifest, and restore execution must
+match the saved approved plan.
+Changes to the reviewed plan require a new preview and approval.
+Previously saved plans with incomplete approval evidence also require a new
+preview and approval.
+Typed approval methods check the complete saved request and preview.
+
+Dry-run snapshots remain read-only after in-memory migration.
+They cannot create durable plans or run recovery.
 
 ## Audit, fixity, and integrity
 

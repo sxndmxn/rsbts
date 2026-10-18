@@ -2,6 +2,11 @@
 
 ## Project
 
+The product target is the beets core workflow in Rust.
+Plugins are outside scope.
+Historical plugin proposals in `ARCHITECTURE_ROADMAP.md` do not define current product scope.
+Prioritize simple core commands, reliable file operations, and measured performance.
+
 `rsbts` is a Rust CLI and reusable library for planning, matching, importing,
 querying, updating, and removing a local music collection. It treats file
 ownership, database consistency, and recoverability as product requirements.

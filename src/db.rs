@@ -1,6 +1,6 @@
 //! SQLite-backed library, audit, journal, and recovery APIs.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -22,6 +22,8 @@ use crate::{
     validate_album_metadata, validate_item_metadata, Album, AudioFormat, Error, ExtendedMetadata,
     ExternalId, FlexibleValue, Item, Result,
 };
+
+const METADATA_BATCH_SIZE: usize = 256;
 
 #[cfg(test)]
 thread_local! {
@@ -793,12 +795,54 @@ impl Library {
         compiled.sql.push_str(", id ASC LIMIT ?");
         compiled.parameters.push(Value::Integer(i64::from(limit)));
         let mut statement = self.conn.prepare(&compiled.sql)?;
-        let rows =
+        let mut rows =
             statement.query_map(params_from_iter(compiled.parameters.iter()), row_to_item)?;
-        for row in rows {
-            let mut item = row?;
-            hydrate_items(&self.conn, std::slice::from_mut(&mut item))?;
-            visitor(item)?;
+        loop {
+            let mut page = rows
+                .by_ref()
+                .take(METADATA_BATCH_SIZE)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            if page.is_empty() {
+                break;
+            }
+            hydrate_items(&self.conn, &mut page)?;
+            for item in page {
+                visitor(item)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Stream albums in query order with a bounded metadata buffer.
+    pub fn visit_albums(
+        &self,
+        query: &Query,
+        limit: u32,
+        mut visitor: impl FnMut(Album) -> Result<()>,
+    ) -> Result<()> {
+        if limit == 0 || limit > 100_000 {
+            return Err(Error::Query(
+                "list limit must be between 1 and 100000".into(),
+            ));
+        }
+        let mut compiled = query.compile_albums();
+        compiled.sql.push_str(", id ASC LIMIT ?");
+        compiled.parameters.push(Value::Integer(i64::from(limit)));
+        let mut statement = self.conn.prepare(&compiled.sql)?;
+        let mut rows =
+            statement.query_map(params_from_iter(compiled.parameters.iter()), row_to_album)?;
+        loop {
+            let mut page = rows
+                .by_ref()
+                .take(METADATA_BATCH_SIZE)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            if page.is_empty() {
+                break;
+            }
+            hydrate_albums(&self.conn, &mut page)?;
+            for album in page {
+                visitor(album)?;
+            }
         }
         Ok(())
     }
@@ -1012,6 +1056,49 @@ impl Library {
                 },
             )
             .map_err(Into::into)
+    }
+
+    /// Aggregate selected rows in `SQLite` without reading media or extended metadata.
+    /// Unfiltered queries use the transactionally maintained statistics.
+    pub fn stats_matching(&self, query: &Query) -> Result<Stats> {
+        if !query.has_filters() {
+            return self.stats();
+        }
+        let compiled = query.compile();
+        let (selection, _) = compiled
+            .sql
+            .rsplit_once(" ORDER BY ")
+            .ok_or_else(|| Error::Query("compiled query has no stable ordering".into()))?;
+        let sql = format!(
+            "SELECT COUNT(*), COUNT(DISTINCT album_id), COUNT(DISTINCT artist),
+                    COALESCE(SUM(length), 0.0), COALESCE(SUM(file_size), 0),
+                    COALESCE(SUM(file_size IS NULL), 0)
+             FROM ({selection})"
+        );
+        self.conn
+            .query_row(&sql, params_from_iter(compiled.parameters), |row| {
+                Ok(Stats {
+                    tracks: row.get(0)?,
+                    albums: row.get(1)?,
+                    artists: row.get(2)?,
+                    total_length: row.get(3)?,
+                    total_size: row.get(4)?,
+                    unknown_sizes: row.get(5)?,
+                })
+            })
+            .map_err(Into::into)
+    }
+
+    /// List custom metadata fields for command discovery.
+    pub fn flexible_field_names(&self, albums: bool) -> Result<Vec<String>> {
+        let mut statement = self.conn.prepare(
+            "SELECT DISTINCT field FROM entity_metadata
+             WHERE entity_type = ?1 AND field != '__core' ORDER BY field",
+        )?;
+        let names = statement
+            .query_map([if albums { "album" } else { "item" }], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(names)
     }
 
     pub fn update_item(&self, id: i64, item: &Item) -> Result<()> {
@@ -2576,18 +2663,26 @@ fn insert_item(transaction: &Transaction<'_>, item: &Item, album_id: Option<i64>
 }
 
 fn hydrate_items(conn: &Connection, items: &mut [Item]) -> Result<()> {
-    for item in items {
-        if let Some(id) = item.id {
-            item.extended = load_extended_metadata(conn, "item", id)?;
+    for page in items.chunks_mut(METADATA_BATCH_SIZE) {
+        let ids = page.iter().filter_map(|item| item.id).collect::<Vec<_>>();
+        let mut metadata = load_extended_metadata_batch(conn, "item", &ids)?;
+        for item in page {
+            if let Some(id) = item.id {
+                item.extended = metadata.remove(&id).unwrap_or_default();
+            }
         }
     }
     Ok(())
 }
 
 fn hydrate_albums(conn: &Connection, albums: &mut [Album]) -> Result<()> {
-    for album in albums {
-        if let Some(id) = album.id {
-            album.extended = load_extended_metadata(conn, "album", id)?;
+    for page in albums.chunks_mut(METADATA_BATCH_SIZE) {
+        let ids = page.iter().filter_map(|album| album.id).collect::<Vec<_>>();
+        let mut metadata = load_extended_metadata_batch(conn, "album", &ids)?;
+        for album in page {
+            if let Some(id) = album.id {
+                album.extended = metadata.remove(&id).unwrap_or_default();
+            }
         }
     }
     Ok(())
@@ -2754,48 +2849,86 @@ fn load_extended_metadata(
     entity_type: &str,
     entity_id: i64,
 ) -> Result<ExtendedMetadata> {
-    let core = conn
-        .query_row(
-            "SELECT value_json FROM entity_metadata
-             WHERE entity_type = ?1 AND entity_id = ?2 AND field = '__core'",
-            params![entity_type, entity_id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    let mut metadata = core.map_or_else(
-        || Ok(ExtendedMetadata::default()),
-        |json| {
-            serde_json::from_str(&json)
-                .map_err(|error| Error::Recovery(format!("invalid stored metadata: {error}")))
-        },
-    )?;
-    let mut statement = conn.prepare(
-        "SELECT field, value_json FROM entity_metadata
-         WHERE entity_type = ?1 AND entity_id = ?2 AND field != '__core'
-         ORDER BY field, ordinal",
-    )?;
-    let rows = statement.query_map(params![entity_type, entity_id], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    Ok(
+        load_extended_metadata_batch(conn, entity_type, &[entity_id])?
+            .remove(&entity_id)
+            .unwrap_or_default(),
+    )
+}
+
+fn load_extended_metadata_batch(
+    conn: &Connection,
+    entity_type: &str,
+    ids: &[i64],
+) -> Result<HashMap<i64, ExtendedMetadata>> {
+    let mut metadata = ids
+        .iter()
+        .map(|id| (*id, ExtendedMetadata::default()))
+        .collect::<HashMap<_, _>>();
+    if ids.is_empty() {
+        return Ok(metadata);
+    }
+    let placeholders = std::iter::repeat_n("?", ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let parameters = std::iter::once(Value::Text(entity_type.to_string()))
+        .chain(ids.iter().map(|id| Value::Integer(*id)))
+        .collect::<Vec<_>>();
+    let mut statement = conn.prepare_cached(&format!(
+        "SELECT entity_id, field, value_json FROM entity_metadata
+         WHERE entity_type = ? AND entity_id IN ({placeholders})
+         ORDER BY entity_id, field != '__core', field, ordinal"
+    ))?;
+    let rows = statement.query_map(params_from_iter(&parameters), |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
     })?;
     for row in rows {
-        let (field, json) = row?;
-        let value = serde_json::from_str::<FlexibleValue>(&json)
-            .map_err(|error| Error::Recovery(format!("invalid flexible field {field}: {error}")))?;
-        metadata.flexible_fields.insert(field, value);
+        let (id, field, json) = row?;
+        if field == "__core" {
+            let value = serde_json::from_str(&json)
+                .map_err(|error| Error::Recovery(format!("invalid stored metadata: {error}")))?;
+            metadata.insert(id, value);
+        } else {
+            let value = serde_json::from_str::<FlexibleValue>(&json).map_err(|error| {
+                Error::Recovery(format!("invalid flexible field {field}: {error}"))
+            })?;
+            metadata
+                .entry(id)
+                .or_default()
+                .flexible_fields
+                .insert(field, value);
+        }
     }
-    let mut statement = conn.prepare(
-        "SELECT provider, kind, value FROM library_external_ids
-         WHERE entity_type = ?1 AND entity_id = ?2 ORDER BY provider, kind, value",
-    )?;
-    metadata.external_ids = statement
-        .query_map(params![entity_type, entity_id], |row| {
-            Ok(ExternalId {
-                provider: row.get(0)?,
-                kind: row.get(1)?,
-                value: row.get(2)?,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for value in metadata.values_mut() {
+        value.external_ids.clear();
+    }
+    let mut statement = conn.prepare_cached(&format!(
+        "SELECT entity_id, provider, kind, value FROM library_external_ids
+         WHERE entity_type = ? AND entity_id IN ({placeholders})
+         ORDER BY entity_id, provider, kind, value"
+    ))?;
+    let rows = statement.query_map(params_from_iter(&parameters), |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            ExternalId {
+                provider: row.get(1)?,
+                kind: row.get(2)?,
+                value: row.get(3)?,
+            },
+        ))
+    })?;
+    for row in rows {
+        let (id, external_id) = row?;
+        metadata
+            .entry(id)
+            .or_default()
+            .external_ids
+            .push(external_id);
+    }
     Ok(metadata)
 }
 
