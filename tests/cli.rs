@@ -968,7 +968,7 @@ fn disposable_cli_workflow_is_atomic_and_confirmation_safe(
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stdout).contains("Missing managed asset"));
 
-    let output = run(&config_path, &["verify", "artist:=\"Test Artist\""])?;
+    let output = run(&config_path, &["verify", "artist:=Test Artist"])?;
     assert_success(&output);
     assert!(String::from_utf8_lossy(&output.stdout).contains("Verified 1 asset(s)"));
 
@@ -987,7 +987,7 @@ fn disposable_cli_workflow_is_atomic_and_confirmation_safe(
         &config_path,
         &[
             "modify",
-            "artist:=\"Test Artist\"",
+            "artist:=Test Artist",
             "title=Changed",
             "year=2024",
         ],
@@ -999,7 +999,7 @@ fn disposable_cli_workflow_is_atomic_and_confirmation_safe(
         &config_path,
         &[
             "modify",
-            "artist:=\"Test Artist\"",
+            "artist:=Test Artist",
             "title=Must Not Persist",
             "year=not-a-year",
         ],
@@ -1019,14 +1019,14 @@ fn disposable_cli_workflow_is_atomic_and_confirmation_safe(
     let output = run_preserving_database(
         &config_path,
         &database_path,
-        &["rm", "--delete", "--dry-run", "artist:=\"Test Artist\""],
+        &["rm", "--delete", "--dry-run", "artist:=Test Artist"],
     )?;
     assert_success(&output);
     assert!(track_path.exists(), "dry-run must preserve the file");
 
     let output = run(
         &config_path,
-        &["rm", "--delete", "--yes", "artist:=\"Test Artist\""],
+        &["rm", "--delete", "--yes", "artist:=Test Artist"],
     )?;
     assert_success(&output);
     assert!(

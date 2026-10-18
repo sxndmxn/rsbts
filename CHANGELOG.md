@@ -6,6 +6,26 @@ breaks.
 
 ## [Unreleased]
 
+### Core commands
+
+The compatibility target now excludes plugins.
+All query commands accept separate shell arguments and preserve quoted phrases.
+Existing scripts must pass each filter and sort term separately.
+
+Album lists now apply field filters and sort before the row limit.
+Bare keywords now match substrings across core text fields.
+Queries support `=~` exact matching without case and unqualified regular expressions.
+Track IDs and album IDs can select and sort records.
+Numeric fields now compare numbers instead of matching text fragments.
+File size, singleton status, and album artwork paths are available as query fields.
+
+Added `ls -p`, `ls -f`, and `ls -l` for paths, field formats, and row limits.
+Added filtered statistics, configuration display, and field discovery.
+Added `-l` and `-d` library path overrides before the command.
+
+Listings now read extended metadata in batches of 256 records.
+Batch reads preserve native metadata, custom fields, and stored provider identifiers.
+
 ### Fixed
 
 Track and album JSON and JSONL listings now include stored extended metadata.

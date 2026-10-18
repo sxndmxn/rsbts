@@ -27,6 +27,10 @@ use rsbts::{Error, Result};
 
 use crate::{Commands, FixityCommand, MigrateSource, OutputFormat, PlanCommand};
 
+mod display;
+
+use display::DisplayTemplate;
+
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
     #[error(transparent)]
@@ -143,11 +147,56 @@ pub enum Outcome {
 pub async fn run(
     command: Commands,
     config_path: Option<PathBuf>,
+    library_path: Option<PathBuf>,
+    directory: Option<PathBuf>,
     output: OutputFormat,
     streams: &mut Streams<'_>,
 ) -> CliResult<Outcome> {
-    let config = Config::load(config_path.as_deref())?;
+    let mut config = if matches!(&command, Commands::Config { defaults: true, .. }) {
+        Config::default()
+    } else {
+        Config::load(config_path.as_deref())?
+    };
+    if let Some(path) = library_path {
+        config.library.database = std::path::absolute(path).map_err(Error::from)?;
+    }
+    if let Some(path) = directory {
+        config.library.directory = std::path::absolute(path).map_err(Error::from)?;
+    }
     preflight(&command)?;
+    if output != OutputFormat::Text
+        && matches!(
+            &command,
+            Commands::List { path: true, .. }
+                | Commands::List {
+                    format: Some(_),
+                    ..
+                }
+        )
+    {
+        return Err(Error::Config("list --path and --format require text output".into()).into());
+    }
+    match &command {
+        Commands::Config { path, .. } => {
+            if *path {
+                let path = Config::path(config_path.as_deref())?;
+                if output == OutputFormat::Text {
+                    outln!(streams, "{}", terminal_safe(path.display()));
+                } else {
+                    emit(output, &serde_json::json!({"path": path}))?;
+                }
+            } else if output == OutputFormat::Text {
+                let text = toml::to_string_pretty(&config)
+                    .map_err(|error| Error::Config(error.to_string()))?;
+                outln!(streams, "{}", text.trim_end());
+            } else {
+                emit(output, &config)?;
+            }
+            return Ok(Outcome::Success);
+        }
+        Commands::Fields => return fields(&config, output, streams),
+        _ => {}
+    }
     if output != OutputFormat::Text
         && matches!(
             &command,
@@ -242,7 +291,7 @@ pub async fn run(
     let ordinary_read = matches!(
         &command,
         Commands::List { .. }
-            | Commands::Stats
+            | Commands::Stats { .. }
             | Commands::Integrity
             | Commands::Fixity {
                 action: FixityCommand::Results { .. }
@@ -305,36 +354,35 @@ pub async fn run(
         Commands::List {
             query,
             album,
+            path,
+            format,
             limit,
-        } => list(&library, query.as_deref(), album, limit, output).map_err(Into::into),
-        Commands::Stats => stats(&library, output, streams),
+        } => list(
+            &library,
+            &query,
+            album,
+            path,
+            format.as_deref(),
+            limit,
+            output,
+        )
+        .map_err(Into::into),
+        Commands::Stats { query } => stats(&library, &query, output, streams),
         Commands::Audit { deep } => audit(&library, deep, output, streams),
         Commands::Integrity => integrity(&library, output).map_err(Into::into),
         Commands::Fixity { action } => {
             fixity_command(&library, &action, output).map_err(Into::into)
         }
-        Commands::Verify { query } => verify(
-            &mut library,
-            &config.library.directory,
-            query.as_deref(),
-            output,
-        )
-        .map_err(Into::into),
-        Commands::Update { query } => update(&library, query.as_deref(), output, streams),
+        Commands::Verify { query } => {
+            verify(&mut library, &config.library.directory, &query, output).map_err(Into::into)
+        }
+        Commands::Update { query } => update(&library, &query, output, streams),
         Commands::Write {
             query,
             all,
             dry_run,
             yes,
-        } => write_tags(
-            &mut library,
-            query.as_deref(),
-            all,
-            dry_run,
-            yes,
-            output,
-            streams,
-        ),
+        } => write_tags(&mut library, &query, all, dry_run, yes, output, streams),
         Commands::Move {
             query,
             all,
@@ -343,7 +391,7 @@ pub async fn run(
         } => move_files(
             &mut library,
             &config,
-            query.as_deref(),
+            &query,
             all,
             dry_run,
             yes,
@@ -361,7 +409,10 @@ pub async fn run(
             dry_run,
             yes,
         } => purge(&mut library, older_than_days, dry_run, yes, output).map_err(Into::into),
-        Commands::Modify { query, fields } => modify(&library, &query, &fields, output, streams),
+        Commands::Modify { arguments } => {
+            let (query, fields) = modification_parts(&arguments)?;
+            modify(&library, query, fields, output, streams)
+        }
         Commands::ProviderRefresh {
             entity_kind,
             entity_id,
@@ -408,10 +459,9 @@ pub async fn run(
         )
         .map_err(Into::into),
         Commands::Plan { action } => plan_command(&library, &action, output).map_err(Into::into),
-        Commands::Migrate { .. } => Err(Error::Config(
-            "migration command was not dispatched during preflight".into(),
-        )
-        .into()),
+        Commands::Migrate { .. } | Commands::Config { .. } | Commands::Fields => Err(
+            Error::Config("migration command was not dispatched during preflight".into()).into(),
+        ),
     }
 }
 
@@ -419,21 +469,27 @@ fn preflight(command: &Commands) -> Result<()> {
     match command {
         Commands::List {
             query,
-            album,
+            format,
             limit,
+            ..
         } => {
             list_limit(*limit)?;
-            if !album {
-                parse_query(query.as_deref())?;
+            Query::parse_args(query)?;
+            if let Some(template) = format {
+                DisplayTemplate::parse(template)?;
             }
         }
+        Commands::Stats { query } => {
+            Query::parse_args(query)?;
+        }
         Commands::Update { query } | Commands::Verify { query } => {
-            parse_query(query.as_deref())?;
+            parse_query(query)?;
         }
         Commands::Remove { query, .. } => {
             require_selection(query, "removal")?;
         }
-        Commands::Modify { query, fields } => {
+        Commands::Modify { arguments } => {
+            let (query, fields) = modification_parts(arguments)?;
             require_selection(query, "modify")?;
             validate_modification_fields(fields)?;
         }
@@ -467,15 +523,12 @@ fn preflight(command: &Commands) -> Result<()> {
         Commands::Fixity { action } => preflight_fixity(action)?,
         Commands::Write { query, all, .. } | Commands::Move { query, all, .. } => {
             if *all {
-                if query.is_some() {
+                if !query.is_empty() {
                     return Err(Error::Query(
                         "operation accepts either --all or a query, not both".into(),
                     ));
                 }
             } else {
-                let query = query.as_deref().ok_or_else(|| {
-                    Error::Query("operation requires --all or an explicit query".into())
-                })?;
                 require_selection(query, "operation")?;
             }
         }
@@ -485,7 +538,8 @@ fn preflight(command: &Commands) -> Result<()> {
             PurgePlan::retention_cutoff(*older_than_days)?;
         }
         Commands::Import { .. }
-        | Commands::Stats
+        | Commands::Config { .. }
+        | Commands::Fields
         | Commands::Audit { .. }
         | Commands::Integrity
         | Commands::Migrate { .. } => {}
@@ -1039,57 +1093,63 @@ fn list_limit(limit: Option<u32>) -> Result<u32> {
 
 fn list(
     library: &Library,
-    query: Option<&str>,
+    arguments: &[String],
     album: bool,
+    path: bool,
+    format: Option<&str>,
     limit: Option<u32>,
     output: OutputFormat,
 ) -> Result<Outcome> {
     let limit = list_limit(limit)?;
+    let query = Query::parse_args(arguments)?;
+    let template = format.map(DisplayTemplate::parse).transpose()?;
     if album {
-        let mut after = None;
-        let mut remaining = limit;
         let mut json_albums = Vec::new();
-        while remaining > 0 {
-            let page_size = remaining.min(1_000);
-            let page = library.query_albums_page(query, after, page_size)?;
-            if page.is_empty() {
-                break;
-            }
-            for album in &page {
-                if output == OutputFormat::Json {
-                    json_albums.push(album.clone());
-                } else if output == OutputFormat::Jsonl {
-                    emit(output, album)?;
-                } else {
-                    let year = album
-                        .year
-                        .map_or_else(String::new, |year| format!(" ({year})"));
-                    println!(
-                        "{} - {}{year}",
-                        terminal_safe(&album.albumartist),
-                        terminal_safe(&album.album)
-                    );
+        library.visit_albums(&query, limit, |album| {
+            if output == OutputFormat::Json {
+                json_albums.push(album);
+            } else if output == OutputFormat::Jsonl {
+                emit(output, &album)?;
+            } else if path {
+                let id = album
+                    .id
+                    .ok_or_else(|| Error::Query("album has no catalog ID".into()))?;
+                let tracks = library.query_items_page(
+                    &Query::parse(&format!("album_id:={id}"))?,
+                    None,
+                    1,
+                )?;
+                if let Some(directory) = tracks.first().and_then(|item| item.path.parent()) {
+                    println!("{}", terminal_safe(directory.display()));
                 }
+            } else if let Some(template) = &template {
+                println!("{}", terminal_safe(template.album(&album)));
+            } else {
+                let year = album
+                    .year
+                    .map_or_else(String::new, |year| format!(" ({year})"));
+                println!(
+                    "{} - {}{year}",
+                    terminal_safe(&album.albumartist),
+                    terminal_safe(&album.album)
+                );
             }
-            let emitted = u32::try_from(page.len())
-                .map_err(|_error| Error::Query("list page is too large".into()))?;
-            remaining = remaining.saturating_sub(emitted);
-            after = page.last().and_then(|album| album.id);
-            if page.len() < page_size as usize {
-                break;
-            }
-        }
+            Ok(())
+        })?;
         if output == OutputFormat::Json {
             emit(output, &json_albums)?;
         }
     } else {
-        let query = parse_query(query)?;
         let mut json_items = Vec::new();
         library.visit_items(&query, limit, |item| {
             if output == OutputFormat::Json {
                 json_items.push(item);
             } else if output == OutputFormat::Jsonl {
                 emit(output, &item)?;
+            } else if path {
+                println!("{}", terminal_safe(item.path.display()));
+            } else if let Some(template) = &template {
+                println!("{}", terminal_safe(template.item(&item)));
             } else {
                 println!(
                     "{} - {} - {} [{}]",
@@ -1108,8 +1168,13 @@ fn list(
     Ok(Outcome::Success)
 }
 
-fn stats(library: &Library, output: OutputFormat, streams: &mut Streams<'_>) -> CliResult<Outcome> {
-    let stats = library.stats()?;
+fn stats(
+    library: &Library,
+    arguments: &[String],
+    output: OutputFormat,
+    streams: &mut Streams<'_>,
+) -> CliResult<Outcome> {
+    let stats = library.stats_matching(&Query::parse_args(arguments)?)?;
     if output != OutputFormat::Text {
         emit(output, &stats)?;
         return Ok(Outcome::Success);
@@ -1121,6 +1186,39 @@ fn stats(library: &Library, output: OutputFormat, streams: &mut Streams<'_>) -> 
     println!("Total size: {}", format_size(stats.total_size));
     if stats.unknown_sizes > 0 {
         outln!(streams, "Unknown file sizes: {}", stats.unknown_sizes);
+    }
+    Ok(Outcome::Success)
+}
+
+fn fields(config: &Config, output: OutputFormat, streams: &mut Streams<'_>) -> CliResult<Outcome> {
+    let mut item = display::ITEM_FIELDS
+        .iter()
+        .map(|field| (*field).to_string())
+        .collect::<Vec<_>>();
+    let mut album = display::ALBUM_FIELDS
+        .iter()
+        .map(|field| (*field).to_string())
+        .collect::<Vec<_>>();
+    if config.library.database.exists() {
+        let library = Library::open_read_only(&config.library.database)?;
+        item.extend(library.flexible_field_names(false)?);
+        album.extend(library.flexible_field_names(true)?);
+    }
+    item.sort_unstable();
+    item.dedup();
+    album.sort_unstable();
+    album.dedup();
+    if output == OutputFormat::Text {
+        outln!(streams, "Item fields:");
+        for field in &item {
+            outln!(streams, "  {}", terminal_safe(field));
+        }
+        outln!(streams, "Album fields:");
+        for field in &album {
+            outln!(streams, "  {}", terminal_safe(field));
+        }
+    } else {
+        emit(output, &serde_json::json!({"item": item, "album": album}))?;
     }
     Ok(Outcome::Success)
 }
@@ -1371,7 +1469,7 @@ fn integrity(library: &Library, output: OutputFormat) -> Result<Outcome> {
 
 fn update(
     library: &Library,
-    query: Option<&str>,
+    query: &[String],
     output: OutputFormat,
     streams: &mut Streams<'_>,
 ) -> CliResult<Outcome> {
@@ -1430,7 +1528,7 @@ fn update(
 fn verify(
     library: &mut Library,
     root: &std::path::Path,
-    query: Option<&str>,
+    query: &[String],
     output: OutputFormat,
 ) -> Result<Outcome> {
     let query = parse_query(query)?;
@@ -1467,7 +1565,7 @@ fn verify(
 
 fn write_tags(
     library: &mut Library,
-    raw_query: Option<&str>,
+    raw_query: &[String],
     all: bool,
     dry_run: bool,
     yes: bool,
@@ -1477,8 +1575,6 @@ fn write_tags(
     let query = if all {
         Query::all()
     } else {
-        let raw_query = raw_query
-            .ok_or_else(|| Error::Query("write requires --all or an explicit query".into()))?;
         require_selection(raw_query, "write")?
     };
     let plan = TagWritePlan::build(library, &query)?;
@@ -1551,7 +1647,7 @@ fn write_tags(
 fn move_files(
     library: &mut Library,
     config: &Config,
-    raw_query: Option<&str>,
+    raw_query: &[String],
     all: bool,
     dry_run: bool,
     yes: bool,
@@ -1561,8 +1657,6 @@ fn move_files(
     let query = if all {
         Query::all()
     } else {
-        let raw_query = raw_query
-            .ok_or_else(|| Error::Query("move requires --all or an explicit query".into()))?;
         require_selection(raw_query, "move")?
     };
     let plan = MovePlan::build(
@@ -1808,7 +1902,7 @@ fn migrate_beets(
 
 fn remove(
     library: &mut Library,
-    raw_query: &str,
+    raw_query: &[String],
     delete: bool,
     dry_run: bool,
     yes: bool,
@@ -1952,7 +2046,7 @@ fn purge(
 
 fn modify(
     library: &Library,
-    raw_query: &str,
+    raw_query: &[String],
     fields: &[String],
     output: OutputFormat,
     streams: &mut Streams<'_>,
@@ -2499,29 +2593,40 @@ fn emit<T: serde::Serialize>(output: OutputFormat, value: &T) -> Result<()> {
     stdout.lock().write_all(&bytes).map_err(Error::Stdout)
 }
 
-fn parse_query(query: Option<&str>) -> Result<Query> {
-    match query {
-        None => Ok(Query::all()),
-        Some(query) if query.trim().is_empty() => Err(Error::Query(
+fn parse_query(query: &[String]) -> Result<Query> {
+    if query.iter().any(|term| term.trim().is_empty()) {
+        return Err(Error::Query(
             "an explicit query cannot be empty; omit it to select all items".into(),
-        )),
-        Some(query) => Query::parse(query),
+        ));
     }
+    Query::parse_args(query)
 }
 
-fn require_selection(query: &str, operation: &str) -> Result<Query> {
-    if query.trim().is_empty() {
+fn require_selection(query: &[String], operation: &str) -> Result<Query> {
+    if query.is_empty() || query.iter().any(|term| term.trim().is_empty()) {
         return Err(Error::Query(format!(
             "{operation} query cannot be empty; provide an explicit filter"
         )));
     }
-    let query = Query::parse(query)?;
+    let query = Query::parse_args(query)?;
     if !query.has_filters() {
         return Err(Error::Query(format!(
             "{operation} query requires an explicit filter; sort terms do not select items"
         )));
     }
     Ok(query)
+}
+
+fn modification_parts(arguments: &[String]) -> Result<(&[String], &[String])> {
+    let index = arguments
+        .iter()
+        .position(|argument| {
+            argument
+                .split_once('=')
+                .is_some_and(|(field, _)| !field.is_empty() && !field.contains(':'))
+        })
+        .ok_or_else(|| Error::Query("modify requires field=value after the query".into()))?;
+    Ok(arguments.split_at(index))
 }
 
 fn require_confirmation_channel(dry_run: bool, yes: bool, operation: &str) -> Result<()> {

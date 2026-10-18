@@ -8,11 +8,19 @@ mod cli;
 
 #[derive(Parser)]
 #[command(name = "rsbts", version)]
-#[command(about = "A safe, plan-first music library manager")]
+#[command(about = "A music library manager in Rust, focused on the beets core")]
 struct Cli {
     /// Path to config file
     #[arg(short, long, global = true)]
     config: Option<PathBuf>,
+
+    /// Override the library database path
+    #[arg(short = 'l', long = "library")]
+    library: Option<PathBuf>,
+
+    /// Override the music directory
+    #[arg(short = 'd', long)]
+    directory: Option<PathBuf>,
 
     /// Output contract for automation
     #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Text)]
@@ -62,20 +70,44 @@ enum Commands {
     /// List tracks or albums
     #[command(name = "ls", alias = "list")]
     List {
-        /// Track query, or album/album-artist substring with --album
-        query: Option<String>,
+        /// Search terms, field filters, and sort terms
+        query: Vec<String>,
 
         /// Show albums instead of tracks
         #[arg(short, long)]
         album: bool,
 
+        /// Print file paths or album directories
+        #[arg(short = 'p', long, conflicts_with = "format")]
+        path: bool,
+
+        /// Format each row with $field or ${field} substitutions
+        #[arg(short = 'f', long)]
+        format: Option<String>,
+
         /// Maximum rows to emit
-        #[arg(long)]
+        #[arg(short = 'l', long)]
         limit: Option<u32>,
     },
 
     /// Show library statistics
-    Stats,
+    Stats {
+        /// Search terms and field filters
+        query: Vec<String>,
+    },
+
+    /// Show the effective configuration without opening the library
+    Config {
+        /// Print the configuration file path
+        #[arg(short = 'p', long)]
+        path: bool,
+        /// Show built-in defaults instead of the loaded configuration
+        #[arg(short = 'd', long = "default")]
+        defaults: bool,
+    },
+
+    /// Show available item and album fields
+    Fields,
 
     /// Check database and file consistency
     Audit {
@@ -96,20 +128,20 @@ enum Commands {
     /// Calculate and store persistent fixity for selected catalog items
     Verify {
         /// Query to filter items; omit to verify the complete catalog
-        query: Option<String>,
+        query: Vec<String>,
     },
 
     /// Re-read tags for matching library items
     Update {
         /// Query to filter items
-        query: Option<String>,
+        query: Vec<String>,
     },
 
     /// Preview or write database metadata to audio files
     Write {
         /// Query selecting files to write
         #[arg(required_unless_present = "all", conflicts_with = "all")]
-        query: Option<String>,
+        query: Vec<String>,
 
         /// Explicitly select every item
         #[arg(long)]
@@ -128,7 +160,7 @@ enum Commands {
     Move {
         /// Query selecting files to move
         #[arg(required_unless_present = "all", conflicts_with = "all")]
-        query: Option<String>,
+        query: Vec<String>,
 
         /// Explicitly select every item
         #[arg(long)]
@@ -147,7 +179,8 @@ enum Commands {
     #[command(name = "rm", alias = "remove")]
     Remove {
         /// Query to match items
-        query: String,
+        #[arg(required = true)]
+        query: Vec<String>,
 
         /// Also delete files from disk after quarantining them
         #[arg(short, long)]
@@ -179,12 +212,9 @@ enum Commands {
 
     /// Modify metadata stored in the library database
     Modify {
-        /// Query to match items
-        query: String,
-
-        /// Field=value pairs
-        #[arg(required = true)]
-        fields: Vec<String>,
+        /// Search terms followed by field=value assignments
+        #[arg(required = true, num_args = 2.., value_name = "QUERY_OR_FIELD")]
+        arguments: Vec<String>,
     },
 
     /// Preview and apply a canonical provider-refresh diff
@@ -366,6 +396,8 @@ async fn main() -> ExitCode {
         let result = cli::run(
             arguments.command,
             arguments.config,
+            arguments.library,
+            arguments.directory,
             arguments.output,
             &mut streams,
         )
