@@ -135,6 +135,10 @@ enum Commands {
     Update {
         /// Query to filter items
         query: Vec<String>,
+
+        /// Preview catalog changes without changing the database
+        #[arg(long, alias = "pretend")]
+        dry_run: bool,
     },
 
     /// Preview or write database metadata to audio files
@@ -213,8 +217,16 @@ enum Commands {
     /// Modify metadata stored in the library database
     Modify {
         /// Search terms followed by field=value assignments
-        #[arg(required = true, num_args = 2.., value_name = "QUERY_OR_FIELD")]
+        #[arg(required = true, value_name = "QUERY_OR_FIELD")]
         arguments: Vec<String>,
+
+        /// Preview field changes without changing the database
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Confirm the complete modification set non-interactively
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 
     /// Preview and apply a canonical provider-refresh diff

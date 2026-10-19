@@ -244,6 +244,7 @@ fn mutating_commands_share_shell_query_rules() -> TestResult {
             "--output",
             "json",
             "modify",
+            "--yes",
             "artist:Air",
             "title:light",
             "genre=Ambient",
@@ -257,7 +258,7 @@ fn mutating_commands_share_shell_query_rules() -> TestResult {
     assert_eq!(ids(&config, &["ls", "genre:=Ambient", "track+"])?, [1, 2]);
     successful(&run(
         &config,
-        &["modify", "title:=100%_done / Mix", "genre=Rock"],
+        &["modify", "--yes", "title:=100%_done / Mix", "genre=Rock"],
     )?);
     assert_eq!(ids(&config, &["ls", "genre:=Rock"])?, [4]);
     Ok(())
@@ -434,5 +435,123 @@ fn metadata_pages_keep_core_custom_fields_and_identifiers_separate() -> TestResu
         library.query_items_bounded(&query, 600)?[599].extended,
         page_metadata(600)?
     );
+    Ok(())
+}
+
+#[test]
+fn modify_previews_changes_and_requires_explicit_approval() -> TestResult {
+    let temporary = tempfile::tempdir()?;
+    let config = fixture(temporary.path())?;
+    let database = temporary.path().join("library.db");
+    let before = std::fs::read(&database)?;
+
+    let output = run(
+        &config,
+        &["modify", "--dry-run", "artist:Air", "genre=Ambient"],
+    )?;
+    successful(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Modification plan: 3 item(s) to change"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("genre: null -> \"Ambient\""), "{stdout}");
+    assert!(stdout.contains("No changes made"), "{stdout}");
+    assert_eq!(std::fs::read(&database)?, before);
+
+    for arguments in [
+        vec!["modify", "artist:Air", "genre=Ambient"],
+        vec!["--output", "json", "modify", "artist:Air", "genre=Ambient"],
+    ] {
+        let output = run(&config, &arguments)?;
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert_eq!(std::fs::read(&database)?, before);
+    }
+
+    let modified = |config: &Path| -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let output = run(
+            config,
+            &[
+                "--output",
+                "json",
+                "modify",
+                "--yes",
+                "artist:Air",
+                "genre=Ambient",
+            ],
+        )?;
+        successful(&output);
+        Ok(serde_json::from_slice::<serde_json::Value>(&output.stdout)?["modified"].clone())
+    };
+    assert_eq!(modified(&config)?, 3);
+    assert_eq!(
+        ids(&config, &["ls", "genre:=Ambient", "track+"])?,
+        [1, 2, 3]
+    );
+    assert_eq!(modified(&config)?, 0);
+    Ok(())
+}
+
+#[test]
+fn modify_keeps_identifiers_for_unchanged_fields() -> TestResult {
+    let temporary = tempfile::tempdir()?;
+    let config = fixture(temporary.path())?;
+    let database = temporary.path().join("library.db");
+    let recording = "8f3471b5-7e6a-48da-86a9-c1c07a0f47ae";
+    Connection::open(&database)?.execute(
+        "UPDATE items
+         SET mb_trackid = ?1, external_track_id = ?1, metadata_provider = 'musicbrainz'
+         WHERE id = 1",
+        [recording],
+    )?;
+    let stored = || -> rusqlite::Result<Option<String>> {
+        Connection::open(&database)?.query_row(
+            "SELECT external_track_id FROM items WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+    };
+
+    successful(&run(
+        &config,
+        &[
+            "modify",
+            "--yes",
+            "id:1",
+            "title=Northern Lights",
+            "genre=Pop",
+        ],
+    )?);
+    assert_eq!(stored()?.as_deref(), Some(recording));
+
+    let output = run(&config, &["modify", "--dry-run", "id:1", "title=Retitled"])?;
+    successful(&output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("clears stored track identifiers"));
+    successful(&run(
+        &config,
+        &["modify", "--yes", "id:1", "title=Retitled"],
+    )?);
+    assert_eq!(stored()?, None);
+    Ok(())
+}
+
+#[test]
+fn update_dry_run_leaves_the_catalog_unchanged() -> TestResult {
+    let temporary = tempfile::tempdir()?;
+    let config = fixture(temporary.path())?;
+    let database = temporary.path().join("library.db");
+    let before = std::fs::read(&database)?;
+
+    for flag in ["--dry-run", "--pretend"] {
+        let output = run(&config, &["update", flag])?;
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("0 item(s) with core field changes; 4 failed"),
+            "{stdout}"
+        );
+        assert!(stdout.contains("No changes made"), "{stdout}");
+        assert_eq!(std::fs::read(&database)?, before);
+    }
     Ok(())
 }

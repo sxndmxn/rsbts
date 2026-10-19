@@ -200,7 +200,10 @@ fn long_unicode_names_survive_file_commands_and_prepared_journal_recovery(
     let path = Path::new(listing[0]["path"].as_str().ok_or("missing path")?);
     assert_eq!(std::fs::read(path)?, original);
     let audio = rsbts::media::decoded_audio_essence_hash(path)?;
-    assert_success(&run(&config, &["modify", "format:wav", "genre=Test"])?);
+    assert_success(&run(
+        &config,
+        &["modify", "--yes", "format:wav", "genre=Test"],
+    )?);
     assert_success(&run(&config, &["write", "--all", "--yes"])?);
     assert_eq!(rsbts::media::decoded_audio_essence_hash(path)?, audio);
     std::fs::write(&config, format!("{base}[paths]\nformat = 'Moved/$title'\n"))?;
@@ -351,7 +354,14 @@ fn modify_emits_machine_results_without_changing_media() -> Result<(), Box<dyn s
         for (query, count) in [("title:=Track", 1), ("title:=Missing", 0)] {
             let output = run(
                 &config,
-                &["--output", format, "modify", query, "title=Changed"],
+                &[
+                    "--output",
+                    format,
+                    "modify",
+                    "--yes",
+                    query,
+                    "title=Changed",
+                ],
             )?;
             let result = parse_json_document(&output)?;
             assert_eq!(result["operation"], "modify");
@@ -987,6 +997,7 @@ fn disposable_cli_workflow_is_atomic_and_confirmation_safe(
         &config_path,
         &[
             "modify",
+            "--yes",
             "artist:=Test Artist",
             "title=Changed",
             "year=2024",
@@ -999,6 +1010,7 @@ fn disposable_cli_workflow_is_atomic_and_confirmation_safe(
         &config_path,
         &[
             "modify",
+            "--yes",
             "artist:=Test Artist",
             "title=Must Not Persist",
             "year=not-a-year",
@@ -1202,7 +1214,7 @@ fn native_tag_aliases_and_unknown_values_survive_cli_update_and_write(
         assert_success(&run(&config, &["verify"])?);
         assert_success(&run(
             &config,
-            &["modify", "title:=Track", "genre=Test Genre"],
+            &["modify", "--yes", "title:=Track", "genre=Test Genre"],
         )?);
         run_preserving_database(&config, &database, &["write", "--all", "--dry-run"])
             .map(|output| assert_success(&output))?;

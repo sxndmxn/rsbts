@@ -23,6 +23,13 @@ Added `ls -p`, `ls -f`, and `ls -l` for paths, field formats, and row limits.
 Added filtered statistics, configuration display, and field discovery.
 Added `-l` and `-d` library path overrides before the command.
 
+`modify` now shows each field change before it changes the database.
+It asks for confirmation. Use `--yes` to approve without a prompt, or `--dry-run` to preview only.
+Scripts that run `modify` without a terminal must now pass `--yes`.
+`modify` changes only fields that differ from the stored value.
+Identifiers that depend on an unchanged field stay stored.
+Added `update --dry-run` (alias `--pretend`) to preview core field changes from file tags.
+
 Listings now read extended metadata in batches of 256 records.
 Batch reads preserve native metadata, custom fields, and stored provider identifiers.
 

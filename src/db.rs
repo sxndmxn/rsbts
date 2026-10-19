@@ -1215,6 +1215,9 @@ impl Library {
     ///
     /// Every field and value is validated before any row is changed. Empty values clear the
     /// optional `albumartist`, `genre`, `year`, `track`, and `disc` fields.
+    ///
+    /// A field whose stored value already equals the new value stays unchanged, and so do the
+    /// identifiers that depend on it. The result is the number of items that changed.
     pub fn modify_items(&self, ids: &[i64], fields: &[String]) -> Result<usize> {
         let modifications = parse_modifications(fields)?;
         if ids.is_empty() {
@@ -1224,23 +1227,30 @@ impl Library {
             return Err(Error::Query("item IDs must not be repeated".into()));
         }
 
-        let assignments = modifications
-            .iter()
-            .map(|modification| format!("{} = ?", modification.column))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!("UPDATE items SET {assignments} WHERE id = ?");
-        let invalidates_track_identity = modifications.iter().any(|modification| {
-            matches!(modification.column, "title" | "artist" | "track" | "disc")
-        });
-        let invalidates_release_identity = modifications
-            .iter()
-            .any(|modification| matches!(modification.column, "album" | "albumartist" | "year"));
-        let modifies_artist = modifications
-            .iter()
-            .any(|modification| modification.column == "artist");
         let transaction = self.conn.unchecked_transaction()?;
+        let mut modified_ids = Vec::with_capacity(ids.len());
+        let mut reconcile_albums = false;
         for id in ids {
+            let modifications = changed_modifications(&transaction, *id, &modifications)?;
+            if modifications.is_empty() {
+                continue;
+            }
+            let assignments = modifications
+                .iter()
+                .map(|modification| format!("{} = ?", modification.column))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!("UPDATE items SET {assignments} WHERE id = ?");
+            let invalidates_track_identity = modifications.iter().any(|modification| {
+                matches!(modification.column, "title" | "artist" | "track" | "disc")
+            });
+            let invalidates_release_identity = modifications.iter().any(|modification| {
+                matches!(modification.column, "album" | "albumartist" | "year")
+            });
+            let modifies_artist = modifications
+                .iter()
+                .any(|modification| modification.column == "artist");
+            reconcile_albums |= invalidates_release_identity || modifies_artist;
             let mut values = modifications
                 .iter()
                 .map(|modification| modification.value.clone())
@@ -1290,17 +1300,13 @@ impl Library {
                 invalidate_release_ids,
             )?;
             synchronize_modified_metadata(&transaction, *id, &modifications)?;
+            modified_ids.push(*id);
         }
-        if modifications.iter().any(|modification| {
-            matches!(
-                modification.column,
-                "artist" | "album" | "albumartist" | "year"
-            )
-        }) {
-            reconcile_album_membership(&transaction, ids)?;
+        if reconcile_albums {
+            reconcile_album_membership(&transaction, &modified_ids)?;
         }
         transaction.commit()?;
-        Ok(ids.len())
+        Ok(modified_ids.len())
     }
 
     pub(crate) fn item_exists(&self, path: &Path) -> Result<bool> {
@@ -2267,10 +2273,182 @@ impl Library {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Modification {
     column: &'static str,
     value: Value,
+}
+
+impl Modification {
+    fn current_value(&self, item: &Item) -> Value {
+        core_field_value(item, self.column)
+    }
+}
+
+const CORE_FIELDS: [&str; 8] = [
+    "title",
+    "artist",
+    "album",
+    "albumartist",
+    "genre",
+    "year",
+    "track",
+    "disc",
+];
+
+fn core_field_value(item: &Item, column: &str) -> Value {
+    let text = |value: &str| Value::Text(value.to_owned());
+    let optional_text = |value: &Option<String>| value.as_deref().map_or(Value::Null, text);
+    let number = |value: Option<i64>| value.map_or(Value::Null, Value::Integer);
+    match column {
+        "title" => text(&item.title),
+        "artist" => text(&item.artist),
+        "album" => text(&item.album),
+        "albumartist" => optional_text(&item.albumartist),
+        "genre" => optional_text(&item.genre),
+        "year" => number(item.year.map(i64::from)),
+        "track" => number(item.track.map(i64::from)),
+        _ => number(item.disc.map(i64::from)),
+    }
+}
+
+/// Compare the core catalog fields that `modify` can change.
+#[must_use]
+pub fn core_field_changes(before: &Item, after: &Item) -> Vec<FieldChange> {
+    CORE_FIELDS
+        .into_iter()
+        .filter_map(|field| {
+            let (old, new) = (
+                core_field_value(before, field),
+                core_field_value(after, field),
+            );
+            (old != new).then(|| FieldChange {
+                field,
+                before: json_value(&old),
+                after: json_value(&new),
+            })
+        })
+        .collect()
+}
+
+/// One field change in a [`ItemModification`] preview.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct FieldChange {
+    pub field: &'static str,
+    pub before: serde_json::Value,
+    pub after: serde_json::Value,
+}
+
+/// The changes that [`Library::modify_items`] would make to one item.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ItemModification {
+    pub item_id: i64,
+    pub path: PathBuf,
+    pub changes: Vec<FieldChange>,
+    /// Stored track identifiers that the change clears.
+    pub clears_track_identifiers: bool,
+    /// Stored release identifiers that the change clears.
+    pub clears_release_identifiers: bool,
+}
+
+/// Preview [`Library::modify_items`] without a database write.
+///
+/// The result contains only items with at least one changed field. It uses the same
+/// validation, comparison, and identifier rules as the write.
+pub fn preview_modifications(items: &[Item], fields: &[String]) -> Result<Vec<ItemModification>> {
+    let modifications = parse_modifications(fields)?;
+    let mut previews = Vec::new();
+    for item in items {
+        let item_id = item
+            .id
+            .ok_or_else(|| Error::Query("a matched item has no database ID".into()))?;
+        let changed = modifications
+            .iter()
+            .filter(|modification| modification.current_value(item) != modification.value)
+            .collect::<Vec<_>>();
+        if changed.is_empty() {
+            continue;
+        }
+        let changes_column = |columns: &[&str]| {
+            changed
+                .iter()
+                .any(|modification| columns.contains(&modification.column))
+        };
+        let albumartist_after = changed
+            .iter()
+            .find(|modification| modification.column == "albumartist")
+            .map_or_else(
+                || item.albumartist.is_some(),
+                |modification| modification.value != Value::Null,
+            );
+        let has_identifier = |kinds: &[&str], stored: &Option<ExternalId>| {
+            stored.is_some()
+                || item
+                    .extended
+                    .external_ids
+                    .iter()
+                    .any(|id| kinds.contains(&id.kind.as_str()))
+        };
+        previews.push(ItemModification {
+            item_id,
+            path: item.path.clone(),
+            changes: changed
+                .iter()
+                .map(|modification| FieldChange {
+                    field: modification.column,
+                    before: json_value(&modification.current_value(item)),
+                    after: json_value(&modification.value),
+                })
+                .collect(),
+            clears_track_identifiers: changes_column(&["title", "artist", "track", "disc"])
+                && has_identifier(
+                    &["recording", "track", "release_track", "release-track"],
+                    &item.track_external_id,
+                ),
+            clears_release_identifiers: (changes_column(&["album", "albumartist", "year"])
+                || changes_column(&["artist"]) && !albumartist_after)
+                && has_identifier(&["release", "legacy"], &item.release_external_id),
+        });
+    }
+    Ok(previews)
+}
+
+fn json_value(value: &Value) -> serde_json::Value {
+    match value {
+        Value::Text(text) => serde_json::Value::from(text.as_str()),
+        Value::Integer(number) => serde_json::Value::from(*number),
+        _ => serde_json::Value::Null,
+    }
+}
+
+fn changed_modifications(
+    transaction: &Transaction<'_>,
+    id: i64,
+    modifications: &[Modification],
+) -> Result<Vec<Modification>> {
+    let mut changed = Vec::with_capacity(modifications.len());
+    for modification in modifications {
+        // The column comes from the fixed list in `parse_modifications`.
+        let unchanged: bool = transaction
+            .query_row(
+                &format!(
+                    "SELECT {} IS ?1 FROM items WHERE id = ?2",
+                    modification.column
+                ),
+                params![modification.value, id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                Error::Query(format!(
+                    "item {id} no longer exists; no items were modified"
+                ))
+            })?;
+        if !unchanged {
+            changed.push(modification.clone());
+        }
+    }
+    Ok(changed)
 }
 
 fn parse_modifications(fields: &[String]) -> Result<Vec<Modification>> {

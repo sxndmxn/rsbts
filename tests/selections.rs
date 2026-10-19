@@ -56,7 +56,7 @@ fn sort_only_mutations_fail_before_database_open() -> Result<(), Box<dyn std::er
         for (command, options) in [
             ("rm", vec!["--yes"]),
             ("rm", vec!["--delete", "--dry-run"]),
-            ("modify", vec!["title=Changed"]),
+            ("modify", vec!["--yes", "title=Changed"]),
             ("write", vec!["--yes"]),
             ("write", vec!["--dry-run"]),
             ("move", vec!["--yes"]),
@@ -81,11 +81,14 @@ fn sorted_mutations_require_a_filter_and_keep_its_scope() -> Result<(), Box<dyn 
     let temporary = tempfile::tempdir()?;
     let (config, database) = catalog_fixture(temporary.path(), 3)?;
     let before = std::fs::read(&database)?;
-    let output = run(&config, &["modify", "artist+", "title=Changed"])?;
+    let output = run(&config, &["modify", "--yes", "artist+", "title=Changed"])?;
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert_eq!(std::fs::read(&database)?, before);
 
-    let output = run(&config, &["modify", "artist:=A", "title-", "title=Changed"])?;
+    let output = run(
+        &config,
+        &["modify", "--yes", "artist:=A", "title-", "title=Changed"],
+    )?;
     assert!(output.status.success(), "{output:?}");
     let library = Library::open_read_only(&database)?;
     let items = library.query_items_page(&Query::all(), None, 10)?;

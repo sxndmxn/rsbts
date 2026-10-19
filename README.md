@@ -158,8 +158,10 @@ rsbts ls -p 'artist:=~Black Sabbath'
 rsbts --output json stats
 rsbts --output json stats 'album:=Paranoid' length:180..
 rsbts --output jsonl ls --limit 100
+rsbts update --dry-run 'artist:=Beatles'
 rsbts update 'artist:=Beatles'
-rsbts modify 'album:=Paranoid' genre=Metal year=1970
+rsbts modify --dry-run 'album:=Paranoid' genre=Metal year=1970
+rsbts modify --yes 'album:=Paranoid' genre=Metal year=1970
 rsbts rm --dry-run 'artist:=Beatles'
 rsbts rm --delete --yes 'artist:=Beatles'
 rsbts purge --dry-run --older-than-days 30
@@ -169,7 +171,14 @@ rsbts purge --dry-run --older-than-days 30
 Absent native fields clear stale native values.
 `update` does not adopt new external identifiers from tags.
 Changes to identity fields can clear associated catalog identifiers.
+`update --dry-run` (alias `--pretend`) lists title, artist, album, album artist, genre, year, track, and disc changes.
+It does not list changes to other native tag fields.
 `modify` keeps artist, album artist, genre, and year consistent with later tag writes.
+`modify` shows each field change and asks for confirmation before it changes the database.
+Use `--yes` to approve without a prompt, or `--dry-run` to preview only.
+The preview also shows stored track or release identifiers that the change clears.
+`modify` changes only fields that differ from the stored value.
+Identifiers that depend on an unchanged field stay stored.
 
 Filters support literal substrings `field:value`, exact values `field:=value`,
 case-insensitive exact values `field:=~value`,

@@ -8,7 +8,10 @@ use num_traits::ToPrimitive;
 
 use rsbts::catalog::{EntityId, EntityKind};
 use rsbts::config::Config;
-use rsbts::db::{validate_modification_fields, AuditIssue, AuditMode, Library};
+use rsbts::db::{
+    core_field_changes, preview_modifications, validate_modification_fields, AuditIssue, AuditMode,
+    FieldChange, Library,
+};
 use rsbts::fixity::{FixityMode, FixitySchedule, FixityScheduleId};
 use rsbts::import::{
     Action, AlbumPlan, ApprovalChoice, ApprovedAlbumPlan, ImportExecutor, ImportOptions,
@@ -232,6 +235,10 @@ pub async fn run(
                 dry_run: false,
                 yes: false,
                 ..
+            } | Commands::Modify {
+                dry_run: false,
+                yes: false,
+                ..
             } | Commands::Migrate {
                 source: MigrateSource::Beets {
                     dry_run: false,
@@ -266,6 +273,9 @@ pub async fn run(
         Commands::Move { dry_run, yes, .. } => {
             require_confirmation_channel(*dry_run, *yes, "move")?;
         }
+        Commands::Modify { dry_run, yes, .. } => {
+            require_confirmation_channel(*dry_run, *yes, "modify")?;
+        }
         Commands::Migrate {
             source: MigrateSource::Beets { dry_run, yes, .. },
         } => {
@@ -287,6 +297,8 @@ pub async fn run(
             | Commands::PathProject { dry_run: true, .. }
             | Commands::Write { dry_run: true, .. }
             | Commands::Move { dry_run: true, .. }
+            | Commands::Modify { dry_run: true, .. }
+            | Commands::Update { dry_run: true, .. }
     );
     let ordinary_read = matches!(
         &command,
@@ -376,7 +388,7 @@ pub async fn run(
         Commands::Verify { query } => {
             verify(&mut library, &config.library.directory, &query, output).map_err(Into::into)
         }
-        Commands::Update { query } => update(&library, &query, output, streams),
+        Commands::Update { query, dry_run } => update(&library, &query, dry_run, output, streams),
         Commands::Write {
             query,
             all,
@@ -409,9 +421,13 @@ pub async fn run(
             dry_run,
             yes,
         } => purge(&mut library, older_than_days, dry_run, yes, output).map_err(Into::into),
-        Commands::Modify { arguments } => {
+        Commands::Modify {
+            arguments,
+            dry_run,
+            yes,
+        } => {
             let (query, fields) = modification_parts(&arguments)?;
-            modify(&library, query, fields, output, streams)
+            modify(&library, query, fields, dry_run, yes, output, streams)
         }
         Commands::ProviderRefresh {
             entity_kind,
@@ -482,13 +498,13 @@ fn preflight(command: &Commands) -> Result<()> {
         Commands::Stats { query } => {
             Query::parse_args(query)?;
         }
-        Commands::Update { query } | Commands::Verify { query } => {
+        Commands::Update { query, .. } | Commands::Verify { query } => {
             parse_query(query)?;
         }
         Commands::Remove { query, .. } => {
             require_selection(query, "removal")?;
         }
-        Commands::Modify { arguments } => {
+        Commands::Modify { arguments, .. } => {
             let (query, fields) = modification_parts(arguments)?;
             require_selection(query, "modify")?;
             validate_modification_fields(fields)?;
@@ -1470,12 +1486,14 @@ fn integrity(library: &Library, output: OutputFormat) -> Result<Outcome> {
 fn update(
     library: &Library,
     query: &[String],
+    dry_run: bool,
     output: OutputFormat,
     streams: &mut Streams<'_>,
 ) -> CliResult<Outcome> {
     let query = parse_query(query)?;
     let items = library.query_items_bounded(&query, 9_999)?;
     let mut tag_updates = Vec::new();
+    let mut previews = Vec::new();
     let mut failures = Vec::new();
     for item in items {
         let result = item
@@ -1483,6 +1501,20 @@ fn update(
             .ok_or_else(|| Error::Query("a matched item has no database ID".into()))
             .and_then(|id| rsbts::tags::read_tags_for_update(&item).map(|value| (id, value)));
         match result {
+            Ok((id, value)) if dry_run => {
+                let changes = core_field_changes(&item, &value);
+                if !changes.is_empty() {
+                    previews.push(serde_json::json!({
+                        "item_id": id,
+                        "path": item.path,
+                        "changes": changes,
+                    }));
+                    if output == OutputFormat::Text {
+                        outln!(streams, "  {}", terminal_safe(item.path.display()));
+                        write_field_changes(streams, &changes)?;
+                    }
+                }
+            }
             Ok(value) => tag_updates.push(value),
             Err(error) => {
                 if output == OutputFormat::Text {
@@ -1500,6 +1532,32 @@ fn update(
                 }));
             }
         }
+    }
+    if dry_run {
+        if output == OutputFormat::Text {
+            outln!(
+                streams,
+                "Update preview: {} item(s) with core field changes; {} failed",
+                previews.len(),
+                failures.len()
+            );
+            outln!(streams, "No changes made");
+        } else {
+            emit(
+                output,
+                &serde_json::json!({
+                    "operation": "update",
+                    "plan": previews,
+                    "executed": false,
+                    "failures": failures,
+                }),
+            )?;
+        }
+        return Ok(if failures.is_empty() {
+            Outcome::Success
+        } else {
+            Outcome::Partial
+        });
     }
     let updated_count = library.update_items(&tag_updates)?;
     if output == OutputFormat::Text {
@@ -2048,28 +2106,81 @@ fn modify(
     library: &Library,
     raw_query: &[String],
     fields: &[String],
+    dry_run: bool,
+    yes: bool,
     output: OutputFormat,
     streams: &mut Streams<'_>,
 ) -> CliResult<Outcome> {
     let query = require_selection(raw_query, "modify")?;
     let items = library.query_items_bounded(&query, 9_999)?;
-    let ids = items
-        .iter()
-        .map(|item| {
-            item.id
-                .ok_or_else(|| Error::Query("a matched item has no database ID".into()))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let plan = preview_modifications(&items, fields)?;
+    if output == OutputFormat::Text {
+        outln!(
+            streams,
+            "Modification plan: {} item(s) to change",
+            plan.len()
+        );
+        for item in &plan {
+            outln!(streams, "  {}", terminal_safe(item.path.display()));
+            write_field_changes(streams, &item.changes)?;
+            if item.clears_track_identifiers {
+                outln!(streams, "    clears stored track identifiers");
+            }
+            if item.clears_release_identifiers {
+                outln!(streams, "    clears stored release identifiers");
+            }
+        }
+    }
+    if dry_run || plan.is_empty() {
+        if output == OutputFormat::Text {
+            outln!(streams, "No changes made");
+        } else {
+            emit(
+                output,
+                &serde_json::json!({
+                    "operation": "modify",
+                    "plan": plan,
+                    "executed": false,
+                    "modified": 0,
+                }),
+            )?;
+        }
+        return Ok(Outcome::Success);
+    }
+    if !yes && !confirm("Modify all listed items?")? {
+        outln!(streams, "Cancelled; no changes made");
+        return Ok(Outcome::Partial);
+    }
+    let ids = plan.iter().map(|item| item.item_id).collect::<Vec<_>>();
     let count = library.modify_items(&ids, fields)?;
     if output == OutputFormat::Text {
         outln!(streams, "Modified {count} item(s)");
     } else {
         emit(
             output,
-            &serde_json::json!({"operation": "modify", "modified": count}),
+            &serde_json::json!({
+                "operation": "modify",
+                "plan": plan,
+                "executed": true,
+                "modified": count,
+            }),
         )?;
     }
     Ok(Outcome::Success)
+}
+
+fn write_field_changes(streams: &mut Streams<'_>, changes: &[FieldChange]) -> CliResult<()> {
+    for change in changes {
+        // JSON rendering quotes text and escapes control characters.
+        outln!(
+            streams,
+            "    {}: {} -> {}",
+            change.field,
+            change.before,
+            change.after
+        );
+    }
+    Ok(())
 }
 
 fn provider_refresh(
