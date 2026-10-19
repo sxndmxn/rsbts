@@ -69,7 +69,8 @@ fn beets_compatibility_manifest_is_pinned_and_valid() -> Result<(), Box<dyn std:
     );
     assert_eq!(manifest.platforms, ["linux", "macos"]);
     assert_eq!(manifest.executable, "rsbts");
-    assert_eq!(manifest.plugin_scope, "bundled");
+    assert_eq!(manifest.plugin_scope, "none");
+    assert!(!manifest.subsystems.contains_key("bundled_plugins"));
     assert_eq!(manifest.statuses.allowed, ALLOWED_STATUSES);
     assert!(!manifest.subsystems.is_empty());
     for (name, entry) in manifest.subsystems {

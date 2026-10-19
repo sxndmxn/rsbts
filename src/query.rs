@@ -13,7 +13,7 @@ pub struct Query {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum QueryTerm {
-    FullText(String),
+    Keyword(String),
     Field {
         negated: bool,
         field: QueryField,
@@ -29,6 +29,11 @@ enum QueryTerm {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum QueryField {
+    Id,
+    AlbumId,
+    ArtPath,
+    FileSize,
+    Singleton,
     Path,
     Title,
     Artist,
@@ -63,12 +68,18 @@ pub enum SortField {
     Length,
     Added,
     Modified,
+    Id,
+    AlbumId,
+    ArtPath,
+    FileSize,
+    Singleton,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FieldOperation {
     Substring(String),
     Exact(String),
+    ExactIgnoreCase(String),
     Glob(String),
     Regex(String),
     Range {
@@ -94,36 +105,71 @@ impl Query {
         input.parse()
     }
 
+    /// Parse shell arguments without splitting phrases or interpreting shell quotes again.
+    pub fn parse_args(arguments: &[String]) -> Result<Self> {
+        let mut tokens = Vec::with_capacity(arguments.len());
+        for (index, argument) in arguments.iter().enumerate() {
+            let separates_group =
+                index + 1 < arguments.len() && argument.len() > 1 && argument.ends_with(',');
+            let value = if separates_group {
+                &argument[..argument.len() - 1]
+            } else {
+                argument
+            };
+            tokens.push(format!(
+                "\"{}\"",
+                value.replace('\\', "\\\\").replace('"', "\\\"")
+            ));
+            if separates_group {
+                tokens.push(",".into());
+            }
+        }
+        Self::parse(&tokens.join(" "))
+    }
+
     /// Return whether the query contains a filter rather than only sort terms.
     #[must_use]
     pub fn has_filters(&self) -> bool {
         self.terms
             .iter()
-            .any(|term| matches!(term, QueryTerm::FullText(_) | QueryTerm::Field { .. }))
+            .any(|term| matches!(term, QueryTerm::Keyword(_) | QueryTerm::Field { .. }))
     }
 
     pub fn compile(&self) -> CompiledQuery {
+        self.compile_for(false)
+    }
+
+    /// Compile album filters, including correlated filters on member tracks.
+    pub fn compile_albums(&self) -> CompiledQuery {
+        self.compile_for(true)
+    }
+
+    fn compile_for(&self, albums: bool) -> CompiledQuery {
         let mut condition_groups = vec![Vec::new()];
         let mut order_by = Vec::new();
         let mut parameters = Vec::new();
 
         for term in &self.terms {
             match term {
-                QueryTerm::FullText(text) => {
+                QueryTerm::Keyword(text) => {
                     if let Some(conditions) = condition_groups.last_mut() {
-                        conditions.push(
-                            "id IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ?)"
-                                .to_string(),
-                        );
+                        conditions.push(compile_any(text, albums, &mut parameters));
                     }
-                    parameters.push(Value::Text(format!("\"{}\"", text.replace('"', "\"\""))));
                 }
                 QueryTerm::Field {
                     negated,
                     field,
                     operation,
                 } => {
-                    let condition = compile_field(field, operation, &mut parameters);
+                    let condition = if albums && !field.is_album_field() {
+                        let predicate = compile_field(field, operation, &mut parameters, false);
+                        format!("EXISTS (SELECT 1 FROM items WHERE items.album_id = albums.id AND {predicate})")
+                    } else if !albums && *field == QueryField::ArtPath {
+                        let predicate = compile_field(field, operation, &mut parameters, true);
+                        format!("EXISTS (SELECT 1 FROM albums WHERE albums.id = items.album_id AND {predicate})")
+                    } else {
+                        compile_field(field, operation, &mut parameters, albums)
+                    };
                     if let Some(conditions) = condition_groups.last_mut() {
                         conditions.push(if *negated {
                             format!("COALESCE(NOT ({condition}), 1)")
@@ -135,7 +181,13 @@ impl Query {
                 QueryTerm::Sort { field, ascending } => {
                     order_by.push(format!(
                         "{} {}",
-                        field.column(),
+                        if albums && !field.is_album_field() {
+                            format!("(SELECT {} FROM items WHERE items.album_id = albums.id ORDER BY items.id LIMIT 1)", field.column())
+                        } else if !albums && *field == SortField::ArtPath {
+                            "(SELECT artpath FROM albums WHERE albums.id = items.album_id)".into()
+                        } else {
+                            field.column().to_string()
+                        },
                         if *ascending { "ASC" } else { "DESC" }
                     ));
                 }
@@ -154,12 +206,19 @@ impl Query {
             format!(" WHERE ({})", conditions.join(" OR "))
         };
         let order_clause = if order_by.is_empty() {
-            " ORDER BY artist, album, disc, track".to_string()
+            if albums {
+                " ORDER BY albumartist, year, album".to_string()
+            } else {
+                " ORDER BY artist, album, disc, track".to_string()
+            }
         } else {
             format!(" ORDER BY {}", order_by.join(", "))
         };
         CompiledQuery {
-            sql: format!("SELECT * FROM items{where_clause}{order_clause}"),
+            sql: format!(
+                "SELECT * FROM {}{where_clause}{order_clause}",
+                if albums { "albums" } else { "items" }
+            ),
             parameters,
         }
     }
@@ -213,26 +272,33 @@ impl FromStr for Query {
                 if value.is_empty() {
                     return Err(Error::Query(format!("missing value for field {field}")));
                 }
-                let field = field.parse()?;
-                terms.push(QueryTerm::Field {
-                    negated,
-                    operation: parse_operation(&field, value)?,
-                    field,
-                });
+                if field.is_empty() && !negated {
+                    regex::Regex::new(value).map_err(|error| {
+                        Error::Query(format!("invalid regular expression: {error}"))
+                    })?;
+                    terms.push(QueryTerm::Keyword(raw.to_string()));
+                } else {
+                    let field = field.parse()?;
+                    terms.push(QueryTerm::Field {
+                        negated,
+                        operation: parse_operation(&field, value)?,
+                        field,
+                    });
+                }
             } else {
                 if negated {
                     return Err(Error::Query(
                         "negation is supported only for field queries".into(),
                     ));
                 }
-                terms.push(QueryTerm::FullText(raw.to_string()));
+                terms.push(QueryTerm::Keyword(raw.to_string()));
             }
         }
         if terms.iter().any(|term| matches!(term, QueryTerm::Or)) {
             let mut group_has_condition = false;
             for term in &terms {
                 match term {
-                    QueryTerm::FullText(_) | QueryTerm::Field { .. } => {
+                    QueryTerm::Keyword(_) | QueryTerm::Field { .. } => {
                         group_has_condition = true;
                     }
                     QueryTerm::Or if !group_has_condition => {
@@ -305,6 +371,11 @@ impl FromStr for QueryField {
 
     fn from_str(value: &str) -> Result<Self> {
         match value.to_ascii_lowercase().as_str() {
+            "id" => Ok(Self::Id),
+            "album_id" => Ok(Self::AlbumId),
+            "artpath" => Ok(Self::ArtPath),
+            "file_size" => Ok(Self::FileSize),
+            "singleton" => Ok(Self::Singleton),
             "path" => Ok(Self::Path),
             "title" => Ok(Self::Title),
             "artist" => Ok(Self::Artist),
@@ -334,8 +405,41 @@ impl FromStr for QueryField {
 }
 
 impl QueryField {
+    const fn is_album_field(&self) -> bool {
+        matches!(
+            self,
+            Self::Id
+                | Self::ArtPath
+                | Self::Album
+                | Self::AlbumArtist
+                | Self::Year
+                | Self::Added
+                | Self::Flexible(_)
+        )
+    }
+
+    const fn is_numeric(&self) -> bool {
+        matches!(
+            self,
+            Self::Id
+                | Self::AlbumId
+                | Self::FileSize
+                | Self::Singleton
+                | Self::Year
+                | Self::Track
+                | Self::Disc
+                | Self::Bitrate
+                | Self::Length
+        )
+    }
+
     const fn column(&self) -> Option<&'static str> {
         match self {
+            Self::Id => Some("id"),
+            Self::AlbumId => Some("album_id"),
+            Self::ArtPath => Some("artpath"),
+            Self::FileSize => Some("file_size"),
+            Self::Singleton => Some("singleton"),
             Self::Path => Some("path"),
             Self::Title => Some("title"),
             Self::Artist => Some("artist"),
@@ -361,6 +465,11 @@ impl FromStr for SortField {
     fn from_str(value: &str) -> Result<Self> {
         let query_field: QueryField = value.parse()?;
         Ok(match query_field {
+            QueryField::Id => Self::Id,
+            QueryField::AlbumId => Self::AlbumId,
+            QueryField::ArtPath => Self::ArtPath,
+            QueryField::FileSize => Self::FileSize,
+            QueryField::Singleton => Self::Singleton,
             QueryField::Path => Self::Path,
             QueryField::Title => Self::Title,
             QueryField::Artist => Self::Artist,
@@ -385,8 +494,20 @@ impl FromStr for SortField {
 }
 
 impl SortField {
+    const fn is_album_field(self) -> bool {
+        matches!(
+            self,
+            Self::Id | Self::ArtPath | Self::Album | Self::AlbumArtist | Self::Year | Self::Added
+        )
+    }
+
     const fn column(self) -> &'static str {
         match self {
+            Self::Id => "id",
+            Self::AlbumId => "album_id",
+            Self::ArtPath => "artpath",
+            Self::FileSize => "file_size",
+            Self::Singleton => "singleton",
             Self::Path => "path",
             Self::Title => "title",
             Self::Artist => "artist",
@@ -406,7 +527,12 @@ impl SortField {
 }
 
 fn parse_operation(field: &QueryField, value: &str) -> Result<FieldOperation> {
+    if let Some(exact) = value.strip_prefix("=~") {
+        validate_numeric_query(field, exact)?;
+        return Ok(FieldOperation::ExactIgnoreCase(exact.to_string()));
+    }
     if let Some(exact) = value.strip_prefix('=') {
+        validate_numeric_query(field, exact)?;
         return Ok(FieldOperation::Exact(exact.to_string()));
     }
     if let Some(pattern) = value.strip_prefix(':') {
@@ -418,6 +544,9 @@ fn parse_operation(field: &QueryField, value: &str) -> Result<FieldOperation> {
         return Ok(FieldOperation::Glob(pattern.to_string()));
     }
     if let Some((start, end)) = value.split_once("..") {
+        for bound in [start, end].into_iter().filter(|bound| !bound.is_empty()) {
+            validate_numeric_query(field, bound)?;
+        }
         return Ok(FieldOperation::Range {
             start: (!start.is_empty()).then(|| start.to_string()),
             end: (!end.is_empty()).then(|| end.to_string()),
@@ -428,13 +557,33 @@ fn parse_operation(field: &QueryField, value: &str) -> Result<FieldOperation> {
             .map(FieldOperation::RelativeDate)
             .ok_or_else(|| Error::Query(format!("invalid relative date: {value}")));
     }
+    if field == &QueryField::Singleton {
+        let value = match value.to_ascii_lowercase().as_str() {
+            "true" | "yes" | "on" | "1" => "1",
+            "false" | "no" | "off" | "0" => "0",
+            _ => return Err(Error::Query(format!("invalid boolean query: {value}"))),
+        };
+        return Ok(FieldOperation::Exact(value.into()));
+    }
+    if field.is_numeric() {
+        validate_numeric_query(field, value)?;
+        return Ok(FieldOperation::Exact(value.into()));
+    }
     Ok(FieldOperation::Substring(value.to_string()))
+}
+
+fn validate_numeric_query(field: &QueryField, value: &str) -> Result<()> {
+    if field.is_numeric() && !is_numeric_bound(value) {
+        return Err(Error::Query(format!("invalid numeric query: {value}")));
+    }
+    Ok(())
 }
 
 fn compile_field(
     field: &QueryField,
     operation: &FieldOperation,
     parameters: &mut Vec<Value>,
+    albums: bool,
 ) -> String {
     if let QueryField::Flexible(name) = field {
         parameters.push(Value::Text(name.clone()));
@@ -469,8 +618,10 @@ fn compile_field(
         };
         return format!(
             "EXISTS (SELECT 1 FROM entity_metadata
-             WHERE entity_type = 'item' AND entity_id = items.id
-               AND field = ? AND {predicate})"
+             WHERE entity_type = '{}' AND entity_id = {}.id
+               AND field = ? AND {predicate})",
+            if albums { "album" } else { "item" },
+            if albums { "albums" } else { "items" }
         );
     }
     let column = field.column().unwrap_or("id");
@@ -482,6 +633,37 @@ fn is_numeric_bound(value: &str) -> bool {
         .trim_matches(|character: char| character.is_ascii_whitespace())
         .parse::<f64>()
         .is_ok_and(f64::is_finite)
+}
+
+fn compile_any(text: &str, albums: bool, parameters: &mut Vec<Value>) -> String {
+    let operation = text
+        .strip_prefix("=~")
+        .map(|value| FieldOperation::ExactIgnoreCase(value.to_string()))
+        .or_else(|| {
+            text.strip_prefix('=')
+                .map(|value| FieldOperation::Exact(value.to_string()))
+        })
+        .or_else(|| {
+            text.strip_prefix(':')
+                .map(|value| FieldOperation::Regex(value.to_string()))
+        })
+        .unwrap_or_else(|| FieldOperation::Substring(text.to_string()));
+    let index = parameters.len() + 1;
+    let predicate = compile_expression("__rsbts_search__", &operation, parameters)
+        .replace('?', &format!("?{index}"));
+    let columns: &[&str] = if albums {
+        &["album", "albumartist"]
+    } else {
+        &["title", "artist", "album", "albumartist", "genre"]
+    };
+    format!(
+        "({})",
+        columns
+            .iter()
+            .map(|column| predicate.replace("__rsbts_search__", column))
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    )
 }
 
 fn compile_expression(
@@ -498,13 +680,17 @@ fn compile_expression(
             parameters.push(Value::Text(value.clone()));
             format!("{column} = ?")
         }
+        FieldOperation::ExactIgnoreCase(value) => {
+            parameters.push(Value::Text(value.clone()));
+            format!("{column} = ? COLLATE NOCASE")
+        }
         FieldOperation::Glob(pattern) => {
             parameters.push(Value::Text(pattern.clone()));
             format!("{column} GLOB ?")
         }
         FieldOperation::Regex(pattern) => {
             parameters.push(Value::Text(pattern.clone()));
-            format!("regexp(?, {column})")
+            format!("regexp(?, CAST({column} AS TEXT))")
         }
         FieldOperation::Range { start, end } => match (start, end) {
             (Some(start), Some(end)) => {
@@ -642,8 +828,8 @@ mod tests {
         assert_eq!(
             Query::parse("C++ invalid+")?.compile().parameters,
             [
-                Value::Text("\"C++\"".into()),
-                Value::Text("\"invalid+\"".into())
+                Value::Text("%C++%".into()),
+                Value::Text("%invalid+%".into())
             ]
         );
         Ok(())

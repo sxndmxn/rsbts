@@ -1,6 +1,6 @@
 //! SQLite-backed library, audit, journal, and recovery APIs.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -22,6 +22,8 @@ use crate::{
     validate_album_metadata, validate_item_metadata, Album, AudioFormat, Error, ExtendedMetadata,
     ExternalId, FlexibleValue, Item, Result,
 };
+
+const METADATA_BATCH_SIZE: usize = 256;
 
 #[cfg(test)]
 thread_local! {
@@ -793,12 +795,54 @@ impl Library {
         compiled.sql.push_str(", id ASC LIMIT ?");
         compiled.parameters.push(Value::Integer(i64::from(limit)));
         let mut statement = self.conn.prepare(&compiled.sql)?;
-        let rows =
+        let mut rows =
             statement.query_map(params_from_iter(compiled.parameters.iter()), row_to_item)?;
-        for row in rows {
-            let mut item = row?;
-            hydrate_items(&self.conn, std::slice::from_mut(&mut item))?;
-            visitor(item)?;
+        loop {
+            let mut page = rows
+                .by_ref()
+                .take(METADATA_BATCH_SIZE)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            if page.is_empty() {
+                break;
+            }
+            hydrate_items(&self.conn, &mut page)?;
+            for item in page {
+                visitor(item)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Stream albums in query order with a bounded metadata buffer.
+    pub fn visit_albums(
+        &self,
+        query: &Query,
+        limit: u32,
+        mut visitor: impl FnMut(Album) -> Result<()>,
+    ) -> Result<()> {
+        if limit == 0 || limit > 100_000 {
+            return Err(Error::Query(
+                "list limit must be between 1 and 100000".into(),
+            ));
+        }
+        let mut compiled = query.compile_albums();
+        compiled.sql.push_str(", id ASC LIMIT ?");
+        compiled.parameters.push(Value::Integer(i64::from(limit)));
+        let mut statement = self.conn.prepare(&compiled.sql)?;
+        let mut rows =
+            statement.query_map(params_from_iter(compiled.parameters.iter()), row_to_album)?;
+        loop {
+            let mut page = rows
+                .by_ref()
+                .take(METADATA_BATCH_SIZE)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            if page.is_empty() {
+                break;
+            }
+            hydrate_albums(&self.conn, &mut page)?;
+            for album in page {
+                visitor(album)?;
+            }
         }
         Ok(())
     }
@@ -1014,6 +1058,49 @@ impl Library {
             .map_err(Into::into)
     }
 
+    /// Aggregate selected rows in `SQLite` without reading media or extended metadata.
+    /// Unfiltered queries use the transactionally maintained statistics.
+    pub fn stats_matching(&self, query: &Query) -> Result<Stats> {
+        if !query.has_filters() {
+            return self.stats();
+        }
+        let compiled = query.compile();
+        let (selection, _) = compiled
+            .sql
+            .rsplit_once(" ORDER BY ")
+            .ok_or_else(|| Error::Query("compiled query has no stable ordering".into()))?;
+        let sql = format!(
+            "SELECT COUNT(*), COUNT(DISTINCT album_id), COUNT(DISTINCT artist),
+                    COALESCE(SUM(length), 0.0), COALESCE(SUM(file_size), 0),
+                    COALESCE(SUM(file_size IS NULL), 0)
+             FROM ({selection})"
+        );
+        self.conn
+            .query_row(&sql, params_from_iter(compiled.parameters), |row| {
+                Ok(Stats {
+                    tracks: row.get(0)?,
+                    albums: row.get(1)?,
+                    artists: row.get(2)?,
+                    total_length: row.get(3)?,
+                    total_size: row.get(4)?,
+                    unknown_sizes: row.get(5)?,
+                })
+            })
+            .map_err(Into::into)
+    }
+
+    /// List custom metadata fields for command discovery.
+    pub fn flexible_field_names(&self, albums: bool) -> Result<Vec<String>> {
+        let mut statement = self.conn.prepare(
+            "SELECT DISTINCT field FROM entity_metadata
+             WHERE entity_type = ?1 AND field != '__core' ORDER BY field",
+        )?;
+        let names = statement
+            .query_map([if albums { "album" } else { "item" }], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(names)
+    }
+
     pub fn update_item(&self, id: i64, item: &Item) -> Result<()> {
         self.update_items(&[(id, item.clone())]).map(|_| ())
     }
@@ -1128,6 +1215,9 @@ impl Library {
     ///
     /// Every field and value is validated before any row is changed. Empty values clear the
     /// optional `albumartist`, `genre`, `year`, `track`, and `disc` fields.
+    ///
+    /// A field whose stored value already equals the new value stays unchanged, and so do the
+    /// identifiers that depend on it. The result is the number of items that changed.
     pub fn modify_items(&self, ids: &[i64], fields: &[String]) -> Result<usize> {
         let modifications = parse_modifications(fields)?;
         if ids.is_empty() {
@@ -1137,23 +1227,30 @@ impl Library {
             return Err(Error::Query("item IDs must not be repeated".into()));
         }
 
-        let assignments = modifications
-            .iter()
-            .map(|modification| format!("{} = ?", modification.column))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!("UPDATE items SET {assignments} WHERE id = ?");
-        let invalidates_track_identity = modifications.iter().any(|modification| {
-            matches!(modification.column, "title" | "artist" | "track" | "disc")
-        });
-        let invalidates_release_identity = modifications
-            .iter()
-            .any(|modification| matches!(modification.column, "album" | "albumartist" | "year"));
-        let modifies_artist = modifications
-            .iter()
-            .any(|modification| modification.column == "artist");
         let transaction = self.conn.unchecked_transaction()?;
+        let mut modified_ids = Vec::with_capacity(ids.len());
+        let mut reconcile_albums = false;
         for id in ids {
+            let modifications = changed_modifications(&transaction, *id, &modifications)?;
+            if modifications.is_empty() {
+                continue;
+            }
+            let assignments = modifications
+                .iter()
+                .map(|modification| format!("{} = ?", modification.column))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!("UPDATE items SET {assignments} WHERE id = ?");
+            let invalidates_track_identity = modifications.iter().any(|modification| {
+                matches!(modification.column, "title" | "artist" | "track" | "disc")
+            });
+            let invalidates_release_identity = modifications.iter().any(|modification| {
+                matches!(modification.column, "album" | "albumartist" | "year")
+            });
+            let modifies_artist = modifications
+                .iter()
+                .any(|modification| modification.column == "artist");
+            reconcile_albums |= invalidates_release_identity || modifies_artist;
             let mut values = modifications
                 .iter()
                 .map(|modification| modification.value.clone())
@@ -1203,17 +1300,13 @@ impl Library {
                 invalidate_release_ids,
             )?;
             synchronize_modified_metadata(&transaction, *id, &modifications)?;
+            modified_ids.push(*id);
         }
-        if modifications.iter().any(|modification| {
-            matches!(
-                modification.column,
-                "artist" | "album" | "albumartist" | "year"
-            )
-        }) {
-            reconcile_album_membership(&transaction, ids)?;
+        if reconcile_albums {
+            reconcile_album_membership(&transaction, &modified_ids)?;
         }
         transaction.commit()?;
-        Ok(ids.len())
+        Ok(modified_ids.len())
     }
 
     pub(crate) fn item_exists(&self, path: &Path) -> Result<bool> {
@@ -2180,10 +2273,182 @@ impl Library {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Modification {
     column: &'static str,
     value: Value,
+}
+
+impl Modification {
+    fn current_value(&self, item: &Item) -> Value {
+        core_field_value(item, self.column)
+    }
+}
+
+const CORE_FIELDS: [&str; 8] = [
+    "title",
+    "artist",
+    "album",
+    "albumartist",
+    "genre",
+    "year",
+    "track",
+    "disc",
+];
+
+fn core_field_value(item: &Item, column: &str) -> Value {
+    let text = |value: &str| Value::Text(value.to_owned());
+    let optional_text = |value: &Option<String>| value.as_deref().map_or(Value::Null, text);
+    let number = |value: Option<i64>| value.map_or(Value::Null, Value::Integer);
+    match column {
+        "title" => text(&item.title),
+        "artist" => text(&item.artist),
+        "album" => text(&item.album),
+        "albumartist" => optional_text(&item.albumartist),
+        "genre" => optional_text(&item.genre),
+        "year" => number(item.year.map(i64::from)),
+        "track" => number(item.track.map(i64::from)),
+        _ => number(item.disc.map(i64::from)),
+    }
+}
+
+/// Compare the core catalog fields that `modify` can change.
+#[must_use]
+pub fn core_field_changes(before: &Item, after: &Item) -> Vec<FieldChange> {
+    CORE_FIELDS
+        .into_iter()
+        .filter_map(|field| {
+            let (old, new) = (
+                core_field_value(before, field),
+                core_field_value(after, field),
+            );
+            (old != new).then(|| FieldChange {
+                field,
+                before: json_value(&old),
+                after: json_value(&new),
+            })
+        })
+        .collect()
+}
+
+/// One field change in a [`ItemModification`] preview.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct FieldChange {
+    pub field: &'static str,
+    pub before: serde_json::Value,
+    pub after: serde_json::Value,
+}
+
+/// The changes that [`Library::modify_items`] would make to one item.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ItemModification {
+    pub item_id: i64,
+    pub path: PathBuf,
+    pub changes: Vec<FieldChange>,
+    /// Stored track identifiers that the change clears.
+    pub clears_track_identifiers: bool,
+    /// Stored release identifiers that the change clears.
+    pub clears_release_identifiers: bool,
+}
+
+/// Preview [`Library::modify_items`] without a database write.
+///
+/// The result contains only items with at least one changed field. It uses the same
+/// validation, comparison, and identifier rules as the write.
+pub fn preview_modifications(items: &[Item], fields: &[String]) -> Result<Vec<ItemModification>> {
+    let modifications = parse_modifications(fields)?;
+    let mut previews = Vec::new();
+    for item in items {
+        let item_id = item
+            .id
+            .ok_or_else(|| Error::Query("a matched item has no database ID".into()))?;
+        let changed = modifications
+            .iter()
+            .filter(|modification| modification.current_value(item) != modification.value)
+            .collect::<Vec<_>>();
+        if changed.is_empty() {
+            continue;
+        }
+        let changes_column = |columns: &[&str]| {
+            changed
+                .iter()
+                .any(|modification| columns.contains(&modification.column))
+        };
+        let albumartist_after = changed
+            .iter()
+            .find(|modification| modification.column == "albumartist")
+            .map_or_else(
+                || item.albumartist.is_some(),
+                |modification| modification.value != Value::Null,
+            );
+        let has_identifier = |kinds: &[&str], stored: &Option<ExternalId>| {
+            stored.is_some()
+                || item
+                    .extended
+                    .external_ids
+                    .iter()
+                    .any(|id| kinds.contains(&id.kind.as_str()))
+        };
+        previews.push(ItemModification {
+            item_id,
+            path: item.path.clone(),
+            changes: changed
+                .iter()
+                .map(|modification| FieldChange {
+                    field: modification.column,
+                    before: json_value(&modification.current_value(item)),
+                    after: json_value(&modification.value),
+                })
+                .collect(),
+            clears_track_identifiers: changes_column(&["title", "artist", "track", "disc"])
+                && has_identifier(
+                    &["recording", "track", "release_track", "release-track"],
+                    &item.track_external_id,
+                ),
+            clears_release_identifiers: (changes_column(&["album", "albumartist", "year"])
+                || changes_column(&["artist"]) && !albumartist_after)
+                && has_identifier(&["release", "legacy"], &item.release_external_id),
+        });
+    }
+    Ok(previews)
+}
+
+fn json_value(value: &Value) -> serde_json::Value {
+    match value {
+        Value::Text(text) => serde_json::Value::from(text.as_str()),
+        Value::Integer(number) => serde_json::Value::from(*number),
+        _ => serde_json::Value::Null,
+    }
+}
+
+fn changed_modifications(
+    transaction: &Transaction<'_>,
+    id: i64,
+    modifications: &[Modification],
+) -> Result<Vec<Modification>> {
+    let mut changed = Vec::with_capacity(modifications.len());
+    for modification in modifications {
+        // The column comes from the fixed list in `parse_modifications`.
+        let unchanged: bool = transaction
+            .query_row(
+                &format!(
+                    "SELECT {} IS ?1 FROM items WHERE id = ?2",
+                    modification.column
+                ),
+                params![modification.value, id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                Error::Query(format!(
+                    "item {id} no longer exists; no items were modified"
+                ))
+            })?;
+        if !unchanged {
+            changed.push(modification.clone());
+        }
+    }
+    Ok(changed)
 }
 
 fn parse_modifications(fields: &[String]) -> Result<Vec<Modification>> {
@@ -2576,18 +2841,26 @@ fn insert_item(transaction: &Transaction<'_>, item: &Item, album_id: Option<i64>
 }
 
 fn hydrate_items(conn: &Connection, items: &mut [Item]) -> Result<()> {
-    for item in items {
-        if let Some(id) = item.id {
-            item.extended = load_extended_metadata(conn, "item", id)?;
+    for page in items.chunks_mut(METADATA_BATCH_SIZE) {
+        let ids = page.iter().filter_map(|item| item.id).collect::<Vec<_>>();
+        let mut metadata = load_extended_metadata_batch(conn, "item", &ids)?;
+        for item in page {
+            if let Some(id) = item.id {
+                item.extended = metadata.remove(&id).unwrap_or_default();
+            }
         }
     }
     Ok(())
 }
 
 fn hydrate_albums(conn: &Connection, albums: &mut [Album]) -> Result<()> {
-    for album in albums {
-        if let Some(id) = album.id {
-            album.extended = load_extended_metadata(conn, "album", id)?;
+    for page in albums.chunks_mut(METADATA_BATCH_SIZE) {
+        let ids = page.iter().filter_map(|album| album.id).collect::<Vec<_>>();
+        let mut metadata = load_extended_metadata_batch(conn, "album", &ids)?;
+        for album in page {
+            if let Some(id) = album.id {
+                album.extended = metadata.remove(&id).unwrap_or_default();
+            }
         }
     }
     Ok(())
@@ -2754,48 +3027,86 @@ fn load_extended_metadata(
     entity_type: &str,
     entity_id: i64,
 ) -> Result<ExtendedMetadata> {
-    let core = conn
-        .query_row(
-            "SELECT value_json FROM entity_metadata
-             WHERE entity_type = ?1 AND entity_id = ?2 AND field = '__core'",
-            params![entity_type, entity_id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    let mut metadata = core.map_or_else(
-        || Ok(ExtendedMetadata::default()),
-        |json| {
-            serde_json::from_str(&json)
-                .map_err(|error| Error::Recovery(format!("invalid stored metadata: {error}")))
-        },
-    )?;
-    let mut statement = conn.prepare(
-        "SELECT field, value_json FROM entity_metadata
-         WHERE entity_type = ?1 AND entity_id = ?2 AND field != '__core'
-         ORDER BY field, ordinal",
-    )?;
-    let rows = statement.query_map(params![entity_type, entity_id], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    Ok(
+        load_extended_metadata_batch(conn, entity_type, &[entity_id])?
+            .remove(&entity_id)
+            .unwrap_or_default(),
+    )
+}
+
+fn load_extended_metadata_batch(
+    conn: &Connection,
+    entity_type: &str,
+    ids: &[i64],
+) -> Result<HashMap<i64, ExtendedMetadata>> {
+    let mut metadata = ids
+        .iter()
+        .map(|id| (*id, ExtendedMetadata::default()))
+        .collect::<HashMap<_, _>>();
+    if ids.is_empty() {
+        return Ok(metadata);
+    }
+    let placeholders = std::iter::repeat_n("?", ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let parameters = std::iter::once(Value::Text(entity_type.to_string()))
+        .chain(ids.iter().map(|id| Value::Integer(*id)))
+        .collect::<Vec<_>>();
+    let mut statement = conn.prepare_cached(&format!(
+        "SELECT entity_id, field, value_json FROM entity_metadata
+         WHERE entity_type = ? AND entity_id IN ({placeholders})
+         ORDER BY entity_id, field != '__core', field, ordinal"
+    ))?;
+    let rows = statement.query_map(params_from_iter(&parameters), |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
     })?;
     for row in rows {
-        let (field, json) = row?;
-        let value = serde_json::from_str::<FlexibleValue>(&json)
-            .map_err(|error| Error::Recovery(format!("invalid flexible field {field}: {error}")))?;
-        metadata.flexible_fields.insert(field, value);
+        let (id, field, json) = row?;
+        if field == "__core" {
+            let value = serde_json::from_str(&json)
+                .map_err(|error| Error::Recovery(format!("invalid stored metadata: {error}")))?;
+            metadata.insert(id, value);
+        } else {
+            let value = serde_json::from_str::<FlexibleValue>(&json).map_err(|error| {
+                Error::Recovery(format!("invalid flexible field {field}: {error}"))
+            })?;
+            metadata
+                .entry(id)
+                .or_default()
+                .flexible_fields
+                .insert(field, value);
+        }
     }
-    let mut statement = conn.prepare(
-        "SELECT provider, kind, value FROM library_external_ids
-         WHERE entity_type = ?1 AND entity_id = ?2 ORDER BY provider, kind, value",
-    )?;
-    metadata.external_ids = statement
-        .query_map(params![entity_type, entity_id], |row| {
-            Ok(ExternalId {
-                provider: row.get(0)?,
-                kind: row.get(1)?,
-                value: row.get(2)?,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for value in metadata.values_mut() {
+        value.external_ids.clear();
+    }
+    let mut statement = conn.prepare_cached(&format!(
+        "SELECT entity_id, provider, kind, value FROM library_external_ids
+         WHERE entity_type = ? AND entity_id IN ({placeholders})
+         ORDER BY entity_id, provider, kind, value"
+    ))?;
+    let rows = statement.query_map(params_from_iter(&parameters), |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            ExternalId {
+                provider: row.get(1)?,
+                kind: row.get(2)?,
+                value: row.get(3)?,
+            },
+        ))
+    })?;
+    for row in rows {
+        let (id, external_id) = row?;
+        metadata
+            .entry(id)
+            .or_default()
+            .external_ids
+            .push(external_id);
+    }
     Ok(metadata)
 }
 

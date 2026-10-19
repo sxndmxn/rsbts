@@ -48,16 +48,23 @@ fn sort_only_mutations_fail_before_database_open() -> Result<(), Box<dyn std::er
         &config,
         "[library]\ndirectory = 'organized'\ndatabase = 'state/library.db'\n",
     )?;
-    for query in ["artist+", "year- title+", "  path- \n track+ "] {
-        for arguments in [
-            vec!["rm", query, "--yes"],
-            vec!["rm", query, "--delete", "--dry-run"],
-            vec!["modify", query, "title=Changed"],
-            vec!["write", query, "--yes"],
-            vec!["write", query, "--dry-run"],
-            vec!["move", query, "--yes"],
-            vec!["move", query, "--dry-run"],
+    for query in [
+        vec!["artist+"],
+        vec!["year-", "title+"],
+        vec!["path-", "track+"],
+    ] {
+        for (command, options) in [
+            ("rm", vec!["--yes"]),
+            ("rm", vec!["--delete", "--dry-run"]),
+            ("modify", vec!["--yes", "title=Changed"]),
+            ("write", vec!["--yes"]),
+            ("write", vec!["--dry-run"]),
+            ("move", vec!["--yes"]),
+            ("move", vec!["--dry-run"]),
         ] {
+            let mut arguments = vec![command];
+            arguments.extend_from_slice(&query);
+            arguments.extend(options);
             let output = run(&config, &arguments)?;
             assert_eq!(output.status.code(), Some(1), "{arguments:?}: {output:?}");
             assert!(String::from_utf8(output.stderr)?.contains("explicit filter"));
@@ -74,11 +81,14 @@ fn sorted_mutations_require_a_filter_and_keep_its_scope() -> Result<(), Box<dyn 
     let temporary = tempfile::tempdir()?;
     let (config, database) = catalog_fixture(temporary.path(), 3)?;
     let before = std::fs::read(&database)?;
-    let output = run(&config, &["modify", "artist+", "title=Changed"])?;
+    let output = run(&config, &["modify", "--yes", "artist+", "title=Changed"])?;
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert_eq!(std::fs::read(&database)?, before);
 
-    let output = run(&config, &["modify", "artist:=A title-", "title=Changed"])?;
+    let output = run(
+        &config,
+        &["modify", "--yes", "artist:=A", "title-", "title=Changed"],
+    )?;
     assert!(output.status.success(), "{output:?}");
     let library = Library::open_read_only(&database)?;
     let items = library.query_items_page(&Query::all(), None, 10)?;
@@ -117,10 +127,10 @@ fn listings_apply_sort_terms_before_the_limit() -> Result<(), Box<dyn std::error
     let before = std::fs::read(&database)?;
     for format in ["json", "jsonl"] {
         for query in ["year+ title-", "year- title+", "artist+"] {
-            let output = run(
-                &config,
-                &["--output", format, "ls", query, "--limit", "1001"],
-            )?;
+            let mut arguments = vec!["--output", format, "ls"];
+            arguments.extend(query.split_whitespace());
+            arguments.extend(["--limit", "1001"]);
+            let output = run(&config, &arguments)?;
             assert!(output.status.success(), "{output:?}");
             let actual: Vec<serde_json::Value> = if format == "json" {
                 serde_json::from_slice(&output.stdout)?
