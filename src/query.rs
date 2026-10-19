@@ -54,11 +54,6 @@ pub enum QueryField {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SortField {
-    Id,
-    AlbumId,
-    ArtPath,
-    FileSize,
-    Singleton,
     Path,
     Title,
     Artist,
@@ -73,6 +68,11 @@ pub enum SortField {
     Length,
     Added,
     Modified,
+    Id,
+    AlbumId,
+    ArtPath,
+    FileSize,
+    Singleton,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -29,6 +29,8 @@ Scripts that run `modify` without a terminal must now pass `--yes`.
 `modify` changes only fields that differ from the stored value.
 Identifiers that depend on an unchanged field stay stored.
 Added `update --dry-run` (alias `--pretend`) to preview core field changes from file tags.
+Library callers can use `db::preview_modifications` and `db::core_field_changes` for the same previews.
+`Library::modify_items` now returns the number of changed items instead of the number of requested IDs.
 
 Listings now read extended metadata in batches of 256 records.
 Batch reads preserve native metadata, custom fields, and stored provider identifiers.
